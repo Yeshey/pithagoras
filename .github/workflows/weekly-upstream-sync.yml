@@ -1,0 +1,61 @@
+name: Weekly Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Every Monday at 00:00 UTC
+  workflow_dispatch: # Allow manual triggering
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.repository == 'Yeshey/pithagoras'
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/thecodacus/pithagoras.git
+          git fetch upstream
+
+      - name: Merge upstream, preserving custom docker.yml
+        run: |
+          # Stash the custom multi-arch build workflow
+          cp .github/workflows/docker.yml /tmp/custom-docker.yml
+
+          # Merge upstream. On conflict, favor upstream's side.
+          # The custom docker.yml is restored afterward.
+          if git merge upstream/main --no-edit -X theirs; then
+            echo "✅ Merge succeeded"
+          else
+            echo "⚠️ Merge failed unexpectedly; aborting"
+            git merge --abort
+            exit 1
+          fi
+
+          # Restore the custom multi-arch build workflow
+          cp /tmp/custom-docker.yml .github/workflows/docker.yml
+          git add .github/workflows/docker.yml
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ Nothing to commit — docker.yml unchanged after merge"
+          else
+            git commit -m "chore: preserve custom aarch64 docker workflow"
+          fi
+
+      - name: Push to origin
+        run: |
+          git push origin main
