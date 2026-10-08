@@ -19,7 +19,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Configure Git
         run: |
@@ -28,23 +28,35 @@ jobs:
 
       - name: Add upstream remote
         run: |
-          git remote add upstream https://github.com/thecodacus/pithagoras.git
+          git remote add upstream https://github.com/thecodacus/pithagoras.git || true
           git fetch upstream main
 
-      - name: Merge upstream and preserve Docker workflow
+      - name: Merge upstream
         id: merge
         shell: bash
         run: |
           before=$(git rev-parse HEAD)
-          cp .github/workflows/docker.yml /tmp/custom-docker.yml
+          fork_only=".github/workflows/weekly-upstream-sync.yml"
+          keep_ours=".github/workflows/docker.yml"
 
-          git merge upstream/main --no-edit -X theirs
+          git merge upstream/main --no-commit --no-ff || true
 
-          cp /tmp/custom-docker.yml .github/workflows/docker.yml
-          git add .github/workflows/docker.yml
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            # Resolve conflicts: keep fork's docker.yml, upstream wins elsewhere
+            for f in $(git diff --name-only --diff-filter=U); do
+              if [[ "$f" == "$keep_ours" || "$f" == "$fork_only" ]]; then
+                git checkout --ours -- "$f" 2>/dev/null || git rm -fq -- "$f"
+              else
+                git checkout --theirs -- "$f" 2>/dev/null || git rm -fq -- "$f"
+              fi
+              git add -A -- "$f"
+            done
 
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: preserve custom aarch64 docker workflow"
+            # Fork-only sync workflow always stays as-is
+            git checkout "$before" -- "$fork_only"
+            git add "$fork_only"
+
+            git commit -m "Merge upstream/main"
           fi
 
           if [[ "$(git rev-parse HEAD)" != "$before" ]]; then
@@ -61,5 +73,5 @@ jobs:
         if: steps.merge.outputs.changed == 'true'
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_PAT }}
           event-type: build-docker
