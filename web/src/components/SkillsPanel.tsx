@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LuCheck,
   LuChevronLeft,
@@ -13,14 +13,14 @@ import {
   LuTriangleAlert,
   LuWrench,
 } from "react-icons/lu";
-import { api, type FoundSkill, type Skill, type SkillDiagnostic } from "../api";
+import { api, type FoundSkill, type Skill, type SkillDiagnostic, type SkippedSkill } from "../api";
+import { LoadFailed, Switch, btnCls, codeAreaCls, inputCls, primaryCls } from "./SettingsUi";
+import { confirmDialog } from "./ConfirmDialog";
+import { useUnsavedDraft } from "./Modal";
+import { isEnter } from "../shortcuts";
+import { t, tp, tx } from "../i18n";
+import { useFlash } from "../use-flash";
 
-const inputCls =
-  "w-full rounded-lg border border-line bg-raised/60 px-3 py-2 text-sm outline-none transition placeholder:text-fg-faint focus:border-accent/60";
-const btnCls =
-  "inline-flex items-center gap-1.5 rounded-lg bg-fg/5 px-3 py-2 text-sm text-fg transition hover:bg-fg/10 disabled:opacity-40";
-const primaryCls =
-  "inline-flex items-center gap-1.5 rounded-lg bg-accent/12 px-3 py-2 text-sm text-accent ring-1 ring-inset ring-accent/25 transition hover:bg-accent/20 disabled:opacity-40";
 
 /**
  * Skills the agent can reach for.
@@ -35,6 +35,9 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
   const [diagnostics, setDiagnostics] = useState<SkillDiagnostic[]>([]);
   const [root, setRoot] = useState("");
   const [loading, setLoading] = useState(true);
+  // Why the first read failed: "None yet" would say there are no skills.
+  const [failed, setFailed] = useState<string | null>(null);
+  const had = useRef(false);
   const [openName, setOpenName] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -42,11 +45,15 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
   const load = async () => {
     try {
       const r = await api.skills();
+      had.current = true;
+      setFailed(null);
       setSkills(r.skills);
       setDiagnostics(r.diagnostics ?? []);
       setRoot(r.root);
     } catch (e) {
-      onError((e as Error).message);
+      // A refresh of what is shown goes to the banner; with nothing read yet the page says it itself.
+      if (had.current) onError((e as Error).message);
+      else setFailed((e as Error).message);
     } finally {
       setLoading(false);
     }
@@ -68,10 +75,7 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
     <>
       <section className="mb-6 rounded-xl border border-line bg-raised/40 p-3">
         <p className="text-xs text-fg-subtle">
-          A skill is a set of instructions the agent pulls in when its description matches what is
-          being asked. Every session sees them, so they are a good place for a procedure you would
-          otherwise repeat. Switching one off stops pi loading it at all, rather than hiding it
-          here.
+          {t("A skill is a set of instructions the agent pulls in when its description matches what is being asked. Every session sees them, so they are a good place for a procedure you would otherwise repeat. Switching one off stops pi loading it at all, rather than hiding it here.")}
         </p>
         <p className="mt-1.5 truncate font-mono text-[11px] text-fg-faint">{root}</p>
       </section>
@@ -96,7 +100,7 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
       <section className="mb-6">
         <div className="flex items-center justify-between">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
-            Yours{mine.length ? ` (${mine.length})` : ""}
+            {t("Yours")}{mine.length ? ` (${mine.length})` : ""}
           </h3>
           <div className="flex items-center gap-3">
             <button
@@ -106,7 +110,7 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
               }}
               className="text-[11px] text-accent hover:text-accent"
             >
-              {importing ? "Cancel" : "Import from GitHub"}
+              {importing ? t("Cancel") : t("Import from GitHub")}
             </button>
             <button
               onClick={() => {
@@ -115,7 +119,7 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
               }}
               className="text-[11px] text-accent hover:text-accent"
             >
-              {adding ? "Cancel" : "+ New"}
+              {adding ? t("Cancel") : t("+ New")}
             </button>
           </div>
         </div>
@@ -124,6 +128,7 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
           <ImportSkills
             onCancel={() => setImporting(false)}
             onError={onError}
+            onReload={load}
             onDone={async () => {
               setImporting(false);
               await load();
@@ -144,13 +149,16 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
         )}
 
         {loading ? (
-          <p className="mt-2 text-sm text-fg-subtle">Loading…</p>
+          <p className="mt-2 text-sm text-fg-subtle">{t("Loading…")}</p>
+        ) : failed && !had.current ? (
+          <div className="mt-2">
+            <LoadFailed error={failed} onRetry={load} />
+          </div>
         ) : mine.length === 0 ? (
           <div className="mt-2 rounded-xl border border-dashed border-line px-3 py-6 text-center text-sm text-fg-subtle">
-            None yet.
+            {t("None yet.")}
             <p className="mt-1 text-xs text-fg-faint">
-              How you like releases cut, the shape of a good commit message, the steps for a
-              deploy — anything you have explained more than twice.
+              {t("How you like releases cut, the shape of a good commit message, the steps for a deploy — anything you have explained more than twice.")}
             </p>
           </div>
         ) : (
@@ -177,7 +185,7 @@ export function SkillsPanel({ onError }: { onError: (e: string) => void }) {
       {theirs.length > 0 && (
         <section className="mb-6">
           <h3 className="text-xs font-semibold uppercase tracking-wider text-fg-subtle">
-            Built in and from packages ({theirs.length})
+            {t("Built in and from packages ({n})", { n: theirs.length })}
           </h3>
           <ul className="mt-2 space-y-1">
             {theirs.map((s) => (
@@ -218,18 +226,18 @@ function SkillRow({
             {s.name}
             {!s.enabled && (
               <span className="ml-1.5 rounded bg-fg/5 px-1 py-0.5 text-[10px] text-fg-subtle">
-                off
+                {t("off")}
               </span>
             )}
             {s.manualOnly && (
               <span className="ml-1.5 rounded bg-fg/5 px-1 py-0.5 text-[10px] text-fg-subtle">
-                /skill only
+                {t("/skill only")}
               </span>
             )}
           </p>
           <p className="line-clamp-2 text-[11px] text-fg-subtle">
             {s.broken ? (
-              <span className="text-warn/90">not loading — see the warning above</span>
+              <span className="text-warn/90">{t("not loading — see the warning above")}</span>
             ) : (
               s.description
             )}
@@ -244,19 +252,7 @@ function SkillRow({
       </button>
 
       {onToggle ? (
-        <button
-          onClick={() => onToggle(!s.enabled)}
-          title={s.enabled ? "Disable — pi stops loading it" : "Enable"}
-          className={`relative h-5 w-9 shrink-0 rounded-full transition ${
-            s.enabled ? "bg-accent" : "bg-raised"
-          }`}
-        >
-          <span
-            className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
-              s.enabled ? "left-[1.125rem]" : "left-0.5"
-            }`}
-          />
-        </button>
+        <Switch on={s.enabled} onChange={onToggle} label={s.name} title={s.enabled ? t("Disable — pi stops loading it") : t("Enable")} />
       ) : (
         <LuChevronRight className="h-4 w-4 shrink-0 text-fg-faint" />
       )}
@@ -276,6 +272,7 @@ function NewSkill({
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
+  useUnsavedDraft(!busy && (!!name.trim() || !!description.trim()));
 
   const create = async () => {
     setBusy(true);
@@ -292,7 +289,7 @@ function NewSkill({
   return (
     <div className="mt-2 space-y-3 rounded-xl border border-line bg-raised/40 p-3">
       <label className="block">
-        <span className="text-xs text-fg-muted">Name</span>
+        <span className="text-xs text-fg-muted">{t("Name")}</span>
         <input
           autoFocus
           value={name}
@@ -302,26 +299,25 @@ function NewSkill({
         />
       </label>
       <label className="block">
-        <span className="text-xs text-fg-muted">When to use it</span>
+        <span className="text-xs text-fg-muted">{t("When to use it")}</span>
         <textarea
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           rows={3}
-          placeholder="Use when cutting a release: version bump, changelog, tag and push."
+          placeholder={t("Use when cutting a release: version bump, changelog, tag and push.")}
           className={`${inputCls} mt-1 resize-y text-xs leading-relaxed`}
         />
         <p className="mt-1 text-[11px] text-fg-faint">
-          This is the only part the model reads when deciding whether the skill applies. Say when,
-          not what.
+          {t("This is the only part the model reads when deciding whether the skill applies. Say when, not what.")}
         </p>
       </label>
       <div className="flex items-center gap-2">
         <button disabled={!name.trim() || !description.trim() || busy} onClick={create} className={primaryCls}>
           {busy ? <LuRefreshCw className="h-4 w-4 animate-spin" /> : <LuPlus className="h-4 w-4" />}
-          Create
+          {t("Create")}
         </button>
         <button onClick={onCancel} className={btnCls}>
-          Cancel
+          {t("Cancel")}
         </button>
       </div>
     </div>
@@ -341,7 +337,8 @@ function SkillDetail({
 }) {
   const [draft, setDraft] = useState(s.content);
   const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [saved, flashSaved] = useFlash();
+  useUnsavedDraft(draft !== s.content);
 
   useEffect(() => setDraft(s.content), [s.name, s.content]);
 
@@ -363,7 +360,7 @@ function SkillDetail({
         onClick={onBack}
         className="mb-4 inline-flex items-center gap-1.5 text-xs text-fg-subtle transition hover:text-fg-muted"
       >
-        <LuChevronLeft className="h-3.5 w-3.5" /> Skills
+        <LuChevronLeft className="h-3.5 w-3.5" /> {t("Skills")}
       </button>
 
       <div className="mb-5 flex items-start gap-3">
@@ -375,7 +372,7 @@ function SkillDetail({
           <p className="text-xs text-fg-subtle">
             {s.broken ? (
               <span className="text-warn/90">
-                pi cannot parse this, so the agent is not seeing it. Fix the frontmatter below.
+                {t("pi cannot parse this, so the agent is not seeing it. Fix the frontmatter below.")}
               </span>
             ) : (
               s.description
@@ -384,26 +381,20 @@ function SkillDetail({
           <p className="mt-0.5 truncate font-mono text-[10px] text-fg-faint">{s.path}</p>
         </div>
         {s.editable && (
-          <button
-            onClick={() => act(() => api.setSkillEnabled(s.name, !s.enabled))}
+          <Switch
+            on={s.enabled}
+            onChange={() => act(() => api.setSkillEnabled(s.name, !s.enabled))}
             disabled={busy}
-            title={s.enabled ? "Disable" : "Enable"}
-            className={`relative mt-1 h-5 w-9 shrink-0 rounded-full transition disabled:opacity-40 ${
-              s.enabled ? "bg-accent" : "bg-raised"
-            }`}
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
-                s.enabled ? "left-[1.125rem]" : "left-0.5"
-              }`}
-            />
-          </button>
+            label={s.name}
+            title={s.enabled ? t("Disable") : t("Enable")}
+            className="mt-1"
+          />
         )}
       </div>
 
       {!s.enabled && (
         <p className="mb-4 rounded-lg border border-line bg-raised/40 px-3 py-2 text-[11px] text-fg-subtle">
-          Switched off. pi is not loading this, so the agent cannot see or use it.
+          {t("Switched off. pi is not loading this, so the agent cannot see or use it.")}
         </p>
       )}
 
@@ -412,28 +403,32 @@ function SkillDetail({
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            aria-label={t("The skill's file")}
             rows={18}
             spellCheck={false}
-            className="w-full resize-y rounded-lg border border-line bg-raised/60 px-3 py-2 font-mono text-xs leading-relaxed outline-none focus:border-accent/60"
+            className={`${codeAreaCls} resize-y`}
           />
           <p className="mt-1 text-[11px] text-fg-faint">
-            The frontmatter at the top is what pi reads — changing <code>name</code> renames the
-            skill, and <code>description</code> is what the model matches against.
+            {tx("The frontmatter at the top is what pi reads — changing {name} renames the skill, and {description} is what the model matches against.", { name: <code>name</code>, description: <code>description</code> })}
           </p>
 
           {s.source && (
             <div className="mt-2 flex items-center gap-2 rounded-lg border border-line bg-raised/40 px-3 py-2 text-[11px] text-fg-subtle">
               <LuGithub className="h-3.5 w-3.5 shrink-0 text-fg-faint" />
               <span className="min-w-0 flex-1 truncate">
-                Imported from <span className="font-mono">{s.source.spec}</span>
+                {tx("Imported from {source}", { source: <span className="font-mono">{s.source.spec}</span> })}
               </span>
               <button
-                onClick={() => act(() => api.updateSkill(s.name))}
+                onClick={async () => {
+                  // Fetched again over what is on disk, and the draft follows the file: nothing of what was changed here stays.
+                  if (!(await confirmDialog({ title: t("Replace your local edits?"), message: t("Update fetches {name} from its source again. What you changed in it here, saved or not, is replaced.", { name: s.name }), confirmLabel: t("Update"), danger: true }))) return;
+                  act(() => api.updateSkill(s.name));
+                }}
                 disabled={busy}
                 className="shrink-0 text-accent hover:text-accent disabled:opacity-40"
-                title="Re-import, replacing local edits"
+                title={t("Re-import, replacing local edits")}
               >
-                Update
+                {t("Update")}
               </button>
             </div>
           )}
@@ -443,8 +438,7 @@ function SkillDetail({
               onClick={() =>
                 act(async () => {
                   await api.saveSkill(s.name, draft);
-                  setSaved(true);
-                  setTimeout(() => setSaved(false), 2000);
+                  flashSaved();
                 })
               }
               disabled={busy || draft === s.content}
@@ -455,11 +449,18 @@ function SkillDetail({
               ) : saved ? (
                 <LuCheck className="h-4 w-4" />
               ) : null}
-              {saved ? "Saved" : "Save"}
+              {saved ? t("Saved") : t("Save")}
             </button>
             <button
-              onClick={() => {
-                if (confirm(`Delete the skill "${s.name}"?`)) {
+              onClick={async () => {
+                if (
+                  await confirmDialog({
+                    title: t("Delete the skill \"{name}\"?", { name: s.name }),
+                    confirmLabel: t("Delete"),
+                    danger: true,
+                    deletes: true,
+                  })
+                ) {
                   act(async () => {
                     await api.deleteSkill(s.name);
                     onBack();
@@ -469,7 +470,7 @@ function SkillDetail({
               disabled={busy}
               className="ml-auto inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-sm text-fg-subtle transition hover:bg-danger/10 hover:text-danger disabled:opacity-40"
             >
-              <LuTrash2 className="h-3.5 w-3.5" /> Delete
+              <LuTrash2 className="h-3.5 w-3.5" /> {t("Delete")}
             </button>
           </div>
         </>
@@ -477,8 +478,7 @@ function SkillDetail({
         <div className="flex items-start gap-2 rounded-xl border border-line bg-raised/40 px-3 py-2 text-xs text-fg-subtle">
           <LuLock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-fg-faint" />
           <p>
-            This skill came with a package. Editing it here would be undone by the next update, so
-            it is read-only — change it by removing or replacing the package in Extensions.
+            {t("This skill came with a package. Editing it here would be undone by the next update, so it is read-only — change it by removing or replacing the package in Extensions.")}
           </p>
         </div>
       )}
@@ -497,23 +497,33 @@ function SkillDetail({
 function ImportSkills({
   onCancel,
   onDone,
+  onReload,
   onError,
 }: {
   onCancel: () => void;
   onDone: () => Promise<void>;
+  onReload: () => Promise<void>;
   onError: (e: string) => void;
 }) {
   const [spec, setSpec] = useState("");
   const [found, setFound] = useState<FoundSkill[] | null>(null);
+  // What the look was of: the import takes exactly that, whatever the field says by then.
+  const [previewed, setPreviewed] = useState<{ spec: string; sha: string } | null>(null);
+  // What is in the repository and was not taken, and why.
+  const [skipped, setSkipped] = useState<SkippedSkill[]>([]);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState<null | "look" | "import">(null);
 
   const look = async () => {
     setBusy("look");
     setFound(null);
+    setPreviewed(null);
+    setSkipped([]);
     try {
       const r = await api.previewSkillImport(spec.trim());
       setFound(r.found);
+      setPreviewed({ spec: r.spec, sha: r.sha });
+      setSkipped(r.skipped);
       // Everything you do not already have, which is the common intent.
       setChosen(new Set(r.found.filter((f) => !f.installed).map((f) => f.name)));
     } catch (e) {
@@ -524,12 +534,22 @@ function ImportSkills({
   };
 
   const doImport = async () => {
+    if (!previewed) return;
     setBusy("import");
     try {
       // Overwrite is implied: anything already installed is only in the list
       // because it was ticked deliberately.
-      await api.importSkills(spec.trim(), [...chosen], true);
-      await onDone();
+      const r = await api.importSkills(previewed.spec, [...chosen], true, previewed.sha);
+      if (r.skipped.length) {
+        // Said here, not closed over: the list is what was imported, and this is what was not.
+        setSkipped(r.skipped);
+        setFound(null);
+        setPreviewed(null);
+        setChosen(new Set());
+        await onReload();
+      } else {
+        await onDone();
+      }
     } catch (e) {
       onError((e as Error).message);
     } finally {
@@ -550,27 +570,53 @@ function ImportSkills({
         <input
           autoFocus
           value={spec}
-          onChange={(e) => setSpec(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && spec.trim() && look()}
+          onChange={(e) => {
+            setSpec(e.target.value);
+            // The list is of another address now.
+            setFound(null);
+            setPreviewed(null);
+            setSkipped([]);
+          }}
+          onKeyDown={(e) => isEnter(e) && spec.trim() && look()}
           placeholder="anthropics/skills"
+          aria-label={t("GitHub repo of skills")}
           className={`${inputCls} font-mono text-xs`}
         />
         <button disabled={!spec.trim() || busy !== null} onClick={look} className={btnCls}>
-          {busy === "look" ? <LuRefreshCw className="h-4 w-4 animate-spin" /> : "Look"}
+          {busy === "look" ? <LuRefreshCw className="h-4 w-4 animate-spin" /> : t("Look")}
         </button>
       </div>
       <p className="text-[11px] text-fg-faint">
-        <code>user/repo</code>, <code>user/repo#branch</code>, a subdirectory like{" "}
-        <code>user/repo/skills/pdf</code>, or a GitHub URL pasted from the address bar.
+        {tx("{repo}, {branch}, a subdirectory like {folder}, or a GitHub URL pasted from the address bar.", { repo: <code>user/repo</code>, branch: <code>user/repo#branch</code>, folder: <code>user/repo/skills/pdf</code> })}
       </p>
+
+      <p className="text-[11px] text-fg-faint">
+        {t("A private repository is reached through the git login of this server. Do not put a token in the address.")}
+      </p>
+
+      {skipped.length > 0 && (
+        <div className="rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-[11px] text-warn/90">
+          <p className="flex items-start gap-1.5">
+            <LuTriangleAlert className="mt-0.5 h-3 w-3 shrink-0" />
+            {t("Not imported:")}
+          </p>
+          <ul className="mt-1 space-y-0.5 pl-4">
+            {skipped.map((s, i) => (
+              <li key={`${s.name}-${i}`}>
+                <span className="font-mono">{s.name}</span> — {s.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {found && (
         <>
           <div className="flex items-baseline justify-between">
             <p className="text-xs text-fg-muted">
-              {found.length} skill{found.length === 1 ? "" : "s"} found
+              {tp(found.length, "{n} skill found", "{n} skills found")}
               {found.some((f) => f.installed) &&
-                ` · ${found.filter((f) => f.installed).length} already installed`}
+                ` · ${t("{n} already installed", { n: found.filter((f) => f.installed).length })}`}
             </p>
             <button
               onClick={() =>
@@ -580,7 +626,7 @@ function ImportSkills({
               }
               className="text-[11px] text-fg-subtle hover:text-fg-muted"
             >
-              {chosen.size === found.length ? "none" : "all"}
+              {chosen.size === found.length ? t("none") : t("all")}
             </button>
           </div>
 
@@ -588,6 +634,8 @@ function ImportSkills({
             {found.map((f) => (
               <li key={f.name}>
                 <button
+                  role="checkbox"
+                  aria-checked={chosen.has(f.name)}
                   onClick={() => toggle(f.name)}
                   className={`flex w-full items-start gap-2.5 rounded-lg border px-3 py-2 text-left transition ${
                     chosen.has(f.name)
@@ -599,7 +647,7 @@ function ImportSkills({
                     className={`mt-0.5 grid h-3.5 w-3.5 shrink-0 place-items-center rounded border ${
                       chosen.has(f.name)
                         ? "border-accent/60 bg-accent/25 text-accent"
-                        : "border-white/20"
+                        : "border-fg/30"
                     }`}
                   >
                     {chosen.has(f.name) && <LuCheck className="h-2.5 w-2.5" />}
@@ -609,7 +657,7 @@ function ImportSkills({
                       {f.name}
                       {f.installed && (
                         <span className="ml-1.5 rounded bg-warn/12 px-1 py-0.5 text-[10px] text-warn">
-                          installed
+                          {t("installed")}
                         </span>
                       )}
                     </p>
@@ -626,7 +674,7 @@ function ImportSkills({
           {[...chosen].some((n) => found.find((f) => f.name === n)?.installed) && (
             <p className="flex items-start gap-1.5 text-[11px] text-warn/90">
               <LuTriangleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-              A ticked skill you already have will be replaced, including any edits you made to it.
+              {t("A ticked skill you already have will be replaced, including any edits you made to it.")}
             </p>
           )}
 
@@ -637,10 +685,10 @@ function ImportSkills({
               ) : (
                 <LuDownload className="h-4 w-4" />
               )}
-              Import {chosen.size || ""}
+              {t("Import")} {chosen.size || ""}
             </button>
             <button onClick={onCancel} className={btnCls}>
-              Cancel
+              {t("Cancel")}
             </button>
           </div>
         </>
@@ -648,8 +696,7 @@ function ImportSkills({
 
       <p className="flex items-start gap-1.5 border-t border-line pt-2 text-[11px] text-fg-faint">
         <LuTriangleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-        Nothing is executed by an import — a skill is markdown. But it is markdown the agent will
-        follow, so take them from somewhere you would take instructions from.
+        {t("Nothing is executed by an import — a skill is markdown. But it is markdown the agent will follow, so take them from somewhere you would take instructions from.")}
       </p>
     </div>
   );

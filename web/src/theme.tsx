@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { local } from "./safe-storage";
 
 /**
  * Light, dark, or whatever the machine is set to.
@@ -21,16 +22,15 @@ function apply(theme: Theme) {
   // does not fade every time something re-renders.
   root.classList.add("theme-switching");
   root.dataset.theme = resolve(theme);
+  // The installed app's title bar follows the page, not only the machine.
+  const canvas = getComputedStyle(root).getPropertyValue("--canvas").trim().split(/\s+/).join(", ");
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", `rgb(${canvas})`);
   window.setTimeout(() => root.classList.remove("theme-switching"), 200);
 }
 
 function stored(): Theme {
-  try {
-    const value = localStorage.getItem(KEY);
-    return value === "light" || value === "dark" || value === "system" ? value : "system";
-  } catch {
-    return "system";
-  }
+  const value = local.get(KEY);
+  return value === "light" || value === "dark" || value === "system" ? value : "system";
 }
 
 export function useTheme() {
@@ -38,11 +38,8 @@ export function useTheme() {
 
   useEffect(() => {
     apply(theme);
-    try {
-      localStorage.setItem(KEY, theme);
-    } catch {
-      // Private mode. The theme still applies for this session.
-    }
+    // Not kept in private mode; the theme still applies for this session.
+    local.set(KEY, theme);
     if (theme !== "system") return;
     const mq = media();
     const onChange = () => apply("system");

@@ -1,5 +1,7 @@
 import { useCallback, useRef } from "react";
 import { api, type CompactionSettings } from "../api";
+import { formatTokens } from "../transcript";
+import { t } from "../i18n";
 
 /**
  * How much of a conversation compaction leaves alone.
@@ -27,9 +29,6 @@ const STEP = 1_000;
  */
 const FALLBACK_MAX = 48_000;
 
-export const formatTokens = (n: number) =>
-  n >= 1000 ? `${(n / 1000).toFixed(n % 1000 === 0 ? 0 : 1)}k` : String(n);
-
 export function KeepRecent({
   value,
   onChange,
@@ -54,10 +53,10 @@ export function KeepRecent({
   return (
     <div>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs text-fg-subtle">Keep recent</span>
+        <span className="text-xs text-fg-subtle">{t("Keep recent")}</span>
         <span className="tabular-nums text-xs text-fg">
-          {formatTokens(clamped)} tokens
-          {share !== null && <span className="ml-1 text-fg-faint">· {share.toFixed(0)}% of window</span>}
+          {t("{n} tokens", { n: formatTokens(clamped) })}
+          {share !== null && <span className="ml-1 text-fg-faint">· {t("{n}% of window", { n: share.toFixed(0) })}</span>}
         </span>
       </div>
       <input
@@ -70,7 +69,7 @@ export function KeepRecent({
         onChange={(e) => onChange(Number(e.target.value))}
         onPointerUp={(e) => onCommit?.(Number((e.target as HTMLInputElement).value))}
         onKeyUp={(e) => onCommit?.(Number((e.target as HTMLInputElement).value))}
-        aria-label="Tokens kept verbatim by compaction"
+        aria-label={t("Tokens kept verbatim by compaction")}
         className="mt-1.5 h-1 w-full cursor-pointer appearance-none rounded-full bg-raised accent-accent disabled:opacity-40"
       />
       <div className="mt-1 flex justify-between text-[10px] text-fg-faint">
@@ -104,6 +103,12 @@ export function KeepRecent({
  *
  * All of this is module level rather than per component: it is one setting,
  * and the two places that offer it must not race each other either.
+ *
+ * `serialSaver` (serial-saver.ts) orders the saves of the other settings the
+ * same way, one saver to a component. This one is not built on it for two
+ * reasons: its queue has to be shared by both places, and a failed save does
+ * not drop the value waiting behind it here (the newest is still sent, and its
+ * own failure is the one told), where a saver gives up with the failure.
  */
 let queue: Promise<unknown> = Promise.resolve();
 let newest = 0;

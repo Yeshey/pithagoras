@@ -1,10 +1,13 @@
 import express, { type Router } from "express";
-import { nanoid } from "nanoid";
 import { getDb, getDefaultReportTo, listRoutineSessions, setDefaultReportTo } from "../db.js";
 import { channelSupervisor } from "../channels/supervisor.js";
+import { unscopeKey } from "../agent.js";
 import { isValidSlug, slugify } from "../slug.js";
 import { isValidCron, nextRun, parseCron } from "../routines/cron.js";
-import { isOneOff, routineSupervisor, whenNext, type RoutineRow } from "../routines/supervisor.js";
+import { isOneOff, oneOffDone, routineSupervisor, type RoutineRow } from "../routines/supervisor.js";
+import { insertRoutine, readTiming, timingSets } from "../routines/store.js";
+import { placeProblem, routinePlace } from "../workspaces.js";
+import { insideReal } from "../within.js";
 
 /**
  * Scheduled work: a standing instruction, a cron expression, and a record of
@@ -20,12 +23,16 @@ const toApi = (row: RoutineRow) => ({
   runAt: row.run_at,
   /** "once" or "repeats" — the two are mutually exclusive. */
   mode: isOneOff(row) ? ("once" as const) : ("repeats" as const),
-  /** A one-off that has already run. Kept so its result stays readable. */
-  done: isOneOff(row) && Boolean(row.last_run),
+  /** A one-off that has already run. Kept so its result stays readable. Not one a restart cut off or somebody stopped: that did not finish. */
+  done: oneOffDone(row) && row.last_status !== "interrupted" && row.last_status !== "stopped",
   instructions: row.instructions,
   freshSession: Boolean(row.fresh_session),
   guard: row.guard === 1,
   browser: row.browser === 1,
+  /** Where its runs happen: null for Home, else a project's directory. */
+  workspace: row.workspace ?? null,
+  /** Why that place cannot be used now, such as a project that was deleted; null when it can. */
+  workspaceProblem: placeProblem(row.workspace),
   /** null inherits the portal default; "" is an explicit "never report". */
   reportChannel: row.report_channel,
   reportTarget: row.report_target,
@@ -38,29 +45,6 @@ const toApi = (row: RoutineRow) => ({
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
-
-/**
- * A routine either repeats on a schedule or happens once at a moment. Both or
- * neither is not a thing, and saying so beats guessing which was meant.
- */
-function readTiming(input: { schedule?: unknown; runAt?: unknown }):
-  | { schedule: string; runAt: string | null }
-  | { error: string } {
-  const schedule = typeof input.schedule === "string" ? input.schedule.trim() : "";
-  const runAt = typeof input.runAt === "string" ? input.runAt.trim() : "";
-
-  if (schedule && runAt) return { error: "Give a schedule or a time to run once, not both" };
-  if (!schedule && !runAt) return { error: "Needs a schedule, or a time to run once" };
-
-  if (schedule) {
-    const bad = isValidCron(schedule);
-    return bad ? { error: bad } : { schedule, runAt: null };
-  }
-
-  const at = new Date(runAt);
-  if (Number.isNaN(at.getTime())) return { error: `"${runAt}" is not a time I can read` };
-  return { schedule: "", runAt: at.toISOString() };
-}
 
 /**
  * A destination, as three states rather than two.
@@ -77,24 +61,64 @@ function readReport(body: any): { channel: string | null; target: string | null 
   return { channel: null, target: null };
 }
 
-/** Slugs own the sessions, so two routines must never share one. */
-function freeSlug(desired: string, exceptId?: string): string {
-  const base = slugify(desired) || "routine";
-  const taken = new Set(
-    (getDb().prepare("SELECT id, slug FROM routines").all() as { id: string; slug: string }[])
-      .filter((r) => r.id !== exceptId)
-      .map((r) => r.slug)
-  );
-  if (!taken.has(base)) return base;
-  for (let n = 2; n < 500; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
-  throw new Error(`Could not find a free slug for "${desired}"`);
+/**
+ * Where a routine runs, as sent: absent leaves it as it is, and anything else
+ * is read as the agent's tool reads it. The place it already has is taken as
+ * it is, even one that has gone: saving another change must not need a new
+ * place first.
+ */
+export function readWorkspace(body: any, current?: string | null): { workspace: string | null } | { error: string } | undefined {
+  if (!body || !("workspace" in body)) return undefined;
+  if (current && body.workspace === current) return { workspace: current };
+  return routinePlace(body.workspace);
+}
+
+/** The routines that run in this folder, or in one below it, or through a link to either. */
+export function routinesIn(dir: string): { id: string; slug: string; name: string; enabled: boolean }[] {
+  const inside = insideReal(dir);
+  return (getDb().prepare("SELECT id, slug, name, enabled, workspace FROM routines ORDER BY name").all() as Pick<RoutineRow, "id" | "slug" | "name" | "enabled" | "workspace">[])
+    .filter((r) => inside(r.workspace))
+    .map((r) => ({ id: r.id, slug: r.slug, name: r.name, enabled: r.enabled === 1 }));
+}
+
+/**
+ * Switches off the routines whose folder has been deleted: each run would fail
+ * there. Their sessions are left alone, the record of what they did, and they
+ * run again once given another place and switched on. Taken from routinesIn
+ * before the folder went, since a link into it cannot be followed after.
+ * Returns the names of those that were on.
+ */
+export function switchOffRoutines(all: { id: string; name: string; enabled: boolean }[]): string[] {
+  const routines = all.filter((r) => r.enabled);
+  if (!routines.length) return [];
+  const off = getDb().prepare("UPDATE routines SET enabled = 0, updated_at = datetime('now') WHERE id = ?");
+  getDb().transaction(() => {
+    for (const r of routines) off.run(r.id);
+  })();
+  routineSupervisor.refreshSchedules(routines.map((r) => r.id));
+  return routines.map((r) => r.name);
+}
+
+/**
+ * Takes the routines out with the folder they ran in, the home of an agent
+ * deleted with its folder: an agent made later under the same name gets a new
+ * folder at the same place, and would otherwise run what was written for the
+ * one before it. Their sessions are left alone, as when a routine is deleted.
+ * Returns their names.
+ */
+export function removeRoutines(all: { id: string; name: string }[]): string[] {
+  const del = getDb().prepare("DELETE FROM routines WHERE id = ?");
+  getDb().transaction(() => {
+    for (const r of all) del.run(r.id);
+  })();
+  return all.map((r) => r.name);
 }
 
 /**
  * Somewhere a report could be sent.
  *
  * Built from conversations that already exist rather than asked for as a chat
- * id: you pick "Telegram — Anirban Kar", and a channel that can only answer
+ * id: you pick "Telegram — Sam Rivera", and a channel that can only answer
  * (a webhook) never appears, because it cannot speak first.
  */
 function reportTargets() {
@@ -110,10 +134,9 @@ function reportTargets() {
   const out: { channel: string; target: string; label: string }[] = [];
   for (const r of rows) {
     if (!channelSupervisor.canSend(r.channel_slug)) continue;
-    // The key is stored scoped by channel; the package expects its own key back.
-    const target = r.channel_key.startsWith(`${r.channel_slug}:`)
-      ? r.channel_key.slice(r.channel_slug.length + 1)
-      : r.channel_key;
+    // The key is stored scoped by channel, and by agent for a channel bound to a
+    // second one; the package expects its own key back.
+    const target = unscopeKey(r.channel_slug, r.channel_key);
     const id = `${r.channel_slug}\u0000${target}`;
     if (seen.has(id)) continue;
     seen.add(id);
@@ -162,28 +185,19 @@ export function routinesRouter(): Router {
 
     const timing = readTiming({ schedule, runAt });
     if ("error" in timing) return res.status(400).json({ error: timing.error });
+    const place = readWorkspace(req.body);
+    if (place && "error" in place) return res.status(400).json({ error: place.error });
 
-    const id = nanoid(10);
-    const slug = freeSlug(typeof req.body?.slug === "string" && req.body.slug ? req.body.slug : name);
-    getDb()
-      .prepare(
-        `INSERT INTO routines
-           (id, slug, name, schedule, run_at, instructions, fresh_session, next_run,
-            report_channel, report_target)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        id,
-        slug,
-        name.trim(),
-        timing.schedule,
-        timing.runAt,
-        typeof instructions === "string" ? instructions.trim() : "",
-        freshSession ? 1 : 0,
-        timing.schedule ? (nextRun(parseCron(timing.schedule))?.toISOString() ?? null) : timing.runAt,
-        report.channel,
-        report.target
-      );
+    const { id } = insertRoutine({
+      name,
+      slug: typeof req.body?.slug === "string" && req.body.slug ? req.body.slug : undefined,
+      timing,
+      instructions: typeof instructions === "string" ? instructions : "",
+      freshSession: Boolean(freshSession),
+      reportChannel: report.channel,
+      reportTarget: report.target,
+      workspace: place?.workspace ?? null,
+    });
     res.json(toApi(rowById(id)!));
   });
 
@@ -209,17 +223,12 @@ export function routinesRouter(): Router {
       sets.push("name = ?");
       values.push(name.trim());
     }
-    // Setting one clears the other: a routine either repeats or happens once.
     if (typeof schedule === "string" || typeof runAt === "string") {
       const timing = readTiming({ schedule, runAt });
       if ("error" in timing) return res.status(400).json({ error: timing.error });
-      sets.push("schedule = ?", "run_at = ?");
-      values.push(timing.schedule, timing.runAt);
-      // Re-arming a one-off that already ran: forget the old outcome, or it
-      // would look done the moment it was saved.
-      if (timing.runAt && timing.runAt !== row.run_at) {
-        sets.push("last_run = NULL", "last_status = NULL", "last_output = NULL");
-      }
+      const change = timingSets(row, timing, typeof enabled === "boolean");
+      sets.push(...change.sets);
+      values.push(...change.values);
     }
     if (typeof instructions === "string") {
       sets.push("instructions = ?");
@@ -246,11 +255,17 @@ export function routinesRouter(): Router {
       sets.push("fresh_session = ?");
       values.push(freshSession ? 1 : 0);
     }
+    const place = readWorkspace(req.body, row.workspace);
+    if (place && "error" in place) return res.status(400).json({ error: place.error });
+    if (place) {
+      sets.push("workspace = ?");
+      values.push(place.workspace);
+    }
 
     if (sets.length) {
       sets.push("updated_at = datetime('now')");
       getDb().prepare(`UPDATE routines SET ${sets.join(", ")} WHERE id = ?`).run(...values, row.id);
-      routineSupervisor.refreshSchedules();
+      routineSupervisor.refreshSchedules([row.id]);
     }
     res.json(toApi(rowById(row.id)!));
   });
@@ -269,7 +284,9 @@ export function routinesRouter(): Router {
     const row = rowById(req.params.id);
     if (!row) return res.status(404).json({ error: "Not found" });
     try {
-      res.json(toApi(await routineSupervisor.run(row, "manual")));
+      const after = await routineSupervisor.run(row, "manual");
+      if (!after) return res.status(404).json({ error: `"${row.name}" was deleted while it ran` });
+      res.json(toApi(after));
     } catch (e) {
       res.status(409).json({ error: (e as Error).message });
     }
@@ -285,7 +302,7 @@ export function routinesRouter(): Router {
     const cron = parseCron(schedule);
     const runs: string[] = [];
     let at = new Date();
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 3; i++) {
       const next = nextRun(cron, at);
       if (!next) break;
       runs.push(next.toISOString());

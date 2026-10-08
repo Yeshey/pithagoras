@@ -2,7 +2,10 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { orderedInput } from "../ordered-input";
 import { api } from "../api";
+
+import { t } from "../i18n";
 
 /**
  * A shell in the workspace of the session you are looking at.
@@ -16,6 +19,9 @@ export function TerminalPanel({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     if (!host.current) return;
+    // What xterm says to a screen reader, in the language of the page: the name of the input, and what it says when too much came at once.
+    Terminal.strings.promptLabel = t("Terminal input");
+    Terminal.strings.tooMuchOutput = t("Too much output to read out; move through the lines to read it.");
     const term = new Terminal({
       fontSize: 12,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -24,6 +30,8 @@ export function TerminalPanel({ sessionId }: { sessionId: string }) {
       theme: { background: "#0b0b0d", foreground: "#d4d4d8" },
       cursorBlink: true,
       scrollback: 5000,
+      // The screen is drawn in a canvas, which a screen reader cannot read: this adds the rows and a live region it can.
+      screenReaderMode: true,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -33,23 +41,49 @@ export function TerminalPanel({ sessionId }: { sessionId: string }) {
     let id: string | null = null;
     let source: EventSource | null = null;
     let closed = false;
+    // Dragging the panel fires the observer for every pixel, and most of those
+    // leave the character grid as it was.
+    let sent = "";
+    const resize = () => {
+      const size = `${term.rows}x${term.cols}`;
+      if (!id || size === sent) return;
+      sent = size;
+      api.terminalResize(id, term.rows, term.cols).catch(() => {});
+    };
 
     api
       .openTerminal(sessionId)
       .then(({ id: termId }) => {
         if (closed) return void api.closeTerminal(termId).catch(() => {});
         id = termId;
+        // Keystrokes that go nowhere — the shell has exited, or the portal has
+        // restarted — used to vanish, and the panel looked merely unresponsive.
+        // Said once, not on every key — and again after the stream has come back:
+        // what it replays starts with a reset, which clears the screen of the notice.
+        let told = false;
         source = new EventSource(`/api/terminal/${termId}/stream`);
         source.onmessage = (m) => term.write(JSON.parse(m.data));
-        term.onData((data) => api.terminalInput(termId, data).catch(() => {}));
-        api.terminalResize(termId, term.rows, term.cols).catch(() => {});
+        source.onopen = () => {
+          told = false;
+        };
+        term.onData(
+          orderedInput(
+            (data) => api.terminalInput(termId, data),
+            () => {
+              if (told || closed) return;
+              told = true;
+              term.write(`\r\n[${t("Connection to the shell lost — close this panel and open it again")}]\r\n`);
+            },
+          ),
+        );
+        resize();
       })
-      .catch((e) => term.write(`\r\nCould not open a shell: ${e.message}\r\n`));
+      .catch((e) => term.write(`\r\n${t("Could not open a shell: {error}", { error: e.message })}\r\n`));
 
     // The panel is resizable, so the pty has to be told when it changes.
     const observer = new ResizeObserver(() => {
       fit.fit();
-      if (id) api.terminalResize(id, term.rows, term.cols).catch(() => {});
+      resize();
     });
     observer.observe(host.current);
 

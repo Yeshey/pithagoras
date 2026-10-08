@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import type { PiClient, PiCommand, PiState, PiStats } from "./types.js";
+import type { ImageContent } from "../prompt-images.js";
 
 /** A message pi emits on stdout. `type: 'response'` replies to a command; everything else is an event. */
 export interface PiMessage {
@@ -12,6 +13,13 @@ export interface PiMessage {
   data?: unknown;
   [key: string]: unknown;
 }
+
+/**
+ * How long a command that does its work before it answers may take: pi replies to `compact` once the summary
+ * is written, and to `reload` once everything is read again. The default would give up on a local model
+ * that needs minutes, while pi goes on and the chat is already shown idle.
+ */
+const LONG_COMMAND_MS = 30 * 60_000;
 
 /**
  * Client for `pi --mode rpc`: newline-delimited JSON over the child's stdio.
@@ -112,8 +120,13 @@ export class PiRpcClient extends EventEmitter implements PiClient {
    * back as events, which is what lets a task keep running after the browser
    * that started it has gone away.
    */
-  async prompt(message: string): Promise<void> {
-    const res = await this.send("prompt", { message });
+  async prompt(message: string, options?: { images?: ImageContent[]; steer?: boolean }): Promise<void> {
+    const res = await this.send("prompt", {
+      message,
+      ...(options?.images?.length ? { images: options.images } : {}),
+      // pi refuses a prompt during a run unless told how to queue it.
+      streamingBehavior: options?.steer ? "steer" : "followUp",
+    });
     if (res.success === false) throw new Error(res.error || "pi rejected the prompt");
   }
 
@@ -127,8 +140,8 @@ export class PiRpcClient extends EventEmitter implements PiClient {
 
   // --- config, expressed as RPC commands ---
 
-  private async data<T>(type: string, params: Record<string, unknown> = {}): Promise<T> {
-    const res = await this.send(type, params);
+  private async data<T>(type: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+    const res = await this.send(type, params, timeoutMs);
     if (res.success === false) throw new Error(res.error || `pi rejected '${type}'`);
     return res.data as T;
   }
@@ -138,7 +151,9 @@ export class PiRpcClient extends EventEmitter implements PiClient {
   }
 
   async getStats(): Promise<PiStats> {
-    return this.data<PiStats>("get_session_stats");
+    const d = await this.data<Partial<PiStats> | undefined>("get_session_stats");
+    // pi leaves the usage out with no model, or a window of 0; the readers of the stats take it to be there, as the SDK client's always is.
+    return { ...d, contextUsage: d?.contextUsage ?? { tokens: null, contextWindow: 0, percent: null } } as PiStats;
   }
 
   async getThinkingLevels(): Promise<string[]> {
@@ -174,11 +189,11 @@ export class PiRpcClient extends EventEmitter implements PiClient {
   }
 
   async compact(): Promise<void> {
-    await this.data("compact");
+    await this.data("compact", {}, LONG_COMMAND_MS);
   }
 
   async reload(): Promise<void> {
-    await this.data("reload");
+    await this.data("reload", {}, LONG_COMMAND_MS);
   }
 
   async exportSession(): Promise<string> {
