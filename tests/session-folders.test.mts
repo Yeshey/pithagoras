@@ -12,6 +12,7 @@ import {
   readOpenFolders,
   sortFolders,
   folderKeys,
+  folderNameOf,
   hasMoreThanHome,
 } from "../web/src/session-folders.ts";
 
@@ -135,6 +136,12 @@ test("each agent's home is a folder named after it, the first one keeping Home's
   assert.deepEqual(folders.slice(0, 2).map((f) => f.newChats), [undefined, undefined]);
   // By name the first agent comes first, then the others, then the projects.
   assert.deepEqual(keys(sortFolders(folders, "name")).slice(0, 3), [HOME, "agent:scout", projectKey("empty")]);
+});
+
+test("a chat's folder is named, not its path; nothing until the places are known", () => {
+  const nameOf = folderNameOf(chats, places);
+  assert.deepEqual(chats.map((s) => nameOf(s)), ["Home", "site", "site", "notes", "Elsewhere"]);
+  assert.equal(folderNameOf(chats, null)(chats[0]), "");
 });
 
 test("the folder of the agent that New starts chats with carries the flag, the others do not", () => {
