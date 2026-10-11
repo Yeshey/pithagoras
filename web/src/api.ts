@@ -128,6 +128,8 @@ export interface Agent {
   sandboxUser: string;
   /** The Home there always was: the one chats go to when none is named, which cannot be deleted. */
   first: boolean;
+  /** Whether the New button starts a chat with it. */
+  newChats: boolean;
   initialised: boolean;
   chats: number;
   /** The channels that talk as it. */
@@ -456,7 +458,7 @@ export const api = {
   logout: () => json<{ ok: true }>("/api/auth/logout", { method: "POST" }),
   workspaces: () => json<{ root: string; workspaces: Workspace[] }>("/api/workspaces"),
   sessions: () => json<{ sessions: Session[]; executor: string }>("/api/sessions"),
-  /** Without a workspace the chat starts in Home. */
+  /** Without a workspace the chat starts in the home of the agent New is set to. */
   createSession: (workspace?: string, title?: string) =>
     json<Session>("/api/sessions", {
       method: "POST",
@@ -464,7 +466,7 @@ export const api = {
     }),
   projects: () => json<{ root: string; home: string; projects: Project[] }>("/api/projects"),
   /** Only where Home is and which projects there are, without their counts: see /api/projects. */
-  places: () => json<{ root: string; home: string; agents?: { id: string; name: string; home: string }[]; projects: { name: string; path: string }[] }>("/api/projects?bare=1"),
+  places: () => json<{ root: string; home: string; agents?: { id: string; name: string; home: string; newChats?: boolean }[]; projects: { name: string; path: string }[] }>("/api/projects?bare=1"),
   /** `toolsOff`: the tools its chats start with off, as for setProjectTools. `toolsError` says the project was made without them. */
   createProject: (name: string, instructions?: string, toolsOff?: string[]) =>
     json<Project & { toolsError?: string }>("/api/projects", {
@@ -872,6 +874,9 @@ export const api = {
       `/api/agents/${encodeURIComponent(id)}?folder=${folder}`,
       { method: "DELETE" }
     ),
+  /** On makes it the agent the New button starts with; off hands that back to the first agent. */
+  setNewChats: (agent: string, on: boolean) =>
+    json<Agent>(`/api/agents/${encodeURIComponent(agent)}/new-chats`, { method: "PUT", body: JSON.stringify({ on }) }),
   setAgentVoice: (agent: string, voice: string) =>
     json<Agent>(`/api/agents/${encodeURIComponent(agent)}/voice`, { method: "PUT", body: JSON.stringify({ voice }) }),
   agentSkills: (agent: string) => json<{ folder: string; skills: AgentSkill[] }>(`/api/agents/${encodeURIComponent(agent)}/skills`),
