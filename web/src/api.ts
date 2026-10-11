@@ -793,6 +793,14 @@ export const api = {
   audit: (limit = 200) => json<{ entries: AuditEntry[] }>(`/api/audit?limit=${limit}`),
   /** Up to and including `through`, the newest entry the caller has seen. */
   clearAudit: (through: number) => json<{ removed: number }>(`/api/audit?through=${through}`, { method: "DELETE" }),
+  /** What the server printed; with `since`, only what came after that line. */
+  logs: (opts: { since?: number; level?: LogLevel; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.since !== undefined) q.set("since", String(opts.since));
+    if (opts.level) q.set("level", opts.level);
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return json<LogsResponse>(`/api/logs?${q}`);
+  },
   toolRules: () => json<{ rules: ToolRule[] }>("/api/tool-rules"),
   addToolRule: (rule: {
     role: string;
@@ -1313,6 +1321,25 @@ export interface ToolRule {
   person_key: string | null;
   note: string;
   created_at: string;
+}
+
+export type LogLevel = "info" | "warn" | "error";
+
+/** One line the server printed, for Settings → Logs. */
+export interface LogLine {
+  id: number;
+  at: string;
+  level: LogLevel;
+  text: string;
+}
+
+/** `boot` changes when the server starts again, and the ids with it. */
+export interface LogsResponse {
+  boot: string;
+  last: number;
+  /** Lines after `since` were let go before they were read, so `lines` does not join what the page holds. */
+  gap?: boolean;
+  lines: LogLine[];
 }
 
 /** One decision the guard made, for the audit view. */
