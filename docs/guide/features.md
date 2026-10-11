@@ -396,6 +396,10 @@ which the agent looks things up in and adds to through its tools
 (`understory_memory_query`, `…_add`, `…_update`, `…_status`, `…_maintain`).
 The bundle is human-readable and git-diffable.
 
+A [project](/guide/projects#an-agent-for-a-project) can do without it: its **Understory
+as memory** switch is off, and its chats are neither told about Understory nor have it
+instead of the agent's `MEMORY.md`. Home keeps it, and so does a project with an agent unless it is switched off; a blank-slate project has no agent and so no Understory.
+
 ### Running it here
 
 With Docker access (see [Docker add-ons](/guide/add-ons#docker-access)), the
