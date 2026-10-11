@@ -1361,6 +1361,17 @@ export function getSkipThinkingProviders(): string[] | undefined {
   }
 }
 
+/** The model spoken turns run on, as saved in the voice settings; undefined where they use the chat's own. */
+export function getVoiceModel(): { provider: string; modelId: string } | undefined {
+  try {
+    const saved = JSON.parse(getSetting("voice") ?? "{}").voiceModel;
+    const at = typeof saved === "string" ? saved.indexOf("/") : -1;
+    return at > 0 && at < saved.length - 1 ? { provider: saved.slice(0, at), modelId: saved.slice(at + 1) } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Whether voice mode can speak: the add-on is on, with a speech engine (not recognition alone). */
 export function voiceSpeaks(): boolean {
   try {
@@ -1418,6 +1429,16 @@ export function chatModel(
   settings: GlobalSettings = getSettings(),
 ): { provider: string; model: string } {
   return { provider: session.provider || settings.provider, model: session.model || settings.model };
+}
+
+/**
+ * Writes a chat's model to its row when nothing names one for it, not even the
+ * defaults. pi reopens such a chat on the model of its last answer, and after a
+ * spoken turn on the voice model that would be the voice model.
+ */
+export function keepChatModel(sessionId: string, provider: string, model: string): void {
+  const row = getSession(sessionId);
+  if (row && !chatModel(row).model) updateSession(sessionId, { provider, model });
 }
 
 export { SETTING_DEFAULTS as getSettingDefaults };
