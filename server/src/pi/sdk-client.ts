@@ -6,6 +6,11 @@ import { EDIT_IMAGE_SOURCE, EDIT_IMAGE_TOOL, GENERATE_IMAGE_SOURCE, GENERATE_IMA
 import { GENERATED_PICTURE_MARK } from "../generated-picture.js";
 import { acceptPrompt } from "./accept-prompt.js";
 import { AUDIO_MESSAGE_PREFIX, AudioRule, VoiceFirstTurn, audioMessage, spokenIn } from "./voice-first.js";
+import { sandboxTools } from "../sandbox/tools.js";
+import { sandboxOn } from "../sandbox/policy.js";
+import { projectSkillPaths, withoutFolderMcp } from "../sandbox/project-trust.js";
+import { agentSkillsDir, skillsLine } from "../agent-skills.js";
+import { agentFilesAt, agentFor, understoryAt } from "../project-agent.js";
 import { crossModelThinkingExtension } from "./cross-model-thinking.js";
 import { BROWSER_READING_RULE, BROWSER_SCREENSHOT_RULE } from "./browser-mcp-rules.js";
 import { browserTools } from "../browser/tools.js";
@@ -25,10 +30,10 @@ import { heartbeatTool } from "./heartbeat-tool.js";
 import { askPrimaryTool } from "./ask-primary.js";
 import { proxyBaseUrl } from "../llama-progress.js";
 import { bridgeSubagents, SUBAGENT_INPUT, SUBAGENT_STOP, type Bridge } from "../subagent-protocol.js";
-import { contextWindowFor, getSkipThinkingProviders, getVoiceInstructions, portalBrowserOn, voiceSpeaks } from "../db.js";
+import { contextWindowFor, getSkipThinkingProviders, getVoiceInstructions, getVoiceModel, portalBrowserOn, voiceSpeaks } from "../db.js";
 import { configStamp, isLlamaProvider } from "../providers.js";
 import { rereadConfig } from "./model-runtime.js";
-import { UNDERSTORY_RULE, understoryOn } from "../features.js";
+import { UNDERSTORY_RULE } from "../features.js";
 
 /** A message on its way into pi: see SdkPiClient.prompt(). */
 interface Handoff {
@@ -48,10 +53,20 @@ function asArray(v: any): any[] {
 /**
  * While Understory holds the agent's memory, MEMORY.md is not read: two
  * memories would drift apart, and the file would be the stale one. It stays
- * where it is, and is read again once Understory is switched off.
+ * where it is, and is read again once Understory is switched off. Asked for
+ * the place the chat works in, since a project can do without Understory.
  */
-const filesFor = (role?: string) =>
-  !role || role === "primary" ? (understoryOn() ? CONTEXT_FILES.filter((f) => f !== "MEMORY.md") : CONTEXT_FILES) : SHARED_FILES;
+const filesFor = (cwd: string, role?: string) =>
+  !role || role === "primary" ? (understoryAt(cwd) ? CONTEXT_FILES.filter((f) => f !== "MEMORY.md") : CONTEXT_FILES) : SHARED_FILES;
+
+/**
+ * Where the agent's own files are read from for a chat working in `cwd`: the
+ * folder itself, which is the agent's home for a chat there. A chat in a
+ * project that is linked to an agent reads the agent's home instead, and the
+ * project's folder, which the agent can write to, is not a place to take its
+ * soul from. A blank-slate project has none: only its AGENTS.md, which pi reads.
+ */
+const filesIn = agentFilesAt;
 
 /**
  * pi's own theme, for extensions that style text with it even when nothing
@@ -96,8 +111,10 @@ const piTheme = () => (globalThis as Record<symbol, unknown>)[THEME_KEY];
  */
 export function extraContextFiles(cwd: string, role?: string): { path: string; content: string }[] {
   const out: { path: string; content: string }[] = [];
-  for (const name of filesFor(role)) {
-    const file = path.join(cwd, name);
+  const from = filesIn(cwd);
+  if (!from) return out;
+  for (const name of filesFor(cwd, role)) {
+    const file = path.join(from, name);
     try {
       if (existsSync(file)) out.push({ path: file, content: readFileSync(file, "utf8") });
     } catch {
@@ -115,16 +132,20 @@ export function extraContextFiles(cwd: string, role?: string): { path: string; c
  * material, and the model read its own identity as notes about a third party.
  * One line at system level is enough to change what they are.
  */
-function ownFiles(cwd: string, role?: string): string[] {
-  const present = filesFor(role).filter((name) => {
+export function ownFiles(cwd: string, role?: string): string[] {
+  const from = filesIn(cwd);
+  if (!from) return [];
+  const present = filesFor(cwd, role).filter((name) => {
     try {
-      return existsSync(path.join(cwd, name));
+      return existsSync(path.join(from, name));
     } catch {
       return false;
     }
   });
+  // In a project the files are not in the working directory: they are the agent's the project works with.
+  const where = from === cwd ? "in your working directory" : "of the agent this project works with";
   return present.length
-    ? [`${present.join(", ")} in your working directory are yours, not reference material about someone else. Each opens with a block saying what it is for; follow it.`]
+    ? [`${present.join(", ")} ${where} are yours, not reference material about someone else. Each opens with a block saying what it is for; follow it.`]
     : [];
 }
 
@@ -159,10 +180,25 @@ function portalLoader(pi: any): new (options: unknown, rule: AudioRule, said?: (
     private readonly rule: AudioRule;
     /** Lines that depend on how the portal is set up now, asked each time like the rule. */
     private readonly said: () => string[];
+    /** The skill paths the portal gives, before a folder's own are added to them. */
+    private readonly portalSkillPaths: string[];
     constructor(options: unknown, rule: AudioRule, said: () => string[] = () => []) {
       super(options);
       this.rule = rule;
       this.said = said;
+      this.portalSkillPaths = [...((options as { additionalSkillPaths?: string[] }).additionalSkillPaths ?? [])];
+    }
+    /**
+     * While the sandbox is on, the chat's folder is the agent's to write, and
+     * pi runs inside the portal: its extensions, packages and settings are not
+     * taken from there, and its skills are (see sandbox/project-trust.ts).
+     * Decided at each load, as switching the sandbox reloads the open chats.
+     */
+    async reload(options?: unknown): Promise<void> {
+      const sandboxed = sandboxOn();
+      this.settingsManager.setProjectTrusted(!sandboxed);
+      this.additionalSkillPaths = [...this.portalSkillPaths, ...(sandboxed ? projectSkillPaths(this.cwd) : [])];
+      return super.reload(options);
     }
     getAppendSystemPrompt(): string[] {
       return [...super.getAppendSystemPrompt(), ...this.said(), ...(this.rule?.lines() ?? [])];
@@ -359,6 +395,8 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     subagentModel?: () => string | undefined;
     /** The agent whose heartbeat this is: gives it the note tool. See heartbeat.ts. */
     heartbeatAgent?: string;
+    /** Told the chat's model when a spoken turn is about to run on another: see useVoiceModel. */
+    rememberChatModel?: (provider: string, modelId: string) => void;
   }): Promise<SdkPiClient> {
     // Imported lazily so the server still boots (and the container executor
     // still works) if the SDK cannot initialise in this environment.
@@ -375,6 +413,7 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     // The CLI wires this up for you; here it has to be asked for.
     const voiceFirst = new VoiceFirstTurn(getSkipThinkingProviders);
     let resourceLoader: any;
+    const settingsManager = pi.SettingsManager.create(opts.cwd, pi.getAgentDir());
     // What the conversation has switched off: the client's, once there is one.
     let switchedOff: () => ReadonlySet<string> = () => new Set(opts.toolsOff ?? []);
     // Whether the model has the tool is settled when pi loads it and by the tool switches: the rule says
@@ -393,6 +432,8 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       // Both are required: the constructor resolves each and throws on
       // undefined, which previously left every session with no extensions.
       const builtinSkills = builtinSkillsDir();
+      // The skills the agent wrote for itself, in its own home: a chat in a project is the one the project is linked to, else the first agent's.
+      const skillsOf = agentFor(opts.cwd);
       // Every session, unconditionally: the point is to limit what a turn can do
       // after it reads something untrusted, and any session can read something.
       const factories: { name: string; factory: (pi: any) => void }[] = [
@@ -407,8 +448,11 @@ export class SdkPiClient extends EventEmitter implements PiClient {
             opts.browserNow ?? (() => ({ allowed: false, allowlist: [] })),
             opts.cwd,
             [path.join(pi.getAgentDir(), "skills"), ...(builtinSkills ? [builtinSkills] : [])],
+            () => switchedOff(),
           ) },
       ];
+      // While the sandbox is on, pi's own tools do what they do to the system as the sandbox user: see sandbox/.
+      factories.push({ name: "sandbox", factory: await sandboxTools(pi, opts.cwd) });
       if (canvases) factories.push({ name: "canvases", factory: canvases.extension });
       // Beside the canvases: both are how the agent puts something on the screen.
       if (opts.sessionId) factories.push({ name: SHOW_IMAGE_SOURCE, factory: showImageTool(opts.cwd) });
@@ -438,12 +482,17 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       }
       resourceLoader = new (portalLoader(pi))({
         cwd: opts.cwd,
+        // One for the loader and the session, so the folder's trust the loader decides holds for both.
+        settingsManager,
+        // The MCP adapter reads no config from the folder, and starts no server there, while the sandbox is on.
+        extensionsOverride: (loaded: { extensions: any[] }) => (sandboxOn() ? withoutFolderMcp(loaded) : loaded),
         ...(eventBus ? { eventBus } : {}),
         agentDir: pi.getAgentDir(),
         // Available everywhere without being installed, and not editable in
         // place: they belong to the image, so an edit would be lost on the next
         // deploy without saying so.
-        ...(builtinSkills ? { additionalSkillPaths: [builtinSkills] } : {}),
+        // Its own only once it has one: pi reports a skill path that is not there as an error.
+        additionalSkillPaths: [...(builtinSkills ? [builtinSkills] : []), ...(skillsOf && existsSync(agentSkillsDir(skillsOf)) ? [agentSkillsDir(skillsOf)] : [])],
         // The portal's own extensions, inline rather than an installed package:
         // the portal owns routines, so a package would have to call back over
         // HTTP to reach the database it sits beside. The list is built above,
@@ -469,7 +518,9 @@ export class SdkPiClient extends EventEmitter implements PiClient {
         // A conversation with anyone else had no memory to replace.
       }, audioRule, () => [
         ...ownFiles(opts.cwd, opts.role),
-        ...((!opts.role || opts.role === "primary") && understoryOn() ? [UNDERSTORY_RULE] : []),
+        // Where its own skills go: only for the person it works for; a look or a colleague does not write them.
+        ...(skillsOf && (!opts.role || opts.role === "primary") && !opts.heartbeatAgent ? [skillsLine(skillsOf)] : []),
+        ...((!opts.role || opts.role === "primary") && understoryAt(opts.cwd) ? [UNDERSTORY_RULE] : []),
       ]);
       await resourceLoader.reload();
     } catch (e) {
@@ -511,7 +562,7 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       cwd: opts.cwd,
       sessionManager,
       modelRuntime,
-      ...(resourceLoader ? { resourceLoader } : {}),
+      ...(resourceLoader ? { resourceLoader, settingsManager } : {}),
       ...(model ? { model } : {}),
       ...(opts.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
     });
@@ -519,6 +570,7 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     const client = new SdkPiClient(session, modelRuntime, () => {});
     switchedOff = () => client.switchedOff;
     client.portalSessionId = opts.sessionId;
+    client.rememberChatModel = opts.rememberChatModel;
     client.canvases = canvases;
     if (eventBus && resourceLoader) {
       client.bus = eventBus;
@@ -538,9 +590,7 @@ export class SdkPiClient extends EventEmitter implements PiClient {
       client.sayAudioRuleEachTurn();
     }
     const unsub = session.subscribe((event: any) => {
-      // Before anything is measured against the window: pi swaps the model for the
-      // registry's whenever an extension registers a provider, and that undoes it.
-      if (event?.type === "agent_start") client.applyLimitQuietly();
+      client.noteRun(event);
       canvases?.observe(event);
       // As pi emits it, not as forward() passes it on: a queue_update held
       // behind a settle would be too late for the prompt() that caused it.
@@ -749,9 +799,13 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     options?: { voice?: boolean; images?: ImageContent[]; steer?: boolean },
   ): Promise<PromptTaken> {
     if (options?.voice) {
+      this.useVoiceModel();
       this.voiceFirst?.arm(this.isIdle());
     } else {
       this.voiceFirst?.reset();
+      // Typed into the moment between idle and settled: the voice model is not
+      // for this one, and the settle that would put the chat back is a run late.
+      this.restoreChatModel();
     }
     const ruleFromThis = this.sayAudioRule(options?.voice === true);
     const promptOptions = {
@@ -787,6 +841,7 @@ export class SdkPiClient extends EventEmitter implements PiClient {
         error => {
           if (options?.voice) this.voiceFirst?.reset();
           if (ruleFromThis) this.unsayAudioRule();
+          this.restoreChatModel();
           const reason = error instanceof Error ? error.message : String(error);
           this.emit("event", { type: "portal_failed", error: `${options?.voice ? "Voice turn" : "The run"} failed: ${reason}` });
         },
@@ -794,6 +849,7 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     } catch (error) {
       if (options?.voice) this.voiceFirst?.reset();
       if (ruleFromThis) this.unsayAudioRule();
+      this.restoreChatModel();
       throw error;
     }
     finally {
@@ -803,7 +859,77 @@ export class SdkPiClient extends EventEmitter implements PiClient {
     if (idleWhenTaken && !this.session.isIdle) return { outcome: "started" };
     // Taken by an extension, and not into the conversation.
     if (ruleFromThis) this.unsayAudioRule();
+    this.restoreChatModel();
     return { outcome: "handled" };
+  }
+
+  /** What the model in use depends on at the start and the end of a run, from pi's events as they come. */
+  noteRun(event: any): void {
+    // Before anything is measured against the window: pi swaps the model for the
+    // registry's whenever an extension registers a provider, and that undoes it.
+    if (event?.type === "agent_start") this.applyLimitQuietly();
+    // See restoreChatModel for the settle that comes in a run late.
+    if (event?.type === "agent_settled") this.restoreChatModel();
+  }
+
+  /** The chat's model and the voice model's name, while a spoken turn runs on the voice model instead: see useVoiceModel. */
+  private displaced?: { chat: any; provider: string; id: string };
+
+  /** Set by create(): where the chat's model is kept for a chat that names none. */
+  rememberChatModel?: (provider: string, modelId: string) => void;
+
+  /**
+   * Puts a spoken turn on the model the voice settings name, where one is named.
+   *
+   * Only for a turn that starts a run: a spoken message into a run that is
+   * going is answered by the model that run is on. The model is put on the
+   * agent's state, as applyContextLimit does, rather than through setModel,
+   * which would write a model change into the conversation and make the voice
+   * model pi's default for every other chat. The chat's model stays what the
+   * chat has chosen, and is back once the run has settled: restoreChatModel.
+   *
+   * pi marks itself idle a moment before it emits agent_settled, while the
+   * extensions' handlers are awaited. A spoken message in that moment finds the
+   * previous run's voice model still in place and keeps it, and the late settle
+   * is ignored while a run is going (restoreChatModel). Known limit: pi awaits
+   * the extensions' input handlers before it marks the next run as running, and
+   * a settle that falls into that wait still counts as idle, so that one spoken
+   * message may be answered by the chat's model. Closing it would mean tying
+   * each borrow to the run it was made for, which pi's events do not name.
+   */
+  private useVoiceModel(): void {
+    if (this.displaced || !this.isIdle()) return;
+    const wanted = getVoiceModel();
+    if (!wanted) return;
+    const current = this.session.model;
+    if (current?.provider === wanted.provider && current?.id === wanted.modelId) return;
+    const model = viaProgressProxy(this.modelRuntime.getModel(wanted.provider, wanted.modelId), this.portalSessionId);
+    if (!model) {
+      console.error(`[portal] voice model ${wanted.provider}/${wanted.modelId} not found; the chat's model answers`);
+      return;
+    }
+    this.displaced = { chat: current, provider: wanted.provider, id: wanted.modelId };
+    // A chat that names no model anywhere is reopened by pi on the model of the
+    // last answer, which would be this one: the portal keeps the chat's own.
+    if (current) this.rememberChatModel?.(current.provider, current.id);
+    this.session.agent.state.model = model;
+    this.applyLimitQuietly();
+  }
+
+  /**
+   * The chat's own model again after a spoken turn. Not while a run is going:
+   * pi is idle a moment before it settles, and a settle that arrives after the
+   * next run has begun is the previous run's. Left alone where the person
+   * picked another model meanwhile: that choice is theirs (see setModel).
+   */
+  restoreChatModel(): void {
+    const displaced = this.displaced;
+    if (!displaced || !this.isIdle()) return;
+    this.displaced = undefined;
+    const current = this.session.model;
+    if (current?.provider !== displaced.provider || current?.id !== displaced.id) return;
+    this.session.agent.state.model = displaced.chat;
+    this.applyLimitQuietly();
   }
 
   /**
@@ -1282,6 +1408,8 @@ export class SdkPiClient extends EventEmitter implements PiClient {
   async setModel(provider: string, modelId: string): Promise<void> {
     const model = this.modelRuntime.getModel(provider, modelId);
     if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
+    // A pick ends the borrow, even of the voice model itself: it is the chat's now.
+    this.displaced = undefined;
     await this.session.setModel(viaProgressProxy(model, this.portalSessionId) ?? model);
     this.applyLimitQuietly();
   }
