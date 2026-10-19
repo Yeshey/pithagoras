@@ -1,6 +1,9 @@
 import { test, expect } from './portal-mock';
 import { settled } from './settled';
 import { readFileSync } from 'node:fs';
+
+// An extension's window at the side: the portal's tests' stand-in for one, opening on each command the agent runs.
+test.use({ installed: ['tests/fixtures/extensions/console'] });
 const sample = readFileSync(new URL('../fixtures/jfk.wav', import.meta.url));
 // A 2×2 PNG, as a picture from the phone or the folder would be.
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==', 'base64');
@@ -13,8 +16,6 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/test-speech.wav', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
   await page.route('**/voice/speech', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
   await page.route('**/api/sessions/test/picture?**', route => route.fulfill({ body: png, contentType: 'image/png' }));
-  await page.route('**/api/sessions/test/files?**', route => route.fulfill({ json: { path: 'src', entries: [{ name: 'app.ts', type: 'file', size: 3, mtime: 1 }], truncated: false } }));
-  await page.route('**/api/sessions/test/file?**', route => route.fulfill({ json: { binary: false, size: 3, mtime: 1, content: 'abc' } }));
 });
 
 async function start(page: import('@playwright/test').Page) {
@@ -140,49 +141,19 @@ test('a file dropped on the voice stage is taken there once, not again by the ch
 
 test('tool cards say what came of a call, and open what they are about', async ({ page }) => {
   await start(page);
-  // The terminal can be opened before the agent has run anything.
-  await page.getByRole('button', { name: 'Show terminal' }).click();
-  await expect(page.getByLabel('Agent terminal output')).toContainText('No commands yet');
-  await page.getByRole('button', { name: 'Minimize terminal' }).click();
+  // The console can be opened before the agent has run anything.
+  await page.getByRole('button', { name: 'Show console' }).click();
+  await expect(page.getByLabel('Console output')).toContainText('No commands yet');
+  await page.getByRole('button', { name: 'Minimize console' }).click();
   await page.getByRole('button', { name: 'Start search' }).click();
   const search = page.locator('.voice-tool-float', { hasText: 'Searching for “retry”' });
   await expect(search).toBeVisible();
   // Still there after the old eight seconds would have faded it, counting.
   await page.waitForTimeout(4200);
   await expect(search).toContainText(/\d+ s/);
+  // What came of an edit; what its card opens is the window of an extension that says it is for files (Files').
   await page.getByRole('button', { name: 'Edit file' }).click();
-  const edit = page.getByRole('button', { name: /Editing app\.ts/ });
-  await expect(edit).toContainText('+2 −1');
-  await edit.click();
-  await expect(page.getByRole('region', { name: 'Files' })).toBeVisible();
-  await expect(page.getByLabel('Contents of src/app.ts')).toHaveValue('abc');
-});
-
-test('the Files window of voice mode leaves the edit of the chat\'s own Files panel where it is', async ({ page }) => {
-  await page.goto('/tests/voice.html');
-  // An edit in the chat's Files panel that is not saved.
-  await page.getByRole('button', { name: 'Files', exact: true }).click();
-  await page.getByRole('button', { name: /^app\.ts/ }).click();
-  await page.getByLabel('Contents of app.ts').fill('edited by hand');
-  const kept = () => page.evaluate(() => sessionStorage.getItem('pithagoras.file-draft.test') ?? '');
-  await expect.poll(kept).toContain('edited by hand');
-  await page.getByRole('button', { name: 'Turn on hands-free voice' }).click();
-  await expect(page.getByRole('button', { name: 'End voice mode' })).toBeVisible({ timeout: 25000 });
-  // The voice stage's own window opens on the folder, ready to show what the agent does, not on a half-made edit of the other.
-  await page.getByRole('button', { name: 'Show files' }).click();
-  const window = page.locator('.voice-files-window', { has: page.getByRole('button', { name: 'Minimize files' }) });
-  await expect(window.getByRole('button', { name: /^app\.ts/ })).toBeVisible();
-  await expect(window.getByLabel('Contents of app.ts')).toHaveCount(0);
-  await expect(window.getByRole('button', { name: 'Following' })).toBeVisible();
-  // Clicking Following again lets go, and Follow takes it up again.
-  await window.getByRole('button', { name: 'Following' }).click();
-  await expect(window.getByRole('button', { name: 'Follow', exact: true })).toBeVisible();
-  await window.getByRole('button', { name: 'Follow', exact: true }).click();
-  await expect(window.getByRole('button', { name: 'Following' })).toBeVisible();
-  // And it did not take the chat's edit with it when it came: that is still kept, for a reload.
-  expect(await kept()).toContain('edited by hand');
-  await page.getByRole('button', { name: 'End voice mode' }).click();
-  await expect(page.getByLabel('Contents of app.ts')).toHaveValue('edited by hand');
+  await expect(page.locator('.voice-tool-float', { hasText: 'Editing app.ts' })).toContainText('+2 −1');
 });
 
 test('settings, push-to-talk, adding to a running task, the conversation and repeat', async ({ page }) => {
@@ -212,14 +183,14 @@ test('settings, push-to-talk, adding to a running task, the conversation and rep
   await settings.getByRole('group', { name: 'Push to talk' }).getByRole('button', { name: 'On' }).click();
   expect(await page.evaluate(() => [localStorage.getItem('voiceRate'), localStorage.getItem('voiceSteer'), localStorage.getItem('voicePtt')])).toEqual(['1.5', 'on', 'on']);
   await page.keyboard.press('Escape');
-  // With the canvas open beside the stage, the card is still on top of it.
-  await page.getByRole('button', { name: 'Session canvases' }).click();
-  await expect(page.getByLabel('Session canvas workspace')).toBeVisible();
+  // With a window an extension brought open on the stage, the card is still on top of it.
+  await page.getByRole('button', { name: 'Show console' }).click();
+  await expect(page.getByRole('region', { name: 'Console', exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Voice settings' }).click();
   const card = await settings.boundingBox();
   expect(await page.evaluate(([x, y]) => !!document.elementFromPoint(x, y)?.closest('.voice-settings'), [card!.x + card!.width / 2, card!.y + 20])).toBe(true);
   await page.keyboard.press('Escape');
-  await page.getByRole('button', { name: 'Close canvas' }).click();
+  await page.getByRole('button', { name: 'Minimize console' }).click();
   await expect(settings).toBeHidden();
   await expect(page.getByRole('button', { name: 'Hold to talk' })).toBeVisible();
   // Once the repeated reply (the fixture's long clip) has finished.
@@ -271,9 +242,9 @@ test('everything in voice mode has a key, and the keys can be changed', async ({
   await expect(page.getByRole('button', { name: 'Mute microphone' })).toBeVisible();
   // Windows open and close.
   await page.keyboard.press('t');
-  await expect(page.getByLabel('Agent terminal output')).toBeVisible();
+  await expect(page.getByLabel('Console output')).toBeVisible();
   await page.keyboard.press('t');
-  await expect(page.getByRole('button', { name: 'Show terminal' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Show console' })).toBeVisible();
   await page.keyboard.press('c');
   await expect(page.getByRole('region', { name: 'Conversation', exact: true })).toHaveClass(/is-open/);
   await page.keyboard.press('c');
@@ -327,16 +298,16 @@ test('everything in voice mode has a key, and the keys can be changed', async ({
 
 test('windows can be resized by their edges, until the windows are arranged anew', async ({ page }) => {
   await start(page);
-  await page.getByRole('button', { name: 'Show terminal' }).click();
-  const terminal = page.locator('.voice-terminal-window');
+  await page.getByRole('button', { name: 'Show console' }).click();
+  const consoleWindow = page.locator('.voice-extension-window[data-extension="test-console"]');
   await settled(page);
-  const before = (await terminal.boundingBox())!;
-  const grip = (await terminal.locator('.resize-sw').boundingBox())!;
+  const before = (await consoleWindow.boundingBox())!;
+  const grip = (await consoleWindow.locator('.resize-sw').boundingBox())!;
   await page.mouse.move(grip.x + 8, grip.y + 8);
   await page.mouse.down();
   await page.mouse.move(grip.x - 80, grip.y + 8 - 60, { steps: 6 });
   await page.mouse.up();
-  const after = (await terminal.boundingBox())!;
+  const after = (await consoleWindow.boundingBox())!;
   expect(after.width).toBeGreaterThan(before.width + 60);
   expect(after.height).toBeLessThan(before.height - 40);
   // The right edge stayed where it was.
@@ -344,32 +315,32 @@ test('windows can be resized by their edges, until the windows are arranged anew
   // Another window: the layout places both again.
   await page.getByRole('button', { name: 'Show the conversation' }).click();
   await settled(page);
-  expect(await terminal.evaluate(el => el.style.width)).toBe('');
+  expect(await consoleWindow.evaluate(el => el.style.width)).toBe('');
 });
 
 test('a window is sized from its corner with the arrow keys, and Home hands it back to the layout', async ({ page }) => {
   await start(page);
-  await page.getByRole('button', { name: 'Show terminal' }).click();
-  const terminal = page.locator('.voice-terminal-window');
+  await page.getByRole('button', { name: 'Show console' }).click();
+  const consoleWindow = page.locator('.voice-extension-window[data-extension="test-console"]');
   await settled(page);
-  const before = (await terminal.boundingBox())!;
+  const before = (await consoleWindow.boundingBox())!;
   // One grip of the five is reached with Tab: the corner.
-  const grip = terminal.getByRole('button', { name: 'Resize the window' });
+  const grip = consoleWindow.getByRole('button', { name: 'Resize the window' });
   await expect(grip).toHaveCount(1);
   await grip.focus();
   // Smaller, where it already fills the stage to the dock.
   await page.keyboard.press('Shift+ArrowLeft');
   await page.keyboard.press('ArrowUp');
   await page.keyboard.press('ArrowUp');
-  await expect(terminal).toHaveAttribute('data-sized', 'pin');
-  const after = (await terminal.boundingBox())!;
+  await expect(consoleWindow).toHaveAttribute('data-sized', 'pin');
+  const after = (await consoleWindow.boundingBox())!;
   expect(after.width).toBeCloseTo(before.width - 96, 0);
   expect(after.height).toBeCloseTo(before.height - 48, 0);
   // The corner moved, not the window: its left edge stayed.
   expect(after.x).toBeCloseTo(before.x, 0);
   await page.keyboard.press('Home');
-  await expect(terminal).not.toHaveAttribute('data-sized', /.+/);
-  expect(await terminal.evaluate(el => el.style.width)).toBe('');
+  await expect(consoleWindow).not.toHaveAttribute('data-sized', /.+/);
+  expect(await consoleWindow.evaluate(el => el.style.width)).toBe('');
 });
 
 test('the conversation window renders a reply as markdown, also while it is written, and puts it in a speech bubble apart from what the user said', async ({ page }) => {

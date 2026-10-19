@@ -17,9 +17,13 @@ curl -s -b jar localhost:4100/api/sessions
 
 | | |
 | --- | --- |
-| `GET /api/auth/status` | `{ authRequired, authed, shortPassword? }`. `shortPassword: true` is sent only to a signed-in caller, and only when the portal runs on a password shorter than 8 characters that it kept from before the minimum |
-| `POST /api/auth/login` | `{ password }` → sets the cookie |
-| `POST /api/auth/logout` | clears the cookie, and refuses the login it held from then on |
+| `GET /api/auth/status` | `{ authRequired, authed, oidc?, shortPassword? }`. `oidc: { name, only }` is there when single sign-on is set up and usable (the login page's button, and whether it is the only way in). `shortPassword: true` is sent only to a signed-in caller, and only when the portal runs on a password shorter than 8 characters that it kept from before the minimum |
+| `POST /api/auth/login` | `{ password }` → sets the cookie; 403 when OIDC only has switched the password login off |
+| `POST /api/auth/logout` | clears the cookie, and refuses the login it held from then on. `{ ok, endSession? }`: `endSession` is the provider's sign-out address, when the settings ask for it |
+| `GET /api/auth/sso` | The single sign-on settings: `{ mode, callbackPath, settings, only }`. `settings` is `null` when it is not set up, otherwise the issuer, client ID, redirect URL, scopes, button name and `endSession`, and `hasSecret` instead of the client secret, which is never sent back |
+| `PUT /api/auth/sso` | `{ current, settings, only? }` → saves them, or takes single sign-on out with `settings: null`. `current` is the current password (403 if wrong); 409 without a password set. The provider's discovery document and keys are read before anything is kept, so settings it does not answer to are 400 with the reason. `only` is the same flag that `GET` returns beside `settings`; left out, it stays as it is. A change of issuer, client ID or `only` ends every other login, and the caller is signed in again |
+| `GET /api/auth/oidc/start` | Browser route, not JSON: sets the state cookie and redirects (303) to the provider. `?returnTo=` is a path on the portal. 404 when single sign-on is not set up, 502 when the provider cannot be reached |
+| `GET /api/auth/oidc/callback` | Browser route: the provider's redirect back. Checks the state, `iss`, the code and the ID token, then sets the login cookie and redirects to `returnTo`; a refusal is a short HTML page. This path is the redirect URI to register at the provider |
 
 ## Workspaces
 
@@ -78,24 +82,21 @@ still be live.
 
 ## Files
 
-The files in the folder a session works in, whether that is a project, the
-workspace root or Home. Every path is relative to that folder; one that leads
-out of it, by `..` or by a link, is refused with 400.
+What the portal itself serves of the folder a session works in, whether that
+is a project, the workspace root or Home: a picture or a clip to draw in the
+page, and a file put there from the message box. Every path is relative to that
+folder; one that leads out of it, by `..` or by a link, is refused with 400.
+Browsing and changing the folder is the [Files](/guide/files#its-routes)
+extension's, at `/api/x/pithagoras-files/…`, and an extension's server half does
+it with [`portal.files`](/guide/extension-ui#a-chat-s-folder). Every refusal of
+these routes answers `{ error, code }`.
 
 | | |
 | --- | --- |
-| `GET /api/sessions/:id/files?path=` | `{ path, entries: [{ name, type, link?, size, mtime }], truncated }` — `type` is `dir`, `file` or `link` (a link that leads out of the folder or nowhere); `link: true` marks every link, including one to a folder inside this one that is listed as a `dir`. Folders first; `.git` is left out; at most 2,000 entries |
-| `GET /api/sessions/:id/file?path=` | `{ binary: false, size, mtime, content }`, or `{ binary: true, size, mtime }` for what is not text or is over 1 MB |
-| `GET /api/sessions/:id/file?path=&download=1` | The file, as a download |
-| `GET /api/sessions/:id/picture?path=` | A PNG, JPEG, GIF or WebP in the folder, to be drawn in the page, with the type its first bytes say it is and a `sandbox` content security policy. 400 for anything that is not one of those four, whatever its name; 413 over 25 MB. The Files panel, canvases and `show_image` use it |
-| `PUT /api/sessions/:id/file?path=` | `{ content, mtime? }` → saves it. With `mtime`, the time it was read at, the save is refused with 409 and `code: "conflict"` if the file has changed since. 413 over 1 MB. Every refusal of the file routes answers `{ error, code }` with `code` one of `invalid`, `missing`, `conflict`, `exists`, `too_large`, `failed` and `unsaved-work` |
-| `PUT /api/sessions/:id/file?path=` with `create: true` | `{ content, create: true }` → makes the file, and refuses with 409 if something already has the name |
-| `POST /api/sessions/:id/folder?path=` | `{ name }` → makes a folder in the folder at `path`, answers `{ path }`. 409 if the name is taken |
+| `GET /api/sessions/:id/picture?path=` | A PNG, JPEG, GIF or WebP in the folder, to be drawn in the page, with the type its first bytes say it is and a `sandbox` content security policy. 400 for anything that is not one of those four, whatever its name; 413 over 25 MB. Files and canvases use it, and the chat draws the pictures that tool calls give with it |
+| `GET /api/sessions/:id/video?path=` | A WebM or an MP4 in the folder, to be played in the page, with the type its first bytes say it is and a `sandbox` content security policy, in the parts a player asks for: `Range` is answered `206` with `Content-Range` (a single range of bytes; several, or another unit, get the whole file, and one past the end `416`), `Accept-Ranges: bytes`, `ETag`/`304`, and `If-Range` is honoured. 400 for anything that is not a WebM or an MP4, whatever its name; 413 over 100 MB. The chat's player uses it for the clips that tool calls give |
+| `GET /api/sessions/:id/file?path=` | Any plain file in the folder, to be saved and never shown: `application/octet-stream`, `Content-Disposition: attachment`, a `sandbox` content security policy, and ranges as for a clip. 400 for a folder or a link out of the folder, 404 for one that is not there. The chat links to it for a file a call gave that is neither a picture nor a clip |
 | `POST /api/sessions/:id/upload?path=&name=` | The file as the request body, sent as `application/octet-stream` → put in the folder at `path` as `name`, or `name (2)` and so on if that is taken; answers `{ path, size }`. Streamed to disk and put in place only once complete. 413 over 2 GB |
-| `PATCH /api/sessions/:id/file?path=` | `{ name }` → gives a file or folder another name in the same folder, and answers `{ path }`. 400 for a name with a `/` or `\`, or `.` or `..`; 409 if the name is taken. A link is renamed as the link |
-| `DELETE /api/sessions/:id/file?path=` | Removes a file, or a folder and all in it; a link is removed as the link. The folder itself is refused. A folder holding git work that exists nowhere else — uncommitted changes, commits no remote has, stashes — is refused with 409 and `code: "unsaved-work"` unless `discard=1` says it may go |
-| `GET /api/sessions/:id/unsaved?path=` | `{ unsaved }` — what deleting `path` would lose that nothing else has: `{ changed, unpushed, stashes, unknown? }`, or `null` for nothing. `unknown` means not everything could be read |
-| `GET /api/sessions/:id/archive?path=` | The folder — or, with `path`, a folder in it — as a `.tar.gz`, without `node_modules`, `.git`, `dist`, `build` and virtual environments. If `tar` cannot run the answer is a 500; if it fails part-way the download is cut off, so it does not end as if it were whole. A file that changes while it is read is not a failure |
 
 ## Prompting
 
@@ -104,10 +105,12 @@ out of it, by `..` or by a link, is refused with 400.
 | `POST /api/sessions/:id/prompt` | `{ message, images?, voice?, steer? }` — `images` is up to eight `{ data }`, each base64 or a `data:` URL of a PNG, JPEG, GIF or WebP under 5 MB. The type is read from the bytes. `message` may be empty when there are pictures. Sent while a run is going, a message waits for the run to end; with `steer: true` it goes into that run instead, after the tools running now |
 | `GET /api/sessions/:id/images/:name` | A picture sent with a message; `portal_prompt` events name them in `payload.images` |
 | `POST /api/sessions/:id/abort` | Stop the current run |
-| `POST /api/sessions/:id/ui-response` | `{ id, value?, cancelled? }` — answer an extension dialog |
-| `GET /api/tools` | `{ tools, off }` — every tool the portal has seen, and which are off by default. With `EXECUTOR=container` this and the other tool routes answer 400 with `code: "tools-unsupported"` |
+| `POST /api/sessions/:id/ui-response` | `{ id, value?, cancelled? }` — answer an extension dialog. For the agent's `ask_question` the value is an object of answers by question id; its questions are stored as the chat's `portal_question` events, and how each ended (`answered` with its `answers`, `cancelled`, `expired`, `stopped`) as a `portal_question_end`, so a stream sends the ones still open again ahead of `caught-up`. A dialog has no time limit unless the extension names one, and a page that opens the chat while one waits is sent it again, ahead of `caught-up`. A routine run, a heartbeat look and a chat reached through a channel raise none: the extension is answered at once with no answer |
+| `GET /api/tools` | `{ tools, off, names, lazy, questionWaitMinutes }` — every tool the portal has seen, which are off by default, how long the agent's questions wait (see `PUT /api/ask-question`), and what is marked [lazy](/guide/extensions#lazy-tools): tool sets and single tools (`<tool>name`). A lazy tool carries `lazy: true`: it is on like any other but is reached through the `tools` tool instead of being offered one by one. An MCP server's tool carries `lazy: true` when its server leaves it to the adapter's `mcp` tool (no `directTools`; that is the default), and `mcp`: the server, whose setting says so (see `PUT /api/mcp/servers/:name/direct`). A tool that cannot be lazy, one of pi's own or the adapter's `mcp`, carries `noLazy: true`. Nothing else is lazy until marked. With `EXECUTOR=container` this and the other tool routes answer 400 with `code: "tools-unsupported"` |
+| `PUT /api/ask-question` | `{ waitMinutes }` — how long a question from the agent's `ask_question` waits for an answer: `0` (until it is answered, the default), `5`, `15`, `30` or `60`; anything else is a 400. The tool is offered wherever a person answers in the web UI (a chat, a conversation on the Agent page), not in a routine, a heartbeat or a chat reached through a channel. Read when a question is asked, so it applies to the next one |
 | `PUT /api/tools` | `{ off: string[] }` — the default for every conversation; applied to the running ones too. A [project](#projects) can bend it with `PUT /api/projects/:name/tools`, and a conversation then holds its exceptions against that |
-| `GET /api/sessions/:id/tools` | `{ tools, live, off }` — every tool the conversation could use and whether it is on. `live` is false when pi is not running to be asked |
+| `PUT /api/tools/lazy` | `{ lazy: string[] }` — the lazy marks: tool sets, named as the tools list names its boxes (a package, the browser, `<portal:media>` for the picture and video tools), and single tools as `<tool>name`. Answers `{ lazy, applied }`. Marking switches nothing: the tools stay on or off as they are, and a running conversation stops offering the lazy ones that are on one by one. A mark that names an MCP server's tools (they are lazy by their server's setting) or pi's built-in tools (the `built in` group) is refused with 400 and `code: "lazy-refused"`, and nothing is stored |
+| `GET /api/sessions/:id/tools` | `{ tools, live, off }` — every tool the conversation could use and whether it is on. `live` is false when pi is not running to be asked. A [lazy](/guide/extensions#lazy-tools) tool (not offered one by one, reached through the `tools` tool) carries `lazy: true` whether it is on or off here; off, it is not reachable. The project and routine tool lists mark it the same |
 | `PUT /api/sessions/:id/tools` | `{ off: string[] }` — switch tools off by name; everything not named is on |
 | `GET /api/tool-names` | What each package is called here; everything unnamed keeps its own name |
 | `PUT /api/tool-names` | `{ names }` — a name per package, MCP server or `built in`. An empty one removes it |
@@ -137,6 +140,12 @@ Each data message is one event:
 ```
 
 Track the highest `seq` you have seen and pass it as `since` when reconnecting.
+
+The stream also carries named events (`event: extension`, and
+a few of the portal's own). `extension` is what an installed extension's server
+half tells what it drew on the page: `{ "extension": "<package>", "data": … }`,
+first where things stand as the stream opens, then each thing as it is said.
+None of them has a `seq`, and none is stored.
 
 ::: warning Negative seq
 Live-only events — streaming message/tool updates, queue updates, prefill progress and extension dialogs — carry a negative `seq`. They are never
@@ -191,47 +200,53 @@ model.
 | --- | --- |
 | `DELETE /api/sessions/:id/messages/:seq` | Removes a message and the agent's answer to it. 409 while the chat is running, 404 for an unknown message |
 | `POST /api/sessions/:id/messages/:seq/edit` | `{ message }` — replaces the message: it and everything after it are dropped, and the new text is sent. The old text stays as another version |
+| `DELETE /api/sessions/:id/queued/:seq` | Takes back a message that was sent while the agent was working and has not been read yet. 409 once the agent has taken it in. The other queued messages keep their order (they are sent again under new numbers) |
+| `POST /api/sessions/:id/queued/:seq/send` | Sends a queued message now: stops the run and sends it first, with the other queued messages behind it in their order. 409 once the agent has taken it in |
 | `POST /api/sessions/:id/messages/:seq/version` | `{ to }` — shows another version of the message, and what followed it then |
 | `PUT /api/sessions/:id/draft` | `{ text, caret?: { start, end } }` — what is in the chat box, which an extension can ask for. Starts nothing |
 | `GET /api/sessions/:id/stats` | Context usage and token counts, without the model catalogue |
 
 ## Git
 
-The Git panel's routes, all for the folder of session `:id`. Each is refused when
-the folder is not a repository, except `init`. See [Git](/guide/git).
+The [Git](/guide/git) extension's routes (`extensions/git`), while it is installed,
+all for the folder of chat `:id`. Each is refused when the folder is not a
+repository, except `init` and `repos`. `?repo=` picks one of the repositories
+inside the folder, by its path relative to it.
 
 | | |
 | --- | --- |
-| `GET /api/sessions/:id/git` | Branch, upstream, ahead/behind, changed files, an operation in progress. Reads the disk only |
-| `GET /api/sessions/:id/git/gh` | Whether pull requests can be had through `gh`, and for which GitHub repository. `?fresh=1` asks again |
-| `POST /api/sessions/:id/git/init` | Make the folder a repository |
-| `GET /api/sessions/:id/git/diff?of=` | A diff: `of` is `unstaged`, `staged`, `untracked` (with `path`), `commit` (`sha`), `range` (`base`) or `stash` (`stash`) |
-| `POST …/git/stage` · `/unstage` · `/discard` | `{ paths }` or `{ all: true }` (not for `discard`) |
-| `POST …/git/commit` | `{ message, amend? }` |
-| `POST …/git/abort` · `/continue` | Abort or continue a paused merge or rebase |
-| `GET …/git/log` · `GET …/git/commits/:sha` | History, in pages; one commit with its files |
-| `GET …/git/branches` · `POST …/git/branches` · `POST …/git/branches/delete` | List, `{ name, from? }`, `{ name, force? }` |
-| `POST …/git/switch` | `{ name, remote? }` |
-| `POST …/git/fetch` · `/pull` · `/push` | Each answers `{ said }`; pull is fast-forward only |
-| `GET …/git/stashes` · `POST …/git/stashes` | List; `{ message? }` stashes the changes. `POST …/git/stashes/apply` · `/pop` · `/drop` with `{ ref, sha? }` act on one |
-| `GET …/git/compare?base=` | The branch against its base |
-| `GET …/git/pulls?state=` · `…/pulls/current` · `…/pulls/:n` · `…/pulls/:n/diff` | Pull requests, through `gh` |
-| `POST …/git/pulls` | `{ title, body, base?, draft? }` |
-| `POST …/git/pulls/:n/checkout` · `/merge` · `/comment` · `/review` | `merge`: `{ method, deleteBranch? }`; `comment`: `{ body }`; `review`: `{ action, body }` |
+| `GET /api/x/pithagoras-git/chats/:id` | Branch, upstream, ahead/behind, changed files, an operation in progress. Reads the disk only |
+| `GET …/chats/:id/repos` | The repositories inside the chat's folder, for the Repository picker |
+| `GET …/chats/:id/gh` | Whether pull requests can be had through `gh`, and for which GitHub repository. `?fresh=1` asks again |
+| `POST …/chats/:id/init` | Make the folder a repository |
+| `GET …/chats/:id/diff?of=` | A diff: `of` is `unstaged`, `staged`, `untracked` (with `path`), `commit` (`sha`), `range` (`base`) or `stash` (`stash`) |
+| `POST …/chats/:id/stage` · `/unstage` · `/discard` | `{ paths }` or `{ all: true }` (not for `discard`) |
+| `POST …/chats/:id/commit` | `{ message, amend? }` |
+| `POST …/chats/:id/abort` · `/continue` | Abort or continue a paused merge or rebase |
+| `GET …/chats/:id/log` · `GET …/chats/:id/commits/:sha` | History, in pages; one commit with its files |
+| `GET …/chats/:id/branches` · `POST …/chats/:id/branches` · `POST …/chats/:id/branches/delete` | List, `{ name, from? }`, `{ name, force? }` |
+| `POST …/chats/:id/switch` | `{ name, remote? }` |
+| `POST …/chats/:id/fetch` · `/pull` · `/push` | Each answers `{ said }`; pull is fast-forward only |
+| `GET …/chats/:id/stashes` · `POST …/chats/:id/stashes` | List; `{ message? }` stashes the changes. `POST …/stashes/apply` · `/pop` · `/drop` with `{ ref, sha? }` act on one |
+| `GET …/chats/:id/compare?base=` | The branch against its base |
+| `GET …/chats/:id/pulls?state=` · `…/pulls/current` · `…/pulls/:n` · `…/pulls/:n/diff` | Pull requests, through `gh` |
+| `POST …/chats/:id/pulls` | `{ title, body, base?, draft? }` |
+| `POST …/chats/:id/pulls/:n/checkout` · `/merge` · `/comment` · `/review` | `merge`: `{ method, deleteBranch? }`; `comment`: `{ body }`; `review`: `{ action, body }` |
 
 ## Terminal, background jobs and subagents
 
 | | |
 | --- | --- |
-| `POST /api/terminal` | `{ sessionId? }` → opens a shell in that session's folder (home otherwise); answers `{ id, cwd }` |
-| `GET /api/terminal/:id/stream` | Server-sent events: its output |
-| `POST /api/terminal/:id/input` · `/resize` | Keystrokes; the size of the panel |
-| `DELETE /api/terminal/:id` | Ends the shell |
+| `POST /api/x/pithagoras-terminal/terminal` | `{ chat? }` → opens a shell in that chat's folder (home otherwise); answers `{ id, cwd }`. The terminal extension's, while it is installed |
+| `GET /api/x/pithagoras-terminal/terminal/:id/stream` | Server-sent events: its output |
+| `POST /api/x/pithagoras-terminal/terminal/:id/input` · `/resize` | Keystrokes; the size of the panel |
+| `DELETE /api/x/pithagoras-terminal/terminal/:id` | Ends the shell |
 | `GET /api/sessions/:id/background` | `{ supported, jobs, …extension status, piRunning }` — background jobs are listed on the host executor on Linux only |
 | `GET /api/sessions/:id/background/:key/output` | A job's output; 404 when it is not in a file the portal can follow |
 | `POST /api/sessions/:id/background/:key/stop` · `/background/clear` | Stop one; clear the finished ones |
 | `POST /api/sessions/:id/subagents/:agent/input` | `{ text }` — say something to a running subagent. 409 when it cannot be reached |
 | `POST /api/sessions/:id/subagents/:agent/stop` | Stop it |
+| `POST /api/sessions/:id/extension-ui` | `{ extension, data }` — what an extension's browser half says to its own pi extension in the chat ([Building an extension](/guide/extension-ui)); starts the chat's agent if it was let go. 409 when the chat's agent does not run its extensions inside the portal |
 
 ## Model providers
 
@@ -244,7 +259,7 @@ the folder is not a repository, except `init`. See [Git](/guide/git).
 | `DELETE /api/providers/:id` | Remove one |
 | `GET /api/models` | Every model pi can use now — the ones with a key |
 | `GET /api/packages/catalog?q=&topic=` | Packages published for pi; `topic=provider` narrows to provider packages |
-| `GET /api/features/flags` | Only which opt-in features are on — for the sidebar and menus: `{ subagent: { enabled }, understory: { enabled }, images: { enabled } }`, where `images.enabled` is that image generation, or editing, is on and has an address, which is when the Images page is offered |
+| `GET /api/features/flags` | Only which opt-in features are on — for the sidebar and menus: `{ subagent: { enabled }, understory: { enabled }, images: { enabled }, videos: { enabled } }`, where `images.enabled` is that image generation, or editing, is on and has an address, and `videos.enabled` that video generation is on and has an address; the Media page is offered while either is |
 
 See [Models and providers](/guide/models).
 
@@ -281,13 +296,38 @@ The session routes answer 409 until Voice is enabled in Settings → Add-ons. Se
 
 ## Canvases
 
+The [Canvases](/guide/canvases) extension's routes (`extensions/canvas`), while
+it is installed, for chat `:id`. What changes is told to the pages open on the
+chat on its stream, as `event: extension` with `pithagoras-canvas`: all of its
+canvases when a page opens it, then each change.
+
 | | |
 | --- | --- |
-| `GET /api/sessions/:id/canvases` · `POST` | List; `{ title }` creates one |
-| `PUT /api/sessions/:id/canvases/:cid` | `{ revision, title, content }` — 409 when `revision` is stale |
-| `POST /api/sessions/:id/canvases/:cid/persist` | Store a temporary canvas |
-| `POST /api/sessions/:id/canvases/:cid/restore` | `{ revision }` — put back the text from before a write that was cut off (`restorable` in the canvas). 409 when `revision` is stale, a write is going on, or there is no earlier text |
-| `DELETE /api/sessions/:id/canvases/:cid` | Delete |
+| `GET /api/x/pithagoras-canvas/chats/:id/canvases` · `POST` | List; `{ title }` creates one |
+| `PUT …/chats/:id/canvases/:cid` | `{ revision, title, content }` — 409 when `revision` is stale |
+| `POST …/chats/:id/canvases/:cid/persist` | Store a temporary canvas |
+| `POST …/chats/:id/canvases/:cid/restore` | `{ revision }` — put back the text from before a write that was cut off (`restorable` in the canvas). 409 when `revision` is stale, a write is going on, or there is no earlier text |
+| `DELETE …/chats/:id/canvases/:cid` | `{ revision }` — Delete |
+
+## Updating the portal
+
+Settings → About → Update. Whoever is signed in may use it. A portal that does not run from a git checkout, or that runs from its source files under a file watcher, answers 404 `unavailable` to the last two.
+
+| | |
+| --- | --- |
+| `GET /api/update` | `{ kind, boot, branch, current, notice, checkedAt, rebuild, run }` from the portal's memory, the remote is not asked. `kind` is `git`, `container` (a container cannot rebuild itself), `dev` (source files under a watcher) or `none`; only `git` has the rest. `notice` is `{ count, target, since }` while `origin/main` has commits the checkout lacks. `rebuild` is true when `core/server/dist/.built-from` names another commit than the one checked out, and the build is still the one it was written for (a build made by hand is not). `boot` changes with each start of the portal. `run` is the update going on or the last one that failed: `{ state: "running" \| "restarting" \| "failed", steps, from, to, startedAt, failed? }`, with `failed` being `{ step, message, output, oldFilesBack }` (`oldFilesBack`: the old node_modules and builds are in place, as they were or put back; false once they have been thrown away for the new build, which is how a failed restart ends, or where putting them back failed) |
+| `POST /api/update/check` | Fetches `origin/main` and answers `{ branch, current, target, behind, ahead, changed, rebuild, problem, running }`. `problem` is `{ code, message }` with `code` `fetch`, `detached`, `dirty`, `diverged` or `restart` (a systemd service not set to start again), or `null`. `running` is the number of chats and runs the restart would stop. Changes nothing |
+| `POST /api/update` | `{ expect }` — required: the commit that was shown. Without it, or with anything but a commit id, 400 `invalid`, and nothing starts. Starts the update: 202 `{ run }`. Refused with 409 and a `code`: `busy` (one is running), `moved` (`origin/main` is not `expect` any more), `current` (nothing to update to, and the build is of the commit checked out), or the `problem` of a check |
+
+## Restarting the portal
+
+Settings → About → Restart. Whoever is signed in may use it.
+
+| | |
+| --- | --- |
+| `GET /api/restart` | `{ possible, by?, code?, reason?, running, loaded, keepsLogins }`. `possible` is true when something would start the portal again (`by`: `systemd`, `container`, `manager` or `copy`); otherwise `code` is `unsupervised`, `policy` or `update` (an update is running) and `reason` says why. `loaded` is the list of extensions this start of the portal runs (null until known), `keepsLogins` whether a login outlives the restart (`PORTAL_SECRET` is set). `running` is the number of chats and runs a restart would stop. Changes nothing |
+| `POST /api/restart` | `{ confirm: true }` — required; without it 400 `confirm`, and nothing happens. 202 `{ restarting: true, boot }`, and the portal ends with status 75 a moment later. 409 `unsupervised` or `policy` where nothing would start it again, 409 `update` while an update runs, 409 `busy` while a restart is on its way (`POST /api/update` answers 409 `restarting` then). Written to the log |
+| `GET /api/health` | `{ ok: true, boot }`, without a login, while the portal is up. `boot` changes with each start of the portal, so a client that asked for a restart waits for another one |
 
 ## Portal settings
 
@@ -308,7 +348,11 @@ overrides; `defaults` is what an unset field falls back to. An empty string in
 | `POST /api/packages` | `{ spec }` |
 | `DELETE /api/packages` | `{ spec }` |
 | `POST /api/packages/update` | Update the installed pi packages (`pi update --extensions`); pi itself comes with the portal's version |
-| `GET /api/extensions` | Parsed packages with their recovered settings |
+| `GET /api/extensions` | Parsed packages with their recovered settings, each with `kinds`: what it brings, of `pi`, `pithagoras` and `themes` |
+| `GET /api/extensions/shipped` | `{ extensions: [{ name, version?, description?, kinds, spec }] }` — the extensions that come with the portal; `spec` is the folder each is installed by |
+| `GET /api/extension-ui` | `{ extensions: [{ name, version, entry?, style?, server?, serverError?, themes? }] }` — the installed packages, switched on, that bring a browser half, a server half or themes: the addresses its module and stylesheet are fetched from, where its server half's routes are, and why that half is not running if it could not be started |
+| `GET /api/extension-ui/<package>/<file>` | A file of that package's web folder |
+| `/api/x/<package>/…` | The routes of that package's server half, whatever it serves there, behind the portal's login; no body is read for them unless the route asks. WebSocket upgrades under the same address go to it, checked for the login and for the page they come from |
 | `PUT /api/extensions/enabled` | `{ spec, enabled }` — switch a package off or on without uninstalling it; reloads idle open sessions and says how many were left waiting |
 | `PUT /api/extensions/settings` | `{ key, value }` — empty value removes the key |
 | `GET /api/pi-settings` | Raw `settings.json` |
@@ -319,8 +363,10 @@ overrides; `defaults` is what an unset field falls back to. An empty string in
 | | |
 | --- | --- |
 | `GET /api/features` | `{ subagent: { available, installed, enabled, source, mode, maxParallel }, understory: { enabled, url, tokenSet, adapterInstalled, reachable, managed: { available, image, container, pulling, url, config, providers } }, images: { enabled, baseUrl, model, size, keySet, editEnabled, editBaseUrl, editModel, editMultiple, editMaxSize, timeoutSeconds, sdExtras, editKeySet, ready, editReady } }` — `config` never holds a key, and `images` only whether one is set |
-| `GET /api/features/images` | `{ images: { enabled, baseUrl, model, size, keySet, editEnabled, editBaseUrl, editModel, editMultiple, editMaxSize, timeoutSeconds, sdExtras, editKeySet, ready, editReady } }` — the image endpoint alone; no key is ever returned. `ready` is whether pictures can be made: it is switched on and has an address to ask. `editReady` is whether editing is available: it is switched on and has an address to ask, its own or generation's. It is what makes the agent's `edit_image` tool exist. `sdExtras` is whether the endpoint is said to be a stable-diffusion.cpp server, which the Images page may then send the settings only it reads (see below); false when never saved. `editMultiple` is whether the editing endpoint is said to take several pictures: with it, and `editReady`, the tool has a list of pictures (`paths`) instead of one (`path`) |
-| `PUT /api/features/images` | `{ enabled?, baseUrl?, model?, size?, apiKey?, editEnabled?, editBaseUrl?, editModel?, editApiKey?, editMultiple?, editMaxSize?, timeoutSeconds?, sdExtras? }` — `baseUrl` is an http(s) base with no login, query or fragment (empty clears it), `size` is `WIDTHxHEIGHT` or `auto` (empty clears it), `apiKey` left out keeps the saved one and `""` removes it; an address of another origin than the saved one, without a key, drops the saved key (a key saved before any address stays for the first). The `edit…` fields are editing's own switch, address, model and key, checked and kept the same way: an empty `editBaseUrl` means the address of generation, `editModel` is the only model sent on an edit (the one of generation never is), and the key of generation goes to the edit address only when it is the same server, while `editApiKey` is the key of the address edits go to and is dropped when that address changes to another server without one. `editMaxSize` is `WIDTHxHEIGHT` (empty, the default, is no limit): the most pixels a picture sent to be edited may have, either way up: a larger one is scaled down to it (its ratio kept, never enlarged) before it is sent, and the job or the tool's answer says so. It is read at each call, so it needs no reload. `editMultiple` (a boolean, off by default) says the editing endpoint takes several pictures in one request, up to 8 and 50 MB together, sent as `image[]`; it is said of that endpoint, so an `editBaseUrl` (or, with none of its own, a `baseUrl`) of another origin takes it off again unless the same request says it. `sdExtras` (a boolean, off by default) is about the endpoint as a whole, for generating and editing, so a `baseUrl` or `editBaseUrl` of another origin takes it off again unless the same request says it: on, the Images page may put `negative_prompt`, `seed`, `sample_params.sample_steps` and, for an edit, `strength` and `init_image: null` in a `<sd_cpp_extra_args>` block in the prompt, which only stable-diffusion.cpp servers understand; off, nothing of this kind is sent whatever a request carries, and the agent's tools never send any of it. Read at each request, so it reloads no chat. `timeoutSeconds` is how long a request for a picture, generated or edited, may take, in whole seconds from 30 to 3600 (300 when none was saved; `null` takes a saved one away; anything else is a 400); it is read at each request, so changing it reloads no chat. 400 for anything else, for `enabled: true` with no address, and for `editEnabled: true` with no address, its own or generation's. Answers `{ images, changed, reloaded, waiting }`; idle open sessions are reloaded only when a tool came or went, or the edit tool's shape changed (`changed`: generation's or editing's, or whether the edit tool takes a list) |
+| `GET /api/features/images` | `{ images: { enabled, baseUrl, model, size, keySet, editEnabled, editBaseUrl, editModel, editMultiple, editMaxSize, timeoutSeconds, sdExtras, editKeySet, ready, editReady } }` — the image endpoint alone; no key is ever returned. `ready` is whether pictures can be made: it is switched on and has an address to ask. `editReady` is whether editing is available: it is switched on and has an address to ask, its own or generation's. It is what makes the agent's `edit_image` tool exist. `sdExtras` is whether the endpoint is said to be a stable-diffusion.cpp server, which the Media page may then send the settings only it reads (see below); false when never saved. `editMultiple` is whether the editing endpoint is said to take several pictures: with it, and `editReady`, the tool has a list of pictures (`paths`) instead of one (`path`) |
+| `PUT /api/features/images` | `{ enabled?, baseUrl?, model?, size?, apiKey?, editEnabled?, editBaseUrl?, editModel?, editApiKey?, editMultiple?, editMaxSize?, timeoutSeconds?, sdExtras? }` — `baseUrl` is an http(s) base with no login, query or fragment (empty clears it), `size` is `WIDTHxHEIGHT` or `auto` (empty clears it), `apiKey` left out keeps the saved one and `""` removes it; an address of another origin than the saved one, without a key, drops the saved key (a key saved before any address stays for the first). The `edit…` fields are editing's own switch, address, model and key, checked and kept the same way: an empty `editBaseUrl` means the address of generation, `editModel` is the only model sent on an edit (the one of generation never is), and the key of generation goes to the edit address only when it is the same server, while `editApiKey` is the key of the address edits go to and is dropped when that address changes to another server without one. `editMaxSize` is `WIDTHxHEIGHT` (empty, the default, is no limit): the most pixels a picture sent to be edited may have, either way up: a larger one is scaled down to it (its ratio kept, never enlarged) before it is sent, and the job or the tool's answer says so. It is read at each call, so it needs no reload. `editMultiple` (a boolean, off by default) says the editing endpoint takes several pictures in one request, up to 8 and 50 MB together, sent as `image[]`; it is said of that endpoint, so an `editBaseUrl` (or, with none of its own, a `baseUrl`) of another origin takes it off again unless the same request says it. `sdExtras` (a boolean, off by default) is about the endpoint as a whole, for generating and editing, so a `baseUrl` or `editBaseUrl` of another origin takes it off again unless the same request says it: on, the Media page may put `negative_prompt`, `seed`, `sample_params.sample_steps` and, for an edit, `strength` and `init_image: null` in a `<sd_cpp_extra_args>` block in the prompt, which only stable-diffusion.cpp servers understand; off, nothing of this kind is sent whatever a request carries, and the agent's tools never send any of it. Read at each request, so it reloads no chat. `timeoutSeconds` is how long a request for a picture, generated or edited, may take, in whole seconds from 30 to 3600 (300 when none was saved; `null` takes a saved one away; anything else is a 400); it is read at each request, so changing it reloads no chat. 400 for anything else, for `enabled: true` with no address, and for `editEnabled: true` with no address, its own or generation's. Answers `{ images, changed, reloaded, waiting }`; idle open sessions are reloaded only when a tool came or went, or the edit tool's shape changed (`changed`: generation's or editing's, or whether the edit tool takes a list) |
+| `GET /api/features/videos` | `{ videos: { enabled, backend, backends: [{ id, label }], baseUrl, model, size, frames, fps, timeoutSeconds, storageLimitMb, keySet, ready } }` — the video endpoint alone; no key is ever returned. `frames` and `fps` are `null` for the server's own, `storageLimitMb` is 0 for no limit, `ready` is whether videos can be made: switched on, and with an address to ask |
+| `PUT /api/features/videos` | `{ enabled?, backend?, baseUrl?, model?, size?, frames?, fps?, apiKey?, timeoutSeconds?, storageLimitMb? }` — `baseUrl` is an http(s) base with no login, query or fragment (empty clears it), `size` is `WIDTHxHEIGHT` with each side from 64 to 4096 or empty, `frames` (1–1000) and `fps` (1–120) are whole numbers or `null`, `timeoutSeconds` is whole seconds from 30 to 14400 or `null` for the default (half an hour), `storageLimitMb` is whole megabytes or `null` for no limit, `backend` is one of `backends` (`sdcpp` now), `apiKey` `""` removes the saved key. Switching on needs an address (400 otherwise); a key belongs to the server it was given for, so another origin without a key drops it. Answers `{ videos, changed, reloaded, waiting }`, where `changed` is that the agent got or lost its video tools, which reloads the idle chats |
 | `GET /api/features/subagent` | `{ subagent }` — the subagent tool's state alone |
 | `PUT /api/features/subagent` | `{ enabled?, mode?: "interrupt" \| "background", maxParallel?: 1–16, model?: "auto" \| "provider/model" }` — installs or removes the bundled subagent tool, writes `subagentMode`, `subagentMaxParallel` and `subagentModel`; reloads idle open sessions |
 | `GET /api/sessions/:id/subagent-model` | `{ model, default }` — what this chat's subagents run on: its own choice (`null` follows `default`) |
@@ -337,6 +383,7 @@ overrides; `defaults` is what an unset field falls back to. An empty string in
 | `GET /api/memory/log` | What changed, newest first |
 | `GET /api/memory/graph` | `{ nodes: [{ path, title, type, links }], edges: [{ source, target }] }` |
 | `GET /api/memory/traces` | The paths Understory's own queries and changes took |
+| `GET /api/memory/trace?id=` | One of those runs with its steps: `{ id, kind, input, notation, outcome, steps: [{ seq, tool, summary, paths, write }] }`, `paths` being the full paths of the notes a step read, wrote or found; 404 when it is not there |
 | `GET /api/memory/validate` | `{ conformant, conceptCount, directoryCount, issues }` |
 | `GET /api/memory/health` | `{ writable, health? }` — whether notes can be changed here (the portal's own Understory, running), and what its checks find: `{ healthy, orphans, brokenLinks, issues }` |
 | `PUT /api/memory/concept` | `{ path, frontmatter, body }` — write a note through Understory's own write path (its index and log follow); `frontmatter` needs `type` and `title`. Answers `{ concept, health }`; 409 unless writable |
@@ -349,12 +396,12 @@ overrides; `defaults` is what an unset field falls back to. An empty string in
 
 ## Images
 
-The [Images page](/guide/images): pictures made with the image add-on's endpoint without a
+The pictures of the [Media page](/guide/media): pictures made with the image add-on's endpoint without a
 chat, and the gallery of those, the ones the agent made in chats and the ones that lie in
 the folders its tools write into. A picture is named by its **id**, twelve lowercase hex
 digits, never by a path: the portal opens files only in the folder of the page's own
 pictures and in `generated-images` of the agents' homes, of the projects and of the folders chats work
-in, with the checks the Files panel's pictures have. Reading the list from the top also
+in, with the checks a picture of a chat's folder has. Reading the list from the top also
 looks in those `generated-images` folders for pictures nobody recorded, such as ones made
 before the gallery kept an index, and lists each plain file there whose bytes show a PNG,
 JPEG, GIF or WebP of at most 25 MB (no link is followed, nothing is looked at that is not in
@@ -374,6 +421,31 @@ such a folder), as a picture of `origin` `folder`. The endpoint's address, key a
 | `DELETE /api/images/jobs/:id` | Stops a job that runs (its request is dropped, and no picture comes of it) or forgets one that has finished. 404 for none |
 | `DELETE /api/images/:id` | Takes the picture away, file and all, from the page's own folder, a chat's or the folder it was found in; a file that is gone already counts as deleted, but a chat's folder that cannot be reached is an error (404) and the picture stays in the list |
 | `POST /api/images/delete` | `{ ids }` (at most 200) — the same for several: `{ deleted, failed: [{ id, error }] }`, each as asked and what could not be said for each |
+
+## Videos
+
+The videos of the [Media page](/guide/media): videos made with the video add-on's endpoint without a chat, and the gallery of those,
+the ones the agent made in chats and the ones that lie in the folders its tool writes into. It is the [Images](#images) API's
+counterpart and has the same rules: a video is named by its **id**, twelve lowercase hex digits, never by a path; the portal opens
+files only in the folder of the page's own videos (`videos` under the data folder) and in `generated-videos` of the agents' homes, of the
+projects and of the folders chats work in, with the checks a picture of a chat's folder has (a path inside the folder, no link followed
+out of it, and what the bytes say it is — here a WebM or an MP4). Reading the list from the top also looks in those folders for videos
+nobody recorded, and lists each plain file there whose bytes show a WebM or an MP4 of at most 100 MB, as a video of `origin` `folder`.
+The endpoint's address, key and model are the add-on's (see [Opt-in features](#opt-in-features)); no key is ever in an answer.
+
+| | |
+| --- | --- |
+| `GET /api/videos?origin=&kind=&before=&limit=&again=` | A page of the gallery, newest first: `{ videos, next, total, pageBytes }`, where `pageBytes` is what all the page's own videos take of the disk, whatever the filters match. `origin` is `page`, `chat` or `folder`, `kind` is `generated`, `animated` (made from a picture as its first frame or its last) or `unknown`, `limit` is 1–100 (24 if left out), `before` is the `next` of the page before. A video is `{ id, origin, chat: { id, title } \| null, folder: { name, home } \| null, kind, prompt, params, createdAt, bytes, fileName, poster, format, copy? }`; `format` is `{ id, label, mimeType, playable }`, what the file is by its first bytes (`id` is `webm`, `mp4`, `mov`, `avi`, `webp`, `gif`, `mkv`, `ogg` or `bin` for a file of no known kind), and only a WebM and an MP4 are `playable`; `copy` is `"ready"` or `"available"` for a clip that is not playable, where a playable copy is made or ffmpeg is there to make one; `params` is what it was asked for with, as far as that is known (`model`, `size`, `frames`, `fps`, `seed`, `sampleSteps`, `strength`, `negativePrompt`, and `madeFrames` and `madeFps`, which the server said it made, and `firstFrame` and `lastFrame`, each `{ picture?, path? }`). `poster` is whether the portal can make a poster picture of it (there is an `ffmpeg`). Reading from the top (no `before`) first drops what is gone and finds what nobody listed; `again=1` is for a page that asks again for a list it has, and does not look through the files within a minute of the last look. 400 for a filter that is none |
+| `GET /api/videos?ids=a,b` | Those videos alone, in the order given, as far as they are in the list: `{ videos }`. At most 200 |
+| `GET /api/videos/:id/file` | The file, with its type from its bytes (413 over 100 MB). A WebM and an MP4 are sent to be played; **any other file is sent as an attachment** (`Content-Disposition: attachment`), as the type its bytes say or `application/octet-stream`, and never shown. In the parts a player asks for (see `GET /api/sessions/:id/video`), and `ETag`/`304`. 404 when it is not in the list or its file is gone, which takes it from the list (not while a chat's folder cannot be reached: the video stays, and is served again when it is back) |
+| `GET /api/videos/:id/poster` | The poster picture of the video, its first frame at most 480 pixels on its longest side, as WebP. It is made by `ffmpeg` (on the `PATH`, or `FFMPEG_PATH`) when it is asked for and there is none for the file as it is, and kept; a file that is written over gets a new one. The clip is given to ffmpeg on its standard input, which may open no other file. **404** where there is no ffmpeg, or it cannot make a frame of this video: the page then shows the video's own first frame |
+| `GET /api/videos/:id/copy` | The playable WebM copy of a clip that is not playable, where one was made; **404** otherwise |
+| `POST /api/videos/:id/copy` | Makes that copy with `ffmpeg` (the clip goes to its standard input, which may open nothing else) and answers `{ ok: true }` when it is made, which takes a while for a long clip; kept in `video-copies`, and made once for a file as it is. **400** for a clip that plays as it is, **409** without ffmpeg, **502** when it could not make one; the original is kept in every case |
+| `POST /api/videos/generate` | `{ prompt, model?, size?, frames?, fps?, seed?, sampleSteps?, strength?, negativePrompt?, firstFrame?, lastFrame?, count? }` — makes `count` videos (1–4, one if left out), one request and one job for each (each takes the next seed from `seed`, a random `-1` stays random), and answers `202 { jobs }` at once. `strength` is a number from 0 to 1, sent as `strength` only when given. `firstFrame` is the id of a picture of the [Images](#images) gallery, sent as the first frame, and `lastFrame` the id of one sent as the last frame (`end_image`), only to a server whose capabilities list `end_image` for video: for any other the job fails, with the reason in its `error`, and the picture is never dropped. 400 for a prompt that is empty or over 4000 characters, a setting out of its range, or a first or last frame that is not a picture of the gallery; 409 when video generation is off or has no address, or when the page's own videos take the disk limit; 429 when four are being made already, or fewer are free than asked for |
+| `GET /api/videos/jobs` | `{ jobs, limit }`, newest first: `{ id, kind: "generate" \| "animate", state: "running" \| "done" \| "failed", stage?: "waiting" \| "making", queuePosition?, prompt, size?, from?, startedAt, finishedAt?, videoId?, error? }`. A running job says whether it waits its turn on the server or is being made, and which place it has in the server's queue when the server says; a done job has the `videoId` of the video in the gallery; a failed one says why in the server's words, with no key in them. Jobs live in memory: a restart ends them, and finished ones are forgotten after an hour, or past thirty |
+| `DELETE /api/videos/jobs/:id` | Stops a job that runs (the portal stops waiting and tells the server to drop it, which only a job still in the queue can be, and no video comes of it) or forgets one that has finished. 404 for none |
+| `DELETE /api/videos/:id` | Takes the video away, file and all, from the page's own folder, a chat's or the folder it was found in; a file that is gone already counts as deleted, but a chat's folder that cannot be reached is an error (404) and the video stays in the list |
+| `POST /api/videos/delete` | `{ ids }` (at most 200) — the same for several: `{ deleted, failed: [{ id, error }] }`, each as asked and what could not be said for each |
 
 ## Channels
 
@@ -442,6 +514,7 @@ Each agent has a home folder of its own, with its own `SOUL.md`,
 | --- | --- |
 | `GET /api/mcp` | Read configured servers and settings. |
 | `PUT /api/mcp/servers/:name` | Add or update a server. `{ entry, from? }`: with `from` it is a rename. A name that another server has is refused with 409 and `code: "exists"`. |
+| `PUT /api/mcp/servers/:name/direct` | `{ direct }` — the server's "Register tools directly" (`directTools`) on its own, nothing else of the entry changed. `true` registers the tools one by one; `false` leaves them to the adapter's `mcp` tool, which the tool lists call lazy. 404 for a server that is not there, 400 for a `direct` that is not a boolean. Read when a chat starts |
 | `DELETE /api/mcp/servers/:name` | Remove a server. |
 | `PUT /api/mcp/settings` | Update MCP settings. |
 | `POST /api/mcp/import` | `{ text }` — import pasted server configuration. A server whose name is taken is not replaced: it is listed in `skipped` with the reason, beside those it could not use. |

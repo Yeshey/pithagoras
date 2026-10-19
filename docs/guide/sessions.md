@@ -23,7 +23,12 @@ not wait for the work to finish. Close the tab if you like.
 While a run is in progress you can keep typing. Words sent mid-run steer it: the
 agent takes them in after the step it is on, instead of when the whole run is
 over. Until then the message sits in the transcript marked *Waiting — goes in
-after the current step*. A message that did not get that far — the run was
+after the current step*. While it waits it can be changed: press ↑ in an empty
+box to take the latest waiting message back into the box (with its pictures) and
+send it again when you are done, or use the buttons under it to delete it or to
+**send it directly**, which stops the run and sends that message at once, with
+the others still waiting going in behind it in their order. Once the agent has
+taken a message in, it can no longer be taken back. A message that did not get that far — the run was
 stopped, or the portal restarted, before the agent took it in — says so and has
 a button to send it again. **Stop** aborts the current run, and pressed while pi
 is still starting for a message, it keeps that message from being sent at all:
@@ -54,7 +59,7 @@ can be a picture alone. The sent message shows them; click one to
 The model sees them, but they are not files of the chat's folder, so the agent's
 [`edit_image`](/guide/features#editing-a-picture) cannot change them: put a picture
 in the folder with the Files panel for that, or change it on the
-[Images page](/guide/images#changing-a-picture).
+[Media page](/guide/media#changing-a-picture).
 
 A photo straight off a phone is made smaller in the browser before it goes:
 2048 pixels on its longer side, as a JPEG. Models scale anything bigger down on
@@ -82,10 +87,47 @@ Two keys work from anywhere on the page:
 | `/` | Jump to the message box with the command list open. Not while you are typing somewhere else, where it is a character. It is the [command character](/guide/commands#the-command-character), so it is another key if you chose one |
 | `Esc` | In the message box, **stop the run**, whatever is typed: the words stay in the box, so it costs you nothing. Not while an input method is composing a word, and not while the command list is open, where it closes the list |
 
+## Questions from the agent
+
+When the agent cannot go on without a decision or a fact only you have, it uses
+its `ask_question` tool: its questions appear in the chat, just above the
+message box (not over the page, so the rest of the chat stays usable), and the
+agent waits for your answers. A question is one of four kinds: **choose
+one**, **choose several**, **free text**, or **put the options in order** (best
+first, moved with the arrows; they start in the order the agent listed them,
+and that order only counts as your answer once you have moved something or
+pressed **Keep this order**). A question the agent asks without options is
+answered in free text.
+A choice may also take an answer of your own when the agent allows it, and a
+question marked *optional* may be left empty. **Submit** is available once every
+other question is answered. **Cancel** puts the questions away, and the agent
+is told that you did not answer.
+
+The agent waits for as long as it takes: there is no time limit by default. It
+ends when you answer, when you cancel, or when you press Stop in the message
+box, which also takes the questions away in every window that has them. If you
+would rather the agent carries on by itself after a while, **Settings → Tools →
+Questions from the agent** sets a limit of 5, 15, 30 or 60 minutes. The portal
+keeps a question with its chat until it ends: after a reload, a visit to
+another chat or a restart of the portal it is there again. Answered while the
+portal restarts or after, your answers reach the agent as a new message once the
+portal is back. Once it ends, the chat
+keeps a short record of it where it was asked: each question and your answer,
+or that it was cancelled or not answered in time.
+
+The tool exists wherever you answer in the portal's own pages: in your chats,
+and in the conversations you start on the Agent page. It does not exist in a
+routine, a heartbeat or a chat reached through a channel, where nobody could
+answer in the web UI: there the agent asks in plain text, and the person
+answers with their next message. It is in the tools list like any other, in a
+group named `ask-question`, and can be switched off there.
+
 ## Looking at a picture
 
-The pictures the agent shows with `show_image` are drawn under their tool line,
-in the middle of the conversation, with the same room above and below. One it
+What a call gives you is drawn under its tool line, in the middle of the
+conversation, with the same room above and below: a picture (from `show_image`,
+or from any tool that [gives one](/guide/extension-ui#files-a-tool-gives)), a
+clip in its player, and any other file as a link that saves it. A picture the agent
 makes with `generate_image` or changes with `edit_image` has no tool line: it is
 the [preview](#pictures-the-agent-makes) that held its place while it was made,
 in the middle of the conversation as well. A very wide or very tall picture is
@@ -231,12 +273,35 @@ are made. In
 [voice mode](/guide/voice) the card of such a call carries the same preview as a
 small tile.
 
-Every picture the agent makes this way is also in the [Images](/guide/images) page's
+Every picture the agent makes this way is also in the [Media](/guide/media) page's
 gallery, from the moment it is saved, with the chat it is from, what it was asked for
 and how it was made. The page can open it, change it, make it again, and delete the
 file — which is the chat's, so that asks every time. What lies in these folders and was
 never listed, such as pictures made before the gallery existed, is found there too, as a
 picture of the folder.
+
+## Videos the agent makes
+
+With [video generation](/guide/features#video-generation) on, a `generate_video` call is not shown as a tool line
+either, but as the video from the moment it is asked for. A video takes minutes, so the wait is the main thing:
+
+- **While it is made**, a frame in the shape of the size the agent asked for (a square when nothing says) holds
+  the place, says "Making a video" and, after a few seconds, how long it has taken. Nothing in it pretends to know how far the
+  server is.
+- **When it is made**, the browser's own **player** takes the frame's place, with the title under it: play and pause, the slider, the
+  volume and full screen. It does not play by itself, and only the start of the file is fetched until you play it, which shows its first frame; the
+  rest comes in the parts the player asks for. The portal serves it from the chat's folder, by its path, and only what its bytes say is a WebM or an MP4.
+- **When it fails**, the frame says so quietly, with the reason in a line or two, and the whole of it under **Details**. A call that was
+  cut off, because the run was stopped or the portal restarted before the video came back, says it was interrupted.
+- **The call itself** — the tool's name and what the agent gave it: the prompt, the title, the size, the length, the first frame — is
+  under **Details**, below the player.
+- **A video the agent shows** with `show_video` is a player under its tool line, in the middle of the conversation as a picture is. One
+  whose file is gone from the folder says so.
+- **A tool of the same name** that another extension brings is the plain tool line it always was; only the portal's own calls
+  are drawn as videos.
+
+[Voice mode](/guide/voice) has no window for videos, and while the agent has `generate_video` its voice instructions say so: a video
+is for the chat, and is made only when asked. Every video the agent makes this way is also in the [Media](/guide/media) page's gallery, from the moment it is saved.
 
 ## Drafts and what is running
 
@@ -254,9 +319,9 @@ A status that names one of the chat's slash commands runs it when clicked.
 ## Sidebar and the sessions page
 
 The sidebar opens with New, then the places — Sessions, Projects, Agents,
-Routines and [Audit](#audit), with Browser, Memory and Images added while the
+Routines and [Audit](#audit), with Browser, Memory and Media added while the
 [browser](/guide/browser) is installed, [Understory](/guide/features#memory-understory)
-holds the agent's memory and an [image endpoint](/guide/images) is set up — then **Pinned**, then **Recents**. The button at its
+holds the agent's memory, or an [image endpoint](/guide/media) or a video endpoint is set up — then **Pinned**, then **Recents**. The button at its
 top edge folds it to a rail of icons. A chat's full path is not drawn in the list: the folders (below) name where it works, and the Files panel shows the path on request. Recents is capped at twelve; anything past that is reachable from
 the Sessions page, which lists everything with a search of its own.
 

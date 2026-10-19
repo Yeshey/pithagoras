@@ -1,6 +1,6 @@
 import { type Locator, type Page } from '@playwright/test';
 import { test, expect, mockPortal } from './portal-mock';
-import { DEFAULT_ORB } from '../../server/src/orb-style';
+import { DEFAULT_ORB } from '../../core/server/src/orb-style';
 
 const agent = (id: string, name: string, extra: Record<string, unknown> = {}) => ({
   id, name, home: `/a/${id}`, first: id === 'home', initialised: true, chats: 3, channels: [], orb: DEFAULT_ORB, voice: '', unread: 0, ...extra,
@@ -254,4 +254,20 @@ test('New conversation starts the same chat as the + in the sidebar, and a chat 
   expect(posts).toEqual([{ workspace: '/a/ada' }]);
   // In the sidebar under the agent's folder at once, not with the next poll.
   await expect(page.getByRole('complementary', { name: 'Sidebar' }).getByRole('group', { name: 'Ada' }).getByText('Fresh conversation')).toBeVisible({ timeout: 2000 });
+});
+
+test('the tab strip scrolls sideways only: it has no vertical scrollbar of a pixel or two', async ({ page }) => {
+  await portal(page);
+  await page.goto('/agents?agent=ada');
+  const strip = page.getByRole('tablist', { name: 'Agent sections' });
+  await expect(strip).toBeVisible();
+  // Each tab's border sits a pixel over the strip's own, which a strip left to scroll both ways could be scrolled by.
+  expect(await strip.evaluate((el) => getComputedStyle(el).overflowY)).toBe('hidden');
+  // No scrollbar takes room beside the tabs, and wheeling over them does not move them.
+  expect(await strip.evaluate((el) => el.offsetWidth - el.clientWidth)).toBe(0);
+  const box = (await strip.boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.wheel(0, 40);
+  await page.waitForTimeout(100);
+  expect(await strip.evaluate((el) => el.scrollTop)).toBe(0);
 });

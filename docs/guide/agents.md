@@ -92,10 +92,8 @@ rules for every agent's heartbeat. A rule for all roles applies to it too.
 What it notices lands in **Activity** as notes; the tab and the agent's card
 show how many are unread. A note marked urgent also goes to the
 channel routines report to, when there is one. It comes into that chat as a
-routine's report does, so the chat counts as having read untrusted content (the
-look read whatever `WATCH.md` names) until you start a new one with `/new`: it
-will not push or set up a routine there before. Most looks find nothing, and say
-nothing.
+routine's report does, wrapped as data, since the look read whatever `WATCH.md`
+names. Most looks find nothing, and say nothing.
 
 A look never gets in the way: it waits while any chat or routine is working,
 and **Look now** is refused until they are done,
@@ -148,7 +146,7 @@ or stop them afterwards. The dialog says so. It asks what to do with its folder,
 and with it, its routines:
 
 - **Keep its folder**: its files and memory stay, and so do the pictures its chats
-  made, in the [Images page](/guide/images), and its routines, switched off. Make an
+  made, on the [Media page](/guide/media), and its routines, switched off. Make an
   agent with the name it had when it was deleted (its last one, if it was renamed)
   and it picks them all up again; a routine of its that is left on the Routines page
   meanwhile says that the agent whose home it was has been deleted.

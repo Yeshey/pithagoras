@@ -1,6 +1,9 @@
 import { test, expect } from './portal-mock';
 import { settled } from './settled';
 import { readFileSync } from 'node:fs';
+
+// An extension's window at the side: the portal's tests' stand-in for one, opening on each command the agent runs.
+test.use({ installed: ['tests/fixtures/extensions/console'] });
 const sample = readFileSync(new URL('../fixtures/jfk.wav', import.meta.url));
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/browser', route => route.fulfill({ json: { running: false, sessions: [], install: { container: 'stopped' } } }));
@@ -211,9 +214,9 @@ test('live transcription begins before turn completion and previews recognized w
 });
 
 
-test('voice panels animate into browser, terminal and simultaneous layouts', async ({ page }) => {
+test('voice panels animate into browser, side window and simultaneous layouts', async ({ page }) => {
   await page.addInitScript(() => {
-    // The terminal's stream, which has no server behind it here.
+    // Streams, which have no server behind them here.
     (window as any).EventSource=class { onmessage:any; onopen:any; close(){} };
   });
   const failures: string[] = []; page.on('pageerror', e => failures.push(e.message));
@@ -232,45 +235,24 @@ test('voice panels animate into browser, terminal and simultaneous layouts', asy
   await expect(page.locator('.voice-stage')).toHaveClass(/is-browsing/);
   await settled(page);
   await page.getByRole('button', { name: 'Use terminal', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Live terminal', exact: true })).toBeVisible();
-  await expect(page.getByLabel('Agent terminal output')).toContainText('42 modules transformed');
+  await expect(page.getByRole('region', { name: 'Console', exact: true })).toBeVisible();
+  await expect(page.getByLabel('Console output')).toContainText('42 modules transformed');
   await expect(page.getByLabel('Tool activity')).toContainText('Running a command');
   await settled(page);
   const browser = await page.locator('.voice-browser-window').boundingBox();
-  const terminal = await page.locator('.voice-terminal-window').boundingBox();
-  expect(browser!.width).toBeGreaterThan(terminal!.width * 1.8);
-  expect(browser!.x + browser!.width).toBeLessThan(terminal!.x);
-  await page.evaluate(() => (window as any).canvasFeed.message({type:'update',canvas:{id:'doc',title:'A shared draft',content:'# Live canvas\n\nWriting alongside the terminal.',revision:1,status:'writing',active_call:'draft',updated_at:''}}));
-  await expect(page.locator('.voice-stage')).toHaveAttribute('data-panels','2');
-  await expect(page.locator('.voice-stage')).not.toHaveClass(/is-browsing/);
-  await expect(page.getByLabel('Session canvas workspace')).toBeVisible();
-  await settled(page);
-  const canvasBox=await page.getByLabel('Session canvas workspace').boundingBox();
-  const terminalBox=await page.locator('.voice-terminal-window').boundingBox();
-  expect(canvasBox!.width).toBeGreaterThan(terminalBox!.width);
-  expect(terminalBox!.x+terminalBox!.width).toBeLessThan(canvasBox!.x);
-  await expect(page.locator('.voice-presence')).toHaveCSS('height','80px');
-  await page.getByLabel('Show browser').click();
-  await settled(page);
-  const sideBrowser=await page.getByLabel('Live browser',{exact:true}).boundingBox();
-  const sideCanvas=await page.getByLabel('Session canvas workspace').boundingBox();
-  expect(sideBrowser!.x).toBeGreaterThanOrEqual(0);
-  expect(sideCanvas!.x-sideBrowser!.x-sideBrowser!.width).toBeGreaterThan(0);
-  expect(sideCanvas!.x-sideBrowser!.x-sideBrowser!.width).toBeLessThanOrEqual(20);
-  await page.getByLabel('Minimize browser').click();
-  await page.getByLabel('Show terminal').click();
-  await page.getByLabel('Close canvas').click();
-  await page.getByLabel('Show browser').click();
+  const consoleWindow = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
+  expect(browser!.width).toBeGreaterThan(consoleWindow!.width * 1.8);
+  expect(browser!.x + browser!.width).toBeLessThan(consoleWindow!.x);
 
   await page.getByRole('button', { name: 'Minimize browser' }).click();
   await settled(page);
   const orb = await page.locator('.voice-presence').boundingBox();
-  const right = await page.locator('.voice-terminal-window').boundingBox();
+  const right = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
   const stage = await page.locator(".voice-stage").boundingBox();
   expect(orb!.x + orb!.width).toBeLessThan(right!.x);
   expect(orb!.height).toBeGreaterThan(150);
   await page.getByRole('button', { name: 'Finish terminal', exact: true }).click();
-  await expect(page.getByLabel('Agent terminal output')).toContainText('Build completed successfully');
+  await expect(page.getByLabel('Console output')).toContainText('Build completed successfully');
   await page.getByRole('button', { name: 'Show browser', exact: true }).click();
   await page.getByRole('button', { name: 'Stream thinking', exact: true }).click();
   await expect(page.getByLabel('Live model thinking')).toContainText('verify the page layout');
@@ -278,8 +260,8 @@ test('voice panels animate into browser, terminal and simultaneous layouts', asy
   await page.setViewportSize({ width: 390, height: 844 });
   await settled(page);
   const mobileBrowser = await page.locator('.voice-browser-window').boundingBox();
-  const mobileTerminal = await page.locator('.voice-terminal-window').boundingBox();
-  expect(mobileBrowser!.y + mobileBrowser!.height).toBeLessThan(mobileTerminal!.y);
+  const mobileConsole = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
+  expect(mobileBrowser!.y + mobileBrowser!.height).toBeLessThan(mobileConsole!.y);
   expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
   await page.getByRole('button', { name: 'End voice mode' }).click();
   await expect(page.getByRole('textbox', { name: 'Message' })).toBeVisible();
@@ -333,7 +315,7 @@ test('prompt and compaction progress remain visible in chat and voice',async({pa
  await page.getByRole('button',{name:'End voice mode'}).click();
 });
 
-test('composer offers send beside stop for a follow-up and canvas lives in the header',async({page})=>{
+test('composer offers send beside stop for a follow-up, and an extension\'s panel has its button in the header',async({page})=>{
  await page.goto('/tests/voice.html');
  const input=page.locator('textarea').first();
  await expect(page.getByRole('button',{name:'Send message',exact:true})).toBeDisabled();
@@ -349,7 +331,7 @@ test('composer offers send beside stop for a follow-up and canvas lives in the h
  await input.fill('   ');
  await page.getByRole('button',{name:'Stop generation',exact:true}).click();
  await expect(page.getByTestId('aborted')).toHaveText('1');
- await expect(page.locator('.session-workspace > header').getByRole('button',{name:'Session canvases',exact:true})).toBeVisible();
+ await expect(page.locator('.session-workspace > header').getByRole('button',{name:'Console',exact:true})).toBeVisible();
 });
 
 test('without speech synthesis voice mode is not offered, because it speaks its replies, and dictation, which only listens, is', async ({ page }) => {
@@ -388,20 +370,40 @@ test('a sentence being dictated when another chat is opened is not sent to that 
   await page.addInitScript(() => localStorage.setItem('dictationMode', 'send'));
   await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true } }));
   await page.route('**/test-speech.wav', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
-  await page.route('**/voice/transcribe*', route => { const url = new URL(route.request().url()); asked.push(url.pathname); purposes.push(url.searchParams.get('purpose')); return route.fulfill({ json: { text: 'A dictated sentence.' } }); });
+  // The answer to what was said is held until the chat has been switched. Answered at once, it is the sentence of the chat it was
+  // started in, sent there when the switch comes late (a slow machine takes longer to click than a sentence takes to end), and
+  // that is what the portal does and the test would take for the fault.
+  let switched!: () => void;
+  const afterSwitch = new Promise<void>(resolve => { switched = resolve; });
+  await page.route('**/voice/transcribe*', async route => {
+    const url = new URL(route.request().url());
+    asked.push(url.pathname);
+    purposes.push(url.searchParams.get('purpose'));
+    await afterSwitch;
+    // The page has dropped the request by then, as it should: there is nobody to answer.
+    await route.fulfill({ json: { text: 'A dictated sentence.' } }).catch(() => {});
+  });
   // The chat switched to answers as the one the page starts in does.
   await page.route('**/api/sessions/other/commands', route => route.fulfill({ json: { commands: [] } }));
-  await page.route('**/api/sessions/other/canvases', route => route.fulfill({ json: [] }));
   await page.route('**/api/sessions/other/config', route => route.fulfill({ status: 503, json: {} }));
   await page.goto('/tests/voice.html');
   await page.getByRole('button', { name: 'Dictate a message' }).click();
   await expect(page.getByRole('button', { name: 'Stop dictating' })).toBeVisible({ timeout: 25000 });
-  await page.getByRole('button', { name: 'Inject speech' }).click();
-  // Mid-sentence: heard, not yet ended by a pause.
-  await expect(page.getByText('Hearing you')).toBeVisible({ timeout: 15000 });
-  // The sentence is already being transcribed for the chat it was started in, which is what the switch has to keep from the other one.
-  await expect.poll(() => asked.length, { timeout: 15000 }).toBeGreaterThan(0);
+  // The chat is switched in the middle of the sentence: heard, not yet ended by a pause, and already being transcribed for the chat
+  // it was started in, which is what the switch has to keep from the other one. The speech is long enough that the sentence is
+  // still going when a slow machine gets to the click. It is played in real time, and a machine too busy to keep up with it misses
+  // it, so it is played again when neither has happened after a while.
+  await page.evaluate(() => { (window as any).speechSeconds = 8; });
+  let injected = 0;
+  await expect.poll(async () => {
+    if (Date.now() - injected > 8000) {
+      injected = Date.now();
+      await page.getByRole('button', { name: 'Inject speech' }).click();
+    }
+    return asked.length > 0 && await page.getByText('Hearing you').isVisible();
+  }, { timeout: 30000, intervals: [100] }).toBe(true);
   await page.getByRole('button', { name: 'Switch chat' }).click();
+  switched();
   // The sentence is not to be sent to the chat it was not started in, which only waiting for as long as a send takes shows.
   await page.waitForTimeout(2500);
   await expect(page.getByTestId('sent')).toHaveText('0');
@@ -448,7 +450,7 @@ test('the orb is never painted empty while it glides beside a window and into it
   await settled(page);
   const first = await page.evaluate(() => ({ ...(window as any).orbSteps }));
   expect(first.steps).toBeGreaterThan(5);
-  await page.getByRole('button', { name: 'Show terminal' }).click();
+  await page.getByRole('button', { name: 'Show console' }).click();
   await expect(page.locator('.voice-stage')).toHaveAttribute('data-orb', 'dock');
   await settled(page);
   const second = await page.evaluate(() => ({ ...(window as any).orbSteps }));
