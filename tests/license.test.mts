@@ -29,9 +29,9 @@ test('every package of the repository says it is Apache-2.0, as LICENSE is', () 
 });
 
 const require = createRequire(path.join(root, 'core/web/package.json'));
-/** The package.json of an installed dependency, found through a file it exports or its main. */
-function installed(name: string): { version: string; license: string } {
-  let dir = path.dirname(require.resolve(name));
+/** The package.json of an installed dependency, found through a file it exports or its main, as the package of `from` finds it. */
+function installed(name: string, from = require): { version: string; license: string } {
+  let dir = path.dirname(from.resolve(name));
   while (!existsSync(path.join(dir, 'package.json')) || json(path.relative(root, path.join(dir, 'package.json'))).name !== name) dir = path.dirname(dir);
   return json(path.relative(root, path.join(dir, 'package.json')));
 }
@@ -57,13 +57,25 @@ test('the notices give the licence of every file the web build copies into voice
   assert.match(notices, /MIT License\s+Copyright \(c\) Microsoft Corporation/);
 });
 
-test('the notices name sharp at the version that is installed, and libvips, which comes with it under the LGPL', () => {
+// The Media extension's own: installed in its folder, from its own lock, when it is built.
+test('the notices name sharp at the version the Media extension installs, and libvips, which comes with it under the LGPL', () => {
   const notices = read('THIRD_PARTY_NOTICES.md');
-  const { version, license } = installed('sharp');
+  const { version, license } = installed('sharp', createRequire(path.join(root, 'extensions/media/package.json')));
   assert.equal(license, 'Apache-2.0', 'sharp changed its licence: the notices have to be read again');
   assert.ok(notices.includes(`\`sharp\` ${version}`), `sharp ${version} is the version the notices describe`);
   assert.match(notices, /libvips[^\n]*LGPL-3\.0-or-later/);
   assert.ok(notices.includes('https://www.gnu.org/licenses/lgpl-3.0.txt'), 'the LGPL text is linked');
+});
+
+// The Browser extension's own: installed in its folder, from its own lock, when it is built.
+test('the notices name playwright-core at the version the Browser extension installs, with its NOTICE', () => {
+  const notices = read('THIRD_PARTY_NOTICES.md');
+  const from = createRequire(path.join(root, 'extensions/browser/package.json'));
+  const { version, license } = installed('playwright-core', from);
+  assert.equal(license, 'Apache-2.0', 'playwright-core changed its licence: the notices have to be read again');
+  assert.ok(notices.includes(`\`playwright-core\` ${version}`), `playwright-core ${version} is the version the notices describe`);
+  const notice = readFileSync(path.join(path.dirname(from.resolve('playwright-core/package.json')), 'NOTICE'), 'utf8');
+  for (const line of notice.split('\n').filter(Boolean)) assert.ok(notices.includes(`    ${line}`), `its NOTICE says "${line}", as the notices do`);
 });
 
 test('the web build puts the notices next to the voice files', () => {

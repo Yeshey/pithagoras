@@ -1,17 +1,20 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import express, { type Router } from "express";
 import { piSettingsPath, readPiSettings, updatePiSettings } from "../pi-settings.js";
-import { extensionStash, setExtensionStash } from "../db.js";
+import { extensionStash, installNotes, setExtensionStash } from "../db.js";
+import { dataOwner } from "../extension-data.js";
 import { isFiltered, isSwitchedOff, setPackageEnabled, sourceOf } from "../extension-switch.js";
 import { sessions } from "../session-manager.js";
-import { clientHalf, packageKinds, staticImports, packageThemes, serverHalf, type ClientHalf, type PackageKind, type PackageThemes, type ServerHalf } from "../extension-ui.js";
+import { clientHalf, packageKinds, requiresOf, staticImports, packageThemes, serverHalf, type ClientHalf, type PackageKind, type PackageThemes, type ServerHalf } from "../extension-ui.js";
 import { sendCompressed } from "../compressed-file.js";
 import { bundledPath } from "../bundled.js";
-import { SUBAGENT_PACKAGE } from "../features.js";
-import { isServing, serverFailure, serversSettled, syncServerHalves } from "../extension-host.js";
+import { isServing, serverFailure, serverHalfStatus, serverHalvesStanding, serversSettled, syncServerHalves } from "../extension-host.js";
+import { logFileLine } from "../logs.js";
+import { planInstall, type InstalledExtension } from "../install-plan.js";
 
 const run = promisify(execFile);
 
@@ -39,6 +42,11 @@ export interface ExtensionInfo {
   filtered?: boolean;
   /** What it brings: something for pi, something the portal draws or runs, colours for the portal. Empty where its folder could not be read. */
   kinds: PackageKind[];
+  /**
+   * The extension whose own data folder it is in, however it was installed; and the note that extension gave and
+   * when, where it installed it itself (`extensions.install`).
+   */
+  installedFrom?: { extension: string; note?: string; at?: string };
 }
 
 /** An extension that comes with the portal and is installed from its own folder. */
@@ -49,13 +57,11 @@ export interface ShippedExtension {
   kinds: PackageKind[];
   /** What it is installed by: its folder. */
   spec: string;
+  /** The extensions it cannot work without, each with the versions it takes (`pithagoras.requires`). */
+  requires?: Record<string, string>;
 }
 
-/**
- * The extensions in the portal's own `extensions` folder, each a package in a
- * folder of its own. Not the subagent tool: that one is switched in Settings →
- * Add-ons, which also keeps its settings.
- */
+/** The extensions in the portal's own `extensions` folder, each a package in a folder of its own. */
 export function shippedExtensions(dir = bundledPath("extensions")): ShippedExtension[] {
   if (!dir) return [];
   const out: ShippedExtension[] = [];
@@ -68,13 +74,15 @@ export function shippedExtensions(dir = bundledPath("extensions")): ShippedExten
     } catch {
       continue;
     }
-    if (typeof meta?.name !== "string" || meta.name === SUBAGENT_PACKAGE) continue;
+    if (typeof meta?.name !== "string") continue;
+    const requires = requiresOf(meta);
     out.push({
       name: meta.name,
       ...(typeof meta.version === "string" ? { version: meta.version } : {}),
       ...(typeof meta.description === "string" ? { description: meta.description } : {}),
       kinds: packageKinds(folder),
       spec: folder,
+      ...(requires ? { requires } : {}),
     });
   }
   return out.sort((x, y) => x.name.localeCompare(y.name));
@@ -112,8 +120,18 @@ function parseList(output: string): { spec: string; path?: string; scope?: strin
  * off the settings object (`const { llamaServerUrl } = settings`). So the keys
  * are recovered from the source, which is a heuristic: it can miss a key built
  * dynamically, and the UI says so rather than implying this list is complete.
+ *
+ * Only a pi extension reads them. A package whose manifest names none (`"pi": {}`,
+ * a portal extension's halves alone) reads none, whatever its own code calls a
+ * `settings` of its own: a picture's settings are not pi's.
  */
 function detectSettingKeys(pkgPath: string): string[] {
+  try {
+    const { pi } = JSON.parse(readFileSync(path.join(pkgPath, "package.json"), "utf8"));
+    if (pi && typeof pi === "object" && !(Array.isArray(pi.extensions) && pi.extensions.length)) return [];
+  } catch {
+    // No package.json, or not one that can be read: a folder of code, looked through as it is.
+  }
   const keys = new Set<string>();
   const SKIP = new Set(["length", "constructor", "default", "prototype"]);
 
@@ -279,7 +297,10 @@ export async function switchPackage(spec: string, enabled: boolean): Promise<boo
  * into its own process: of the packages its own settings install, the ones
  * switched on. Never a package a folder brings: an agent can write that
  * folder, and what it put there would run in the page of everyone who opens
- * the portal, or in the portal itself.
+ * the portal, or in the portal itself. A package an extension's data folder
+ * holds (one an extension wrote, for an agent, say) has its server half run in
+ * a process of its own, however it was installed: told by the folder, which is
+ * there before pi lists the package and as long as it does.
  */
 async function halves(): Promise<{ clients: ClientHalf[]; servers: ServerHalf[]; themed: PackageThemes[] }> {
   const settings = readPiSettings();
@@ -294,6 +315,8 @@ async function halves(): Promise<{ clients: ClientHalf[]; servers: ServerHalf[];
     const entry = listed.find((e) => sourceOf(e) === pkg.spec);
     if (entry === undefined || isSwitchedOff(entry)) continue;
     const client = clientHalf(pkg.path), server = serverHalf(pkg.path), themes = packageThemes(pkg.path);
+    // On the half itself: its revision is read when first asked for (see serverHalf), which a copy would do now.
+    if (server && dataOwner(pkg.path) !== undefined) server.isolated = true;
     const name = (client ?? server ?? themes)?.name;
     if (!name || taken.has(name)) continue;
     taken.add(name);
@@ -307,12 +330,65 @@ async function halves(): Promise<{ clients: ClientHalf[]; servers: ServerHalf[];
 const clientHalves = async () => (await halves()).clients;
 
 /**
+ * The extensions installed for the portal, each by what its package.json says, with whether it is switched on: what an
+ * install that requires one finds there (see install-plan.ts). Of two under one name, the first that is switched on,
+ * as `halves` has it; the first of them where none is, to be switched on.
+ */
+async function installedExtensions(): Promise<InstalledExtension[]> {
+  const settings = readPiSettings();
+  const listed = Array.isArray(settings.packages) ? settings.packages : [];
+  const out: InstalledExtension[] = [];
+  for (const pkg of await installedPackages(settings)) {
+    if (!pkg.path || (pkg.scope && !/^user/i.test(pkg.scope))) continue;
+    let meta: any;
+    try {
+      meta = JSON.parse(readFileSync(path.join(pkg.path, "package.json"), "utf8"));
+    } catch {
+      continue;
+    }
+    if (typeof meta?.name !== "string") continue;
+    const entry = listed.find((e) => sourceOf(e) === pkg.spec);
+    const requires = requiresOf(meta);
+    const ext: InstalledExtension = {
+      name: meta.name,
+      ...(typeof meta.version === "string" ? { version: meta.version } : {}),
+      spec: pkg.spec,
+      enabled: entry === undefined || !isSwitchedOff(entry),
+      ...(requires ? { requires } : {}),
+    };
+    const at = out.findIndex((other) => other.name === ext.name);
+    if (at === -1) out.push(ext);
+    else if (ext.enabled && !out[at]!.enabled) out[at] = ext;
+  }
+  return out;
+}
+
+const digest = (of: unknown): string => createHash("sha256").update(JSON.stringify(of)).digest("base64url").slice(0, 16);
+
+/**
+ * What is installed, as the last sync found it: the packages pi's settings list, with what is switched on of each, and
+ * the halves and themes of them the pages load, as a digest. None until the portal has gone through it once.
+ */
+let installed = "";
+
+/**
+ * What is installed, and where each server half stands, as a digest. Every page asks for it with the list of chats
+ * (`GET /api/sessions`) and goes through what is installed again when it changes, so that an install made anywhere
+ * else (another tab, the API, an agent) reaches it, Settings → Extensions included; and so does a server half's crash,
+ * though nothing was installed (see serverHalvesStanding).
+ */
+export const extensionsRevision = (): string => installed && digest([installed, serverHalvesStanding()]);
+
+/**
  * Bring the server halves that run in line with what is installed and switched
  * on: as the portal starts, and whenever a package is installed, removed,
  * updated or switched.
  */
 export async function syncExtensionServers(): Promise<void> {
-  await syncServerHalves((await halves()).servers);
+  const found = await halves();
+  await syncServerHalves(found.servers);
+  // The packages too: one with nothing for the pages (a pi half, skills, prompts) is still listed in Settings.
+  installed = digest([readPiSettings().packages ?? null, found]);
 }
 
 /**
@@ -334,9 +410,13 @@ export const preparingExtensions = <T>(work: Promise<T>): Promise<T> => {
   return work;
 };
 
-/** Where a page fetches a file of a package's web folder from. */
+/**
+ * Where a page fetches a file of a package's web folder from: under the half's revision, as a folder of its own, so
+ * that what the module imports by a relative address is fetched under that revision too, and another revision is
+ * other files to the page, every one of them.
+ */
 const clientUrl = (half: ClientHalf, file: string) =>
-  `/api/extension-ui/${[...half.name.split("/"), ...file.split("/")].map(encodeURIComponent).join("/")}?v=${half.rev}`;
+  `/api/extension-ui/${[...half.name.split("/"), `~${half.rev}`, ...file.split("/")].map(encodeURIComponent).join("/")}`;
 
 /**
  * Where a module's import of `file` (a path from the web folder) is fetched from: the address the browser makes
@@ -345,7 +425,7 @@ const clientUrl = (half: ClientHalf, file: string) =>
  * browser would not read as that file (a `#` or a `?` in it).
  */
 function importUrl(half: ClientHalf, file: string): string | undefined {
-  const base = `/api/extension-ui/${half.name.split("/").map(encodeURIComponent).join("/")}/`;
+  const base = `/api/extension-ui/${half.name.split("/").map(encodeURIComponent).join("/")}/~${half.rev}/`;
   const url = new URL(file, `http://portal${base}`);
   const expected = `${decodeURIComponent(base)}${file}`;
   return url.search === "" && url.hash === "" && decodeURIComponent(url.pathname) === expected ? url.pathname : undefined;
@@ -353,6 +433,29 @@ function importUrl(half: ClientHalf, file: string): string | undefined {
 
 /** What a page asks for ahead with the module of `half`. */
 const preloadOf = (half: ClientHalf): string[] => staticImports(half).map((file) => importUrl(half, file)).filter((url) => url !== undefined);
+
+/** How many of the lines a crashed server half said last are listed with its crash. */
+const CRASH_LINES = 30;
+
+/**
+ * Why a browser half failed in a page, as the page said: to load, to draw, or in what it runs of its own there. The
+ * latest, by the package's name, with the revision that failed and where it failed, as the page had it.
+ */
+const clientFailures = new Map<string, { rev: string; error: string; stack?: string }>();
+/** What a page said of `half` while it is that revision: another one has not failed yet. */
+function clientFailure(half: ClientHalf): { error: string; stack?: string } | undefined {
+  const failure = clientFailures.get(half.name);
+  if (failure?.rev === half.rev) return failure;
+  clientFailures.delete(half.name);
+  return undefined;
+}
+
+/** What a page said last failed of the browser half of `name` that is installed now, and where; nothing where none is. */
+export async function browserFailure(name: string): Promise<{ error: string; stack?: string } | undefined> {
+  const half = (await clientHalves()).find((h) => h.name === name);
+  const failure = half && clientFailure(half);
+  return failure && { error: failure.error, ...(failure.stack ? { stack: failure.stack } : {}) };
+}
 
 export function extensionsRouter(): Router {
   const router = express.Router();
@@ -362,25 +465,39 @@ export function extensionsRouter(): Router {
       // What is being started or stopped is waited for: a page is told where a server half's routes are only once they are there.
       await preparing;
       await serversSettled();
+      // What is installed, as GET /api/sessions says it, for the page to tell by whether this list is still what is
+      // installed. Read before the list: a list newer than it is only gone through once more.
+      const revision = extensionsRevision();
       const { clients, servers, themed } = await halves();
       const names = [...new Set([...clients, ...servers, ...themed].map((half) => half.name))];
       res.json({
+        revision,
         extensions: names.map((name) => {
           const client = clients.find((half) => half.name === name);
           const server = servers.find((half) => half.name === name);
           const themes = themed.find((half) => half.name === name);
           const failure = server && serverFailure(name);
+          const failed = client && clientFailure(client);
+          // The crash its server half is held off for, with what it said last.
+          const status = server && serverHalfStatus(name);
           return {
             name,
             version: (client ?? server ?? themes)!.version,
             ...(themes ? { themes: themes.themes } : {}),
-            ...(client ? { entry: clientUrl(client, client.entry) } : {}),
+            // Its revision, which a page says a failure of it under.
+            ...(client ? { rev: client.rev, entry: clientUrl(client, client.entry) } : {}),
             ...(client?.style ? { style: clientUrl(client, client.style) } : {}),
             // What its module imports along with itself, for the page to ask for all at once.
             ...(client && preloadOf(client).length ? { preload: preloadOf(client) } : {}),
             // Where its server half's own routes are, when it has one that is running.
             ...(server && isServing(name) ? { server: `/api/x/${name.split("/").map(encodeURIComponent).join("/")}` } : {}),
+            // What its server half cannot start without.
+            ...(server?.requires ? { requires: server.requires } : {}),
             ...(failure ? { serverError: failure } : {}),
+            ...(status && status.crash ? { crash: { ...status.crash, lines: status.lines.slice(-CRASH_LINES).map(logFileLine) } } : {}),
+            // Why its browser half failed in a page, and where, as that page said.
+            ...(failed ? { clientError: failed.error } : {}),
+            ...(failed?.stack ? { clientStack: failed.stack } : {}),
           };
         }),
       });
@@ -389,13 +506,36 @@ export function extensionsRouter(): Router {
     }
   });
 
+  /**
+   * A page says that a browser half failed there, to load, to draw or in what it runs of its own, with where (`stack`),
+   * for whoever looks at the extension next (Settings, the agent). Kept until another revision of it is installed. Only
+   * of the revision installed now: a page that still has an older one says nothing of this one.
+   */
+  router.post("/extension-ui/failures", async (req, res) => {
+    const { name, rev, error, stack } = req.body ?? {};
+    if (typeof name !== "string" || typeof rev !== "string" || typeof error !== "string" || !error) {
+      return res.status(400).json({ error: "name, rev and error are required" });
+    }
+    if (stack !== undefined && typeof stack !== "string") return res.status(400).json({ error: "stack is text" });
+    try {
+      if (!(await clientHalves()).some((half) => half.name === name && half.rev === rev)) {
+        return res.status(404).json({ error: "No browser half of that name is installed at that revision" });
+      }
+      clientFailures.set(name, { rev, error, ...(stack ? { stack } : {}) });
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
   // A file of a package's web folder. The package's name may have a slash in it (`@scope/name`), so it is found by
-  // what the path starts with.
+  // what the path starts with; then the revision it is asked for under (see clientUrl), when it is. The file is the one
+  // there now, whichever revision it is asked for under.
   router.get("/extension-ui/*file", async (req, res) => {
     try {
       const asked = (req.params as unknown as { file: string[] }).file.join("/");
       const half = (await clientHalves()).find((h) => asked.startsWith(`${h.name}/`));
-      const file = half ? asked.slice(half.name.length + 1) : "";
+      const file = half ? asked.slice(half.name.length + 1).replace(/^~[^/]+\//, "") : "";
       if (!half || !file) return res.status(404).json({ error: "Not found" });
       // Asked for by the module's revision, so what a page holds is never stale; checked each time all the same.
       // A text file goes compressed to a browser that takes it; the rest, and what is refused, as it is.
@@ -413,6 +553,7 @@ export function extensionsRouter(): Router {
       const settings = readPiSettings();
       const packages = await installedPackages(settings);
       const listed = Array.isArray(settings.packages) ? settings.packages : [];
+      const notes = installNotes();
 
       const infos: ExtensionInfo[] = packages.map((pkg) => {
         const info: ExtensionInfo = {
@@ -423,6 +564,9 @@ export function extensionsRouter(): Router {
           settings: [],
           kinds: pkg.path ? packageKinds(pkg.path) : [],
         };
+        // Told by its folder, however it was installed; with the note where the extension installed it itself.
+        const extension = pkg.path ? dataOwner(pkg.path) : undefined;
+        if (extension) info.installedFrom = { extension, ...notes[pkg.spec] };
 
         if (!pkg.scope || /^user/i.test(pkg.scope)) {
           const entry = listed.find((e) => sourceOf(e) === pkg.spec);
@@ -468,6 +612,20 @@ export function extensionsRouter(): Router {
   router.get("/extensions/shipped", (_req, res) => {
     try {
       res.json({ extensions: shippedExtensions() });
+    } catch (e) {
+      res.status(500).json({ error: (e as Error).message });
+    }
+  });
+
+  /**
+   * What installing `spec` brings with it: the extensions it requires that are not there as it needs them, and what is
+   * done for each (see install-plan.ts). Asked by the page before it installs, to say so and do it first.
+   */
+  router.get("/extensions/plan", async (req, res) => {
+    const spec = typeof req.query.spec === "string" ? req.query.spec : "";
+    if (!spec) return res.status(400).json({ error: "spec is required" });
+    try {
+      res.json(await planInstall(spec, { installed: await installedExtensions(), folder: shippedExtensions() }));
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }

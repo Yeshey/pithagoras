@@ -1,23 +1,27 @@
 import Database from "better-sqlite3";
-import { inTurnWithSettings, piSetting, readPiSettings, readProjectPiSettings } from "./pi-settings.js";
-import { packageIndex, packageKey, packageLabel, toolAvailability } from "./extension-switch.js";
-import { EDIT_IMAGE_SOURCE, EDIT_IMAGE_TOOL, GENERATE_IMAGE_SOURCE, GENERATE_IMAGE_TOOL, SHOW_IMAGE_SOURCE, imageEditingReady, imageGenerationReady } from "./image-generation.js";
-import { GENERATE_VIDEO_SOURCE, GENERATE_VIDEO_TOOL, SHOW_VIDEO_SOURCE, SHOW_VIDEO_TOOL, videoGenerationReady } from "./video-generation.js";
-import { BUILT_IN_SET, MEDIA_SET, PI_BUILT_IN_TOOLS, PORTAL_BROWSER_TOOLS, browserTool, defaultsFor, lazyToolEntry, mcpServerOf, toolEnabled, toolSetOf } from "./tool-policy.js";
+import { inTurnWithSettings, piAgentDir, piSetting, readPiSettings, readProjectPiSettings, updatePiSettingsNow } from "./pi-settings.js";
+import { packageIndex, packageKey, packageLabel, sourceOf, toolAvailability } from "./extension-switch.js";
+import { isLocalSource, localPackagePath } from "./features.js";
+import { GUARD_RULE_NAMES } from "./pi/guard-rule-names.js";
+import { BUILT_IN_SET, PI_BUILT_IN_TOOLS, defaultsFor, lazyToolEntry, mcpServerOf, toolEnabled, toolSetOf } from "./tool-policy.js";
 import { projectOf } from "./workspaces.js";
-import { browserServers, dropMcpCache, mcpAdapter, mcpCachePath, mcpConfigPath, mcpServerNames, onMcpWritten, readMcpCache, readMcpFile, readableMcpConfig, serversAndBrowsers } from "./api/mcp.js";
-import { mcpCatalogue, mcpDirect, mcpOffer, unlisted, type McpOffer } from "./mcp-offer.js";
-import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { dropMcpCache, mcpAdapter, mcpCachePath, mcpConfigPath, mcpServerNames, mcpWritten, onMcpWritten, readMcpCache, readMcpFile, readableMcpConfig, serversAndBrowsers } from "./api/mcp.js";
+import { mcpCatalogue, mcpDirect, mcpOffer, namingOf, unlisted, type McpOffer } from "./mcp-offer.js";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { isWithinText } from "./within.js";
 import { baseDir, fitBytes, makeFolder, saveNewFile } from "./workspace-files.js";
 import { agentHome, agentHomePath, homeAgentName } from "./agent-home.js";
 import { DATA_DIR } from "./data-dir.js";
-import { removeThumbs } from "./image-thumbs.js";
-import { removePosters } from "./video-posters.js";
-import { EXECUTOR_KIND } from "./executor-kind.js";
+import { writeFileAtomic } from "./atomic-write.js";
+import { handoffRoot, leaveHandoff, moveFolderTo, moveTo } from "./handoff.js";
 import { RUNS_AS_PRIMARY } from "./pi/runs-as-primary.js";
 import { CODEMODE_TOOL } from "./pi/codemode.js";
+import { INLINE_EXTENSIONS } from "./pi/inline-extensions.js";
+import { CORE_MODES, CUSTOM, providedModes, type ChatModeEntry } from "./chat-modes.js";
+import { EXECUTOR_KIND } from "./executor-kind.js";
+import { asksQuestions } from "./pi/ask-question.js";
+import { freeSlug } from "./slug.js";
 import { SCHEMA_VERSION, dbFile } from "./schema-version.js";
 import { debugLog } from "./logs.js";
 import { filesOnOldCalls } from "./old-call-files.js";
@@ -75,12 +79,21 @@ export interface SessionRow {
   role: "primary" | "colleague" | "guest" | "unknown";
   /** Who last spoke here, surviving a restart that empties the in-memory map. */
   last_person_key: string | null;
-  /** May this session drive the agent's browser? Off unless turned on. */
-  browser: number;
   /** Tools switched off for this conversation, newline separated. */
   tools_off: string;
   /** And switched on against a default that has them off. */
   tools_on: string;
+  /** The mode it was started in (chat-modes.ts); null is Standard. */
+  mode: string | null;
+  /**
+   * The chat this one is a child of (a sub-chat a server half made: `chats.create`), or null for a chat of its own.
+   * One level only: a child has no children.
+   */
+  parent_id: string | null;
+  /** 0 for a child kept out of the chat lists, found only by its id; 1 for every other chat. */
+  listed: number;
+  /** The package whose server half made this child, which alone may prompt, stop or remove it; null for any other chat. */
+  creator: string | null;
 }
 
 /**
@@ -95,6 +108,14 @@ export const BROWSER_CHANNEL = "browser";
  */
 export const onChannel = (row: Pick<SessionRow, "channel_slug"> | undefined): boolean =>
   Boolean(row?.channel_slug) && row?.channel_slug !== BROWSER_CHANNEL;
+
+/**
+ * The chat whose people a chat's dialogs and questions are for: its own, and for a child chat its parent's. A child is
+ * unlisted or out of the way, so where its parent has nobody to answer (a channel conversation, a routine run) a
+ * question put on the child's page would wait for good, and with it the parent's work that waits on the child.
+ */
+export const dialogHost = (session: Pick<SessionRow, "kind" | "channel_slug"> & { parent_id?: string | null }): Pick<SessionRow, "kind" | "channel_slug"> =>
+  (session.parent_id && getSession(session.parent_id)) || session;
 
 export interface EventRow {
   seq: number;
@@ -357,7 +378,8 @@ function schema(db: Database.Database): void {
       tools_on TEXT NOT NULL DEFAULT ''
     );
 
-    -- Which agent a project works with, and whether Understory is its memory.
+    -- Which agent a project works with, and whether it does without the
+    -- agent's memory where an extension holds it (memory_off).
     -- No row, or an empty agent, is a blank slate: the chats get the project's
     -- AGENTS.md and nothing else. Kept here and not as a file in the folder for
     -- the reason project_tools is: the agent works in the folder and can write
@@ -366,7 +388,7 @@ function schema(db: Database.Database): void {
     CREATE TABLE IF NOT EXISTS project_agent (
       project TEXT PRIMARY KEY,
       agent TEXT NOT NULL DEFAULT '',
-      understory_off INTEGER NOT NULL DEFAULT 0
+      memory_off INTEGER NOT NULL DEFAULT 0
     );
 
     -- An agent's exceptions to the portal-wide tool default, for every chat in
@@ -379,6 +401,25 @@ function schema(db: Database.Database): void {
       tools_on TEXT NOT NULL DEFAULT ''
     );
 
+    -- The chat modes the person made (Settings → Modes): a chat in one stores "custom/<id>". Its tool layer is
+    -- exceptions to what the layers under it leave, as a project's are; codemode 1 has its chats work through the
+    -- code tool alone; instructions are said in its chats' system prompt; provider, model and thinking_level, where
+    -- set, are written into a chat as it is put in the mode.
+    CREATE TABLE IF NOT EXISTS chat_modes (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      tools_off TEXT NOT NULL DEFAULT '',
+      tools_on TEXT NOT NULL DEFAULT '',
+      codemode INTEGER NOT NULL DEFAULT 0,
+      instructions TEXT NOT NULL DEFAULT '',
+      provider TEXT,
+      model TEXT,
+      thinking_level TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- Background subagents started and not yet ended, kept as their events
     -- are written: what a server that went left open is read from here at
     -- start, not dug out of every event there ever was.
@@ -386,65 +427,6 @@ function schema(db: Database.Database): void {
       session_id TEXT NOT NULL,
       id TEXT NOT NULL,
       PRIMARY KEY (session_id, id)
-    );
-
-    -- The pictures of the Media page: the ones it made itself, which are files
-    -- in the portal's own images folder, the ones the agent made in a chat with
-    -- generate_image or edit_image, which are files in that chat's folder and
-    -- are listed here as they are made, and those found lying in a folder the
-    -- tools write into that nobody listed (see image-gallery.ts). A row names
-    -- the file, never holds it; one whose file is gone is dropped when the
-    -- page next looks, and a chat's stay with its folder when the chat goes,
-    -- as pictures found there. "path" is a file name in
-    -- the images folder for the page's, and a path from the folder for the
-    -- agent's: from the chat's, or, for one that was found, from "folder", the
-    -- real path of the folder it was found in. "params" is what the request
-    -- was made with, as JSON.
-    CREATE TABLE IF NOT EXISTS images (
-      id TEXT PRIMARY KEY,
-      origin TEXT NOT NULL,
-      session_id TEXT,
-      folder TEXT,
-      path TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      prompt TEXT NOT NULL DEFAULT '',
-      params TEXT NOT NULL DEFAULT '{}',
-      source_id TEXT,
-      bytes INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_images_created ON images(created_at DESC, id DESC);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_images_chat_file ON images(session_id, path) WHERE session_id IS NOT NULL;
-
-    -- The clips of the Media page, as the pictures are listed above: the ones it
-    -- made itself, which are files in the portal's own videos folder, the ones the
-    -- agent made in a chat with generate_video, which are files in that chat's
-    -- folder, and those found lying in a folder the tool writes into that nobody
-    -- listed (see video-gallery.ts). A row names the file, never holds it.
-    CREATE TABLE IF NOT EXISTS videos (
-      id TEXT PRIMARY KEY,
-      origin TEXT NOT NULL,
-      session_id TEXT,
-      folder TEXT,
-      path TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      prompt TEXT NOT NULL DEFAULT '',
-      params TEXT NOT NULL DEFAULT '{}',
-      bytes INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC, id DESC);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_chat_file ON videos(session_id, path) WHERE session_id IS NOT NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_videos_folder_file ON videos(folder, path) WHERE folder IS NOT NULL;
-
-    -- The voices saved in the settings, for speech to be told to sound like (see voice-presets.ts).
-    CREATE TABLE IF NOT EXISTS voice_presets (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      instruction TEXT NOT NULL,
-      transcript TEXT NOT NULL,
-      audio BLOB
     );
 
     -- Logins signed out before they ran out, by the signature of their cookie.
@@ -466,8 +448,8 @@ function schema(db: Database.Database): void {
       home TEXT NOT NULL UNIQUE,
       -- Its avatar, as JSON: NULL is the default orb.
       orb TEXT,
-      -- The voice it speaks with in voice mode: a voice library id or 'design';
-      -- NULL is the one chosen in the voice settings.
+      -- The voice it speaks with in voice mode: an id from the voices voice
+      -- mode's source offers; NULL is the source's own choice.
       voice TEXT,
       -- Its heartbeat: how often it looks around on its own, in minutes (NULL
       -- is never), the hours it keeps quiet ('HH:MM', both or neither), and how
@@ -506,7 +488,8 @@ function schema(db: Database.Database): void {
  */
 function writeOutCanvases(d: Database.Database): void {
   if (!d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'canvases'").get()) return;
-  canvasSetMoved(d);
+  // Core filed its canvas tools as the set "canvases".
+  setMoved(d, "canvases", "pithagoras-canvas");
   const rows = d.prepare("SELECT c.id, c.title, c.content, s.workspace FROM canvases c LEFT JOIN sessions s ON s.id = c.session_id").all() as { id: string; title: string; content: string; workspace: string | null }[];
   const gone = d.prepare("DELETE FROM canvases WHERE id = ?");
   const folderOf = (workspace: string | null) => {
@@ -533,21 +516,562 @@ function writeOutCanvases(d: Database.Database): void {
 }
 
 /**
- * Core filed its canvas tools as the set "canvases"; the extension's are filed
- * under its package's name. A lazy mark on the set, and a name somebody gave
+ * Pictures and videos are an extension's now (extensions/media), with a store of
+ * its own. What the Media page kept here is left for it in the data folder, as
+ * it was (see handoff.ts), and the extension takes it up when it starts, which
+ * may be long after this, or never: its rows, each with the folder of its chat
+ * as it was then, its two settings, the page's own pictures and clips, and the
+ * thumbnails, posters and playable copies it made, which are named by a row's
+ * id and its file's size and time. The files are moved, not copied. The page's
+ * pictures are only the files its rows name in the portal's images folder,
+ * which also holds a folder of each chat's pictures sent with its messages:
+ * those stay. The tables and settings go once it is left, and a try that fails
+ * keeps them for the next start. The database was backed up before this ran
+ * (db-upgrade.ts); docs/guide/upgrading.md says how the files are put back to
+ * go back.
+ */
+function handOffMedia(d: Database.Database): void {
+  if (!d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'images'").get()) return;
+  const data = path.resolve(DATA_DIR);
+  try {
+    // A chat's folder, where it can be reached: the extension keeps the pictures of a chat that is deleted as pictures of that folder.
+    const real = (workspace: string) => {
+      try {
+        return baseDir(workspace);
+      } catch {
+        return null;
+      }
+    };
+    const rows = (table: string) =>
+      (d.prepare(`SELECT t.*, s.workspace FROM ${table} t LEFT JOIN sessions s ON s.id = t.session_id`).all() as ({ origin: string; path: string; workspace: string | null } & Record<string, unknown>)[])
+        .map(({ workspace, ...row }) => ({ ...row, chat: workspace === null ? null : { workspace, real: real(workspace) } }));
+    const images = rows("images");
+    // The clips came after the first release, and a database no build since has opened has none.
+    const videos = d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'videos'").get() ? rows("videos") : [];
+    const settings = { image_generation: settingIn(d, "image_generation") ?? null, video_generation: settingIn(d, "video_generation") ?? null };
+    leaveHandoff("media", (dir) => {
+      // What an earlier try moved is there already, and a file that is gone is gone: its row is left all the same, as the page would have kept it until it looked.
+      const move = (from: string, to: string) => {
+        if (existsSync(to) || !existsSync(from)) return;
+        mkdirSync(path.dirname(to), { recursive: true, mode: 0o700 });
+        moveTo(from, to);
+      };
+      // A folder mounted on its own, or a link to one elsewhere, stays where it is: what is in it is moved. One that is
+      // not there is moveFolderTo's to tell from one out of reach, of which an earlier try moved some.
+      const moveFolder = (from: string, to: string) => {
+        if (existsSync(to)) return;
+        mkdirSync(path.dirname(to), { recursive: true, mode: 0o700 });
+        moveFolderTo(from, to);
+      };
+      for (const row of images) if (row.origin === "page") move(path.join(data, "images", row.path), path.join(dir, "files", "images", row.path));
+      moveFolder(path.join(data, "videos"), path.join(dir, "files", "videos"));
+      for (const cache of ["image-thumbs", "video-posters", "video-copies"]) moveFolder(path.join(data, cache), path.join(dir, "cache", cache));
+      // Written last, and anew on each try, from the rows as they are.
+      writeFileAtomic(path.join(dir, "images.json"), JSON.stringify({ rows: images }), 0o600);
+      writeFileAtomic(path.join(dir, "videos.json"), JSON.stringify({ rows: videos }), 0o600);
+      writeFileAtomic(path.join(dir, "settings.json"), JSON.stringify(settings), 0o600);
+      writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "media", schema: 7, made: new Date().toISOString() }), 0o600);
+    });
+  } catch (e) {
+    console.warn(`[portal] what the Media page kept could not be left for its extension, and is kept for the next start: ${(e as Error).message}`);
+    return;
+  }
+  d.prepare("DELETE FROM settings WHERE key IN ('image_generation', 'video_generation')").run();
+  d.exec("DROP TABLE images");
+  d.exec("DROP TABLE IF EXISTS videos");
+  // Core filed its picture and video tools as one set of their own: "<portal:media>", and in v0.1.0, before there were
+  // videos, "<portal:images>". A name given to the newer one wins.
+  setMoved(d, "<portal:media>", "pithagoras-media");
+  setMoved(d, "<portal:images>", "pithagoras-media");
+  mediaToolsSeenMoved(d);
+  mediaToldOfRemovals(d);
+}
+
+/**
+ * The extension takes up what was left whenever it first starts, which may be long after: it is told then of every
+ * folder deleted since (see folderRemoved in extension-host.ts), as a server half that was not running is, for what it
+ * takes up of a folder that went meanwhile to go too. A package seen for the first time is told of none, as what it
+ * keeps is of no folder deleted before; this one keeps what the portal kept before.
+ */
+function mediaToldOfRemovals(d: Database.Database): void {
+  let told: Record<string, number> = {};
+  try {
+    told = JSON.parse(settingIn(d, "folders_told") ?? "{}") ?? {};
+  } catch {
+    // Not JSON: the host reads it as nobody told yet, and so it is written anew.
+  }
+  if (told["pithagoras-media"] !== undefined) return;
+  d.prepare("INSERT INTO settings (key, value) VALUES ('folders_told', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify({ ...told, "pithagoras-media": 0 }));
+}
+
+/**
+ * The portal's picture and video tools as the tools lists remember them, each under a name of its own, filed under
+ * the extension's package as its tools are. A chat says which tools it has when it next loads, and that would put
+ * them right; until then they would be listed in boxes nothing fills any more, and a lazy mark on the set would not
+ * reach them. An extension's tool of one of these names, which a chat reported as not inline, stays where it is.
+ */
+function mediaToolsSeenMoved(d: Database.Database): void {
+  const sources: Record<string, string> = { show_image: "pictures", generate_image: "image-generation", edit_image: "image-editing", generate_video: "video-generation", show_video: "videos" };
+  try {
+    const seen = JSON.parse(settingIn(d, "tools_seen") ?? "[]");
+    const portals = (tool: any) => typeof tool?.name === "string" && sources[tool.name] === tool.source && tool.inline !== false;
+    if (!Array.isArray(seen) || !seen.some(portals)) return;
+    d.prepare("UPDATE settings SET value = ? WHERE key = 'tools_seen'").run(JSON.stringify(seen.map((tool) => (portals(tool) ? { ...tool, source: "pithagoras-media", inline: true } : tool))));
+  } catch {
+    // Not JSON: knownTools reads it as nothing remembered, and so it stays.
+  }
+}
+
+/** A setting as it is stored, for a step of the upgrade, which runs on the database before getDb gives it out. */
+const settingIn = (d: Database.Database, key: string): string | undefined =>
+  (d.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined)?.value;
+
+/** The settings the portal kept for its browser, which are the Browser extension's now. */
+const BROWSER_SETTINGS = ["browser_user", "browser_password", "browser_port", "browser_https_port", "browser_cursor", "browser_tools"];
+
+/** The tools the portal's browser registered, which the Browser extension registers under the same names. */
+const BROWSER_TOOLS = [
+  "browser_navigate",
+  "browser_back",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_select",
+  "browser_key",
+  "browser_scroll",
+  "browser_find",
+  "browser_get_text",
+  "browser_screenshot",
+];
+
+/** The tools the tools lists remember (`tools_seen`), as they are stored; nothing where that cannot be read. */
+function toolsSeenIn(d: Database.Database): { name?: unknown; source?: unknown; inline?: unknown }[] {
+  try {
+    const seen = JSON.parse(settingIn(d, "tools_seen") ?? "[]");
+    return Array.isArray(seen) ? seen : [];
+  } catch {
+    // Not JSON: knownTools reads it as nothing remembered.
+    return [];
+  }
+}
+
+/** One of the portal's browser tools as the tools lists remember it: filed under its own set, inline. */
+const portalBrowserTool = (tool: { name?: unknown; source?: unknown; inline?: unknown }) =>
+  typeof tool?.name === "string" && BROWSER_TOOLS.includes(tool.name) && tool.source === "browser" && tool.inline !== false;
+
+/**
+ * The agent's browser is an extension's now (extensions/browser), with settings of its own. What the portal kept for
+ * it is left for it in the data folder (see handoff.ts), and the extension takes it up when it starts, which may be
+ * long after this, or never: the browser's six settings as they were stored, its password among them, which the
+ * container was made with, and the profile of the machine's own Chrome where it ran one, which is moved, not copied.
+ * The settings go once it is left, and a try that fails keeps them for the next start. The container and its profile
+ * volume stay where they are: the extension takes them over by their names. The allowlist stays, as the guard's.
+ * The database was backed up before this ran (db-upgrade.ts); docs/guide/upgrading.md says how to go back.
+ */
+function handOffBrowser(d: Database.Database): void {
+  const profile = path.join(path.resolve(DATA_DIR), "browser-profile");
+  const settings = Object.fromEntries(BROWSER_SETTINGS.map((key) => [key, settingIn(d, key) ?? null]));
+  if (Object.values(settings).every((value) => value === null) && !existsSync(profile) && !toolsSeenIn(d).some(portalBrowserTool)) return;
+  try {
+    leaveHandoff("browser", (dir) => {
+      // A folder mounted on its own, or a link to one elsewhere, stays where it is: what is in it is moved.
+      if (!existsSync(path.join(dir, "profile"))) moveFolderTo(profile, path.join(dir, "profile"));
+      // Written last, and anew on each try, from the settings as they are.
+      writeFileAtomic(path.join(dir, "settings.json"), JSON.stringify(settings), 0o600);
+      writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "browser", schema: 8, made: new Date().toISOString() }), 0o600);
+    });
+  } catch (e) {
+    console.warn(`[portal] what the browser kept could not be left for its extension, and is kept for the next start: ${(e as Error).message}`);
+    return;
+  }
+  d.prepare(`DELETE FROM settings WHERE key IN (${BROWSER_SETTINGS.map(() => "?").join(", ")})`).run(...BROWSER_SETTINGS);
+  // Core filed its browser tools as the set "browser"; the extension's are filed under its package.
+  setMoved(d, "browser", "pithagoras-browser");
+  // As the tools lists remember them: a chat says which tools it has when it next loads, and that would put them
+  // right; until then they would be listed in a box nothing fills any more.
+  const seen = toolsSeenIn(d);
+  if (seen.some(portalBrowserTool)) {
+    d.prepare("UPDATE settings SET value = ? WHERE key = 'tools_seen'").run(JSON.stringify(seen.map((tool) => (portalBrowserTool(tool) ? { ...tool, source: "pithagoras-browser", inline: true } : tool))));
+  }
+}
+
+/**
+ * Who may drive the browser was a switch of its own beside the tools' (`sessions.browser`, `routines.browser`, and
+ * the carrying over of it as the portal's browser tools were first seen: `browser_tools_adopted`). It is the tools'
+ * switches now, as for any tool: what each routine and chat had is written into its tools, once, as the database is
+ * brought to schema 8. The columns stay, unread.
+ *
+ * The browser's tools were the portal's own and those seen of an MCP server that is a browser (serversAndBrowsers: a
+ * Playwright server pointed at one): the switch and the grant answered for both. A routine's switch answered for each
+ * of them its lists did not name, on or off: those are named now, as it said. The run of a routine that is gone was
+ * refused them: off in it now, where it named none of them itself. A chat's grant was carried into the tools as they
+ * were first seen, which made them off by default and on in the chats that had it: what was still to be carried,
+ * where the portal waited for them, is carried now. An MCP server's tools not seen yet were never counted: they come
+ * as any tool does.
+ */
+function browserGrantsToSwitches(d: Database.Database): void {
+  const { servers, browsers } = serversAndBrowsers();
+  const seen = new Set(toolsSeenIn(d).flatMap((tool) => (typeof tool?.name === "string" ? [tool.name] : [])));
+  const ofBrowser = (name: string) => {
+    const server = mcpServerOf(name, servers);
+    return server !== undefined && browsers.includes(server);
+  };
+  const browser = clean([...BROWSER_TOOLS, ...[...seen].filter(ofBrowser)]);
+  const unnamedIn = (lists: { tools_off: string; tools_on: string }) => {
+    const off = parseToolsOff(lists.tools_off);
+    const on = parseToolsOff(lists.tools_on);
+    return { off, on, unnamed: browser.filter((name) => !off.includes(name) && !on.includes(name)) };
+  };
+  const routines = d.prepare("SELECT slug, browser, tools_off, tools_on FROM routines").all() as { slug: string; browser: number; tools_off: string; tools_on: string }[];
+  const putRoutine = d.prepare("UPDATE routines SET tools_off = ?, tools_on = ? WHERE slug = ?");
+  for (const routine of routines) {
+    const { off, on, unnamed } = unnamedIn(routine);
+    if (!unnamed.length) continue;
+    (routine.browser === 1 ? on : off).push(...unnamed);
+    putRoutine.run(clean(off).join("\n"), clean(on).join("\n"), routine.slug);
+  }
+  const gone = d.prepare("SELECT id, tools_off, tools_on FROM sessions WHERE kind = 'routine' AND routine_slug NOT IN (SELECT slug FROM routines)").all() as { id: string; tools_off: string; tools_on: string }[];
+  const putRun = d.prepare("UPDATE sessions SET tools_off = ? WHERE id = ?");
+  for (const run of gone) {
+    const { off, unnamed } = unnamedIn(run);
+    if (unnamed.length) putRun.run(clean([...off, ...unnamed]).join("\n"), run.id);
+  }
+  // Unmarked in a database no portal that carried grants has opened: one with no chat had nothing to carry, one with chats waited.
+  const adopted = settingIn(d, "browser_tools_adopted") ?? (d.prepare("SELECT 1 FROM sessions LIMIT 1").get() ? "pending" : "1");
+  if (adopted === "1") return;
+  // Waiting, the grant answered for all of them; carrying, each was carried as it was first seen, and the rest are to be.
+  const unseen = adopted === "pending" ? browser : browser.filter((name) => !seen.has(name));
+  if (!unseen.length) return;
+  d.prepare("INSERT INTO settings (key, value) VALUES ('tools_off_default', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(
+    clean([...parseToolsOff(settingIn(d, "tools_off_default")), ...unseen]).join("\n"),
+  );
+  const granted = d.prepare("SELECT id, tools_on FROM sessions WHERE browser = 1 AND kind != 'routine'").all() as { id: string; tools_on: string }[];
+  const putChat = d.prepare("UPDATE sessions SET tools_on = ? WHERE id = ?");
+  for (const chat of granted) putChat.run(clean([...parseToolsOff(chat.tools_on), ...unseen]).join("\n"), chat.id);
+}
+
+/**
+ * Where the voice service listened and spoke when it was the portal's, on the portal's loopback: the addresses connecting
+ * it saved into voice mode's settings. Written out here, as an upgrade step does not change with the code after it.
+ */
+const VOICE_SERVICE_URLS = [
+  "http://127.0.0.1:7862/v1/audio/speech",
+  "http://127.0.0.1:7863/v1/audio/speech",
+  "http://127.0.0.1:8188/inference",
+  "http://127.0.0.1:7862/v1/audio/transcriptions",
+  "http://127.0.0.1:7863/v1/audio/transcriptions",
+];
+/** An address of the voice service, as the portal told one: `localhost` is the same loopback, and a slash at the end is the same path. */
+function voiceServiceUrl(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(url.hostname)) return false;
+    return VOICE_SERVICE_URLS.includes(`http://127.0.0.1:${url.port}${url.pathname.replace(/\/+$/, "")}`);
+  } catch {
+    return false;
+  }
+}
+
+/** The keys of voice mode's settings that stay the portal's: whether a spoken conversation is offered and how it goes, whatever listens and speaks for it. */
+const VOICE_MODE_KEYS = ["vad", "responseInstructions", "skipThinkingProviders", "voiceModel", "conversation"];
+
+/**
+ * Voice mode listens and speaks through an extension now, the source, chosen on that extension's own page (`provider`
+ * in the voice settings), and core keeps only how a spoken conversation goes. Everything the portal kept of the voice
+ * service is the Voice extension's (pithagoras-voice), and the person's own speech servers are a small extension's
+ * (pithagoras-voice-servers). What the portal kept for each is left for it in the data folder (see handoff.ts), and the
+ * extension takes it up when it starts, which may be long after this, or never:
+ *
+ * - "voice-service": the voice library (each saved voice, a clone's recording as the bytes stored), the voice chosen,
+ *   the designed voice's description, the engine settings and the input language, and the service's own settings: the
+ *   GPU chosen on its page, a setup that had not come up yet, and whether its speech model was let go of once voice
+ *   mode no longer used it. Left wherever any of it is there.
+ * - "voice-addresses": the person's own addresses for recognition, speech and dictation, with their models, runtime,
+ *   language and Kokoro voice. Where the service's addresses were in use, a side of the person's own is what connecting
+ *   the service remembered of it (`voice_before_managed`), and a dictation address of their own beside the service's is
+ *   theirs. Left wherever any address of theirs is there, whether voice mode was on or off, as their addresses are never
+ *   overwritten.
+ *
+ * Leaving is not choosing. Voice mode that was on keeps the source chosen at version 8, or else takes the extension
+ * that does what it did: the service where the service's addresses were in use, the person's own servers where theirs
+ * were. Voice mode that was off has none. The voice settings then keep only `provider` and VOICE_MODE_KEYS.
+ *
+ * The step runs while the table of saved voices is there: it drops the table once all of it is left, so a database
+ * that is done, or fresh, has nothing to do. While the table is there, a folder at either name is an earlier try's that
+ * nothing has taken (a take moves it away first), and all of it is in the rows still: it is removed and left anew,
+ * with any voices added since. A try that fails keeps everything for the next start. The spoken error line the portal
+ * kept as a file goes, as voice mode asks the source for it as it starts. The container and its volume stay where they
+ * are: Voice takes them over by their names. The database was backed up before this ran (db-upgrade.ts);
+ * docs/guide/upgrading.md says how to go back.
+ */
+function handOffVoice(d: Database.Database): void {
+  if (!d.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'voice_presets'").get()) return;
+  const stored = settingIn(d, "voice");
+  let voice: any;
+  let readable = stored !== undefined;
+  try {
+    voice = stored === undefined ? undefined : JSON.parse(stored);
+  } catch {
+    // Not JSON: voice mode could not read it either.
+    readable = false;
+  }
+  const gpu = settingIn(d, "voice_gpu");
+  const pending = settingIn(d, "voice_setup_pending");
+  let kept: Record<string, any> = {};
+  try {
+    kept = JSON.parse(settingIn(d, "voice_before_managed") ?? "{}") ?? {};
+  } catch {
+    // Not JSON: nothing was kept of the person's own.
+  }
+  const voices = d.prepare("SELECT id, name, kind, instruction, transcript, audio FROM voice_presets ORDER BY rowid").all() as { id: string; name: string; kind: string; instruction: string; transcript: string; audio: Buffer | null }[];
+
+  // Which source voice mode takes: the one chosen, else the one its addresses were, and none where it was off.
+  const service = voiceServiceUrl(voice?.whisperUrl) || voiceServiceUrl(voice?.breezeUrl);
+  const chosen = typeof voice?.provider === "string" ? voice.provider.trim() : "";
+  const addresses = !service && typeof voice?.whisperUrl === "string" && voice.whisperUrl.trim() !== "";
+  const provider = voice?.enabled !== true ? "" : chosen || (service ? "pithagoras-voice" : addresses ? "pithagoras-voice-servers" : "");
+
+  // The person's own addresses, each side theirs: what connecting the service remembered where its addresses were in use.
+  const listening = voiceServiceUrl(voice?.whisperUrl);
+  // No speech address and the runtime none is the service's where a connect saved it. Where nothing says (a service connected by an older portal), it is when the recognition is.
+  const speaking = voiceServiceUrl(voice?.breezeUrl) || (voice?.runtime === "none" && !voice?.breezeUrl && (typeof kept.noSpeech === "boolean" ? kept.noSpeech : listening));
+  const dictation = voiceServiceUrl(voice?.dictationUrl);
+  // A dictation address of the person's own beside the service's stays; one connecting the service remembered comes back; the service's own goes.
+  const ownDictation = typeof voice?.dictationUrl === "string" && voice.dictationUrl.trim() !== "" && !dictation;
+  const heard = listening ? kept.listening : voice;
+  const spoken = speaking ? kept.speaking : voice;
+  const dictated = ownDictation ? voice : listening ? kept.listening : dictation ? undefined : voice;
+  const text = (value: unknown) => (typeof value === "string" ? value : null);
+  const number = (value: unknown) => (typeof value === "number" ? value : null);
+  const own = {
+    whisperUrl: text(heard?.whisperUrl),
+    sttModel: text(heard?.sttModel),
+    breezeUrl: text(spoken?.breezeUrl),
+    runtime: text(spoken?.runtime),
+    dictationUrl: text(dictated?.dictationUrl),
+    dictationModel: text(dictated?.dictationModel),
+    language: text(voice?.language),
+    kokoroVoice: text(voice?.kokoroVoice),
+  };
+  const leaveAddresses = [own.whisperUrl, own.breezeUrl, own.dictationUrl].some((url) => !!url?.trim());
+  const leaveService = readable || voices.length > 0 || gpu !== undefined || pending !== undefined;
+
+  try {
+    for (const name of ["voice-service", "voice-addresses"]) rmSync(path.join(handoffRoot(), name), { recursive: true, force: true });
+    if (leaveService) {
+      leaveHandoff("voice-service", (dir) => {
+        // A clone's recording, as the bytes stored, named by its place in the list: no path is made of what is in the rows.
+        const index = voices.map(({ audio, ...row }, n) => {
+          if (!audio) return { ...row, audio: null };
+          mkdirSync(path.join(dir, "voices"), { recursive: true, mode: 0o700 });
+          writeFileAtomic(path.join(dir, "voices", `${n}.wav`), audio, 0o600);
+          return { ...row, audio: `voices/${n}.wav` };
+        });
+        writeFileAtomic(path.join(dir, "voices.json"), JSON.stringify(index), 0o600);
+        writeFileAtomic(
+          path.join(dir, "settings.json"),
+          JSON.stringify({
+            gpu: gpu ?? null,
+            setupPending: pending ?? null,
+            lazyLoad: typeof voice?.lazyLoad === "boolean" ? voice.lazyLoad : null,
+            voice: text(voice?.voice),
+            instruction: text(voice?.instruction),
+            cfgScale: number(voice?.cfgScale),
+            exaggeration: number(voice?.exaggeration),
+            kokoroVoice: text(voice?.kokoroVoice),
+            speed: number(voice?.speed),
+            language: text(voice?.language),
+          }),
+          0o600,
+        );
+        writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "voice-service", schema: 9, made: new Date().toISOString() }), 0o600);
+      });
+    }
+    if (leaveAddresses) {
+      leaveHandoff("voice-addresses", (dir) => {
+        writeFileAtomic(path.join(dir, "settings.json"), JSON.stringify(own), 0o600);
+        writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "voice-addresses", schema: 9, made: new Date().toISOString() }), 0o600);
+      });
+    }
+  } catch (e) {
+    console.warn(`[portal] what voice mode kept could not be left for its extensions, and is kept for the next start: ${(e as Error).message}`);
+    return;
+  }
+  if (readable) {
+    d.prepare("UPDATE settings SET value = ? WHERE key = 'voice'").run(
+      JSON.stringify({ provider, ...Object.fromEntries(VOICE_MODE_KEYS.filter((key) => voice?.[key] !== undefined).map((key) => [key, voice[key]])) }),
+    );
+  } else if (stored !== undefined) {
+    // Voice mode could not read it before either, and a save needs one it can read; the backup has it.
+    d.prepare("DELETE FROM settings WHERE key = 'voice'").run();
+  }
+  d.prepare("DELETE FROM settings WHERE key IN ('voice_gpu', 'voice_setup_pending', 'voice_before_managed')").run();
+  d.exec("DROP TABLE voice_presets");
+  // The spoken error line, kept as a file of its own and as the file a write left half done: only those go, and the folder
+  // where nothing else is in it. A cache: what is left of it does no harm, and nothing about it stops the upgrade.
+  const lines = path.join(path.resolve(DATA_DIR), "voice");
+  try {
+    for (const name of readdirSync(lines)) if (/^\.?error-line-.+\.wav(\.[0-9a-f]{12}\.tmp)?$/.test(name)) rmSync(path.join(lines, name));
+    rmdirSync(lines);
+  } catch {
+    // Not there, or not removed: left as it is.
+  }
+}
+
+/** Understory's settings, when the portal ran it itself. Written out here, as an upgrade step does not change with the code after it. */
+const UNDERSTORY_SETTINGS = ["understory_config", "understory_token", "understory_llm_token", "understory_last_dream"];
+
+/**
+ * The agent's memory in Understory is an extension's now (extensions/understory), with settings of its own. What the
+ * portal kept for it is left for it in the data folder (see handoff.ts), and the extension takes it up when it starts,
+ * which may be long after this, or never: its four settings as they were stored, among them the token its container
+ * was made with, which the agent's MCP entry carries, and any key of the person's it was given. The settings go once
+ * they are left, and a try that fails keeps them for the next start.
+ *
+ * The guard counted what Understory's server said as the person's own words while the person had not said which
+ * servers are: from schema 10 it counts only those said. Where the person had said none, and Understory was in use (its
+ * settings are there, or its server is in pi's mcp.json), it is said for them, once, as the database is brought to
+ * schema 10, whatever comes of the rest.
+ *
+ * The MCP entry stays in pi's mcp.json, with its token, and its tools keep their names, switches and sets: they are
+ * still the server `understory`'s. The container and its volume stay where they are: the extension takes them over by
+ * their names. The database was backed up before this ran (db-upgrade.ts); docs/guide/upgrading.md says how to go back.
+ */
+function handOffUnderstory(d: Database.Database): void {
+  const settings = Object.fromEntries(UNDERSTORY_SETTINGS.map((key) => [key, settingIn(d, key) ?? null]));
+  const kept = Object.values(settings).some((value) => value !== null);
+  const before10 = (d.pragma("user_version", { simple: true }) as number) < 10;
+  if (before10 && settingIn(d, "guard_trusted_mcp_servers") === undefined && (kept || readMcpFile().config.mcpServers?.understory !== undefined)) {
+    d.prepare("INSERT INTO settings (key, value) VALUES ('guard_trusted_mcp_servers', ?)").run(JSON.stringify(["understory"]));
+  }
+  if (!kept) return;
+  try {
+    leaveHandoff("understory", (dir) => {
+      // Written last, and anew on each try, from the settings as they are.
+      writeFileAtomic(path.join(dir, "settings.json"), JSON.stringify(settings), 0o600);
+      writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "understory", schema: 10, made: new Date().toISOString() }), 0o600);
+    });
+  } catch (e) {
+    console.warn(`[portal] what Understory kept could not be left for its extension, and is kept for the next start: ${(e as Error).message}`);
+    return;
+  }
+  d.prepare(`DELETE FROM settings WHERE key IN (${UNDERSTORY_SETTINGS.map(() => "?").join(", ")})`).run(...UNDERSTORY_SETTINGS);
+}
+
+/** What the subagent tool read from pi's settings.json while it was a pi package alone. Written out here, as an upgrade step does not change with the code after it. */
+const SUBAGENT_PI_KEYS = ["subagentMode", "subagentMaxParallel", "subagentModel"];
+
+/**
+ * A copy of the subagent tool that pi lists by its folder and that is no extension of the portal's: a clone from before
+ * it was one, a package named `pithagoras-subagent` without a server half. pi still loads it, as a plain pi package,
+ * and it reads the three keys from pi's settings.json, so those stay where it reads them.
+ */
+function plainSubagentCopy(pi: Record<string, unknown>): string | undefined {
+  const agentDir = piAgentDir();
+  for (const entry of Array.isArray(pi.packages) ? pi.packages : []) {
+    const source = sourceOf(entry);
+    if (!source || !isLocalSource(source)) continue;
+    try {
+      const dir = localPackagePath(source, agentDir);
+      const meta = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+      if (meta?.name === "pithagoras-subagent" && typeof meta.pithagoras?.server !== "string") return dir;
+    } catch {
+      // Not a folder with a package, or not one that can be read: not a copy of the tool.
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The subagent tool is an extension with a server half now (extensions/subagent), with settings of its own. What it
+ * read from pi's settings.json is left for it in the data folder (see handoff.ts), and the extension takes it up when it
+ * starts, which may be long after this, or never: the three keys as pi's settings held them, each null where they held
+ * none. They leave pi's settings only once they are left, and a try that fails keeps them for the next start, as it does
+ * a settings file that cannot be read. They were never in the database, so its backup does not hold them:
+ * docs/guide/upgrading.md says how to put them back to go back.
+ *
+ * A hand-off that waits already (the upgrade of an earlier time, undone by going back) is written anew from the keys
+ * as pi's settings hold them now, as the person may have changed them since. A copy of the tool that is no extension
+ * keeps them, with a warning: nothing would take them up.
+ */
+function handOffSubagent(): void {
+  const pi = readPiSettings();
+  if (!SUBAGENT_PI_KEYS.some((key) => pi[key] !== undefined)) return;
+  const copy = plainSubagentCopy(pi);
+  if (copy) {
+    console.warn(`[portal] the subagent settings stay in pi's settings.json: ${copy} is a copy of the subagent tool from before it was an extension, and still reads them there. Replace it with the one that comes with the portal (Settings → Extensions).`);
+    return;
+  }
+  try {
+    const kept = Object.fromEntries(SUBAGENT_PI_KEYS.map((key) => [key, pi[key] ?? null]));
+    const fill = (dir: string) => {
+      // Written last, and anew on each try, from the settings as they are.
+      writeFileAtomic(path.join(dir, "settings.json"), JSON.stringify(kept), 0o600);
+      writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "subagent", schema: 12, made: new Date().toISOString() }), 0o600);
+    };
+    if (leaveHandoff("subagent", fill) === "there") fill(path.join(handoffRoot(), "subagent"));
+    updatePiSettingsNow((all) => {
+      for (const key of SUBAGENT_PI_KEYS) delete all[key];
+    });
+  } catch (e) {
+    console.warn(`[portal] the subagent settings in pi's settings.json could not be left for its extension, and are kept for the next start: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * What a chat said its subagents run on (its model menu) is the subagent extension's to keep from schema 14, as the
+ * settings are (handOffSubagent). The portal kept it as a setting for each chat, `subagent_model:<chat id>`: "auto", or
+ * "provider/model", or "" for nothing said. Each said is left for the extension in the data folder (see handoff.ts),
+ * which takes them up when it starts: `models.json`, by chat id. The settings go once they are left, and a try that
+ * fails keeps them for the next start. A hand-off that waits already (left by an earlier upgrade, and the person went
+ * back) keeps what it has, and what the settings say now is added over it. The database was backed up before this
+ * ran (db-upgrade.ts); docs/guide/upgrading.md says how to go back.
+ */
+function handOffSubagentChats(d: Database.Database): void {
+  const rows = d.prepare("SELECT key, value FROM settings WHERE key GLOB 'subagent_model:*'").all() as { key: string; value: string }[];
+  if (!rows.length) return;
+  // As the portal checked a choice when it was made. Written out here, as an upgrade step does not change with the code after it.
+  const said = (value: string) => value === "auto" || /^[^/\s]+\/\S+$/.test(value);
+  const models = Object.fromEntries(rows.filter((row) => said(row.value)).map((row) => [row.key.slice("subagent_model:".length), row.value]));
+  // Only chats that said nothing (each one set back to the default leaves ""): nothing to leave.
+  if (!Object.keys(models).length) return void d.prepare("DELETE FROM settings WHERE key GLOB 'subagent_model:*'").run();
+  try {
+    const fill = (dir: string) => {
+      const file = path.join(dir, "models.json");
+      let before: Record<string, unknown> = {};
+      try {
+        const read = JSON.parse(readFileSync(file, "utf8"));
+        if (read && typeof read === "object" && !Array.isArray(read)) before = read;
+      } catch {
+        // Not written yet.
+      }
+      // Written last, and anew on each try, from the settings as they are.
+      writeFileAtomic(file, JSON.stringify({ ...before, ...models }), 0o600);
+      writeFileAtomic(path.join(dir, "handoff.json"), JSON.stringify({ format: 1, name: "subagent-chats", schema: 14, made: new Date().toISOString() }), 0o600);
+    };
+    if (leaveHandoff("subagent-chats", fill) === "there") fill(path.join(handoffRoot(), "subagent-chats"));
+  } catch (e) {
+    console.warn(`[portal] what the chats said their subagents run on could not be left for the subagent extension, and is kept for the next start: ${(e as Error).message}`);
+    return;
+  }
+  d.prepare("DELETE FROM settings WHERE key GLOB 'subagent_model:*'").run();
+}
+
+/**
+ * A set of the portal's own tools that are an extension's now, whose are filed
+ * under its package's name: a lazy mark on the set, and a name somebody gave
  * its box, go with them.
  */
-function canvasSetMoved(d: Database.Database): void {
-  const OLD = "canvases", NEW = "pithagoras-canvas";
-  const setting = (key: string) => (d.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | undefined)?.value;
+function setMoved(d: Database.Database, from: string, to: string): void {
   const put = d.prepare("UPDATE settings SET value = ? WHERE key = ?");
-  const marks = parseToolsOff(setting("tools_lazy"));
-  if (marks.includes(OLD)) put.run([...new Set(marks.map((mark) => (mark === OLD ? NEW : mark)))].sort().join("\n"), "tools_lazy");
+  const marks = parseToolsOff(settingIn(d, "tools_lazy"));
+  if (marks.includes(from)) put.run([...new Set(marks.map((mark) => (mark === from ? to : mark)))].sort().join("\n"), "tools_lazy");
   try {
-    const names = JSON.parse(setting("tool_group_names") ?? "{}");
-    if (names && typeof names === "object" && OLD in names && !(NEW in names)) {
-      names[NEW] = names[OLD];
-      delete names[OLD];
+    const names = JSON.parse(settingIn(d, "tool_group_names") ?? "{}");
+    if (names && typeof names === "object" && from in names && !(to in names)) {
+      names[to] = names[from];
+      delete names[from];
       put.run(JSON.stringify(names), "tool_group_names");
     }
   } catch {
@@ -581,6 +1105,8 @@ function migrate(d: Database.Database): void {
   if (!names.includes("pi_session_file")) {
     d.exec("ALTER TABLE sessions ADD COLUMN pi_session_file TEXT");
   }
+  // Whether a chat could drive the browser, until schema 8 wrote it into the chat's tools (see
+  // browserGrantsToSwitches). Kept, unread.
   if (!names.includes("browser")) {
     d.exec("ALTER TABLE sessions ADD COLUMN browser INTEGER NOT NULL DEFAULT 0");
   }
@@ -611,6 +1137,15 @@ function migrate(d: Database.Database): void {
   if (!names.includes("reloads")) {
     d.exec("ALTER TABLE sessions ADD COLUMN reloads INTEGER NOT NULL DEFAULT 0");
   }
+  // The mode a chat works in (chat-modes.ts): NULL is Standard, which every chat before schema 11 was.
+  if (!names.includes("mode")) d.exec("ALTER TABLE sessions ADD COLUMN mode TEXT");
+  // Child chats (schema 13): the chat a server half made one for, whether it is in the chat lists, and the package that
+  // made it. Every chat before was one of its own, and listed.
+  if (!names.includes("parent_id")) d.exec("ALTER TABLE sessions ADD COLUMN parent_id TEXT");
+  if (!names.includes("listed")) d.exec("ALTER TABLE sessions ADD COLUMN listed INTEGER NOT NULL DEFAULT 1");
+  if (!names.includes("creator")) d.exec("ALTER TABLE sessions ADD COLUMN creator TEXT");
+  // A chat's children are looked up as it is deleted, and as its pi asks whether one of them still works.
+  d.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id) WHERE parent_id IS NOT NULL");
   // Versions kept before pi's file was kept as the part after a checked start:
   // one could not tell whether the conversation it would go back to was still
   // there. Only ever on a test deploy; and the reload markers stored then.
@@ -670,6 +1205,16 @@ function migrate(d: Database.Database): void {
     d.exec("UPDATE people SET renamed = 1 WHERE notes != ''");
   }
   writeOutCanvases(d);
+  handOffMedia(d);
+  handOffBrowser(d);
+  handOffVoice(d);
+  handOffUnderstory(d);
+  handOffSubagent();
+  handOffSubagentChats(d);
+  // Whether a project does without the agent's memory was named for what held it, Understory, until schema 10:
+  // anything may hold it now (portal.memory.hold).
+  const agentLinkCols = (d.prepare("PRAGMA table_info(project_agent)").all() as { name: string }[]).map((c) => c.name);
+  if (agentLinkCols.includes("understory_off")) d.exec("ALTER TABLE project_agent RENAME COLUMN understory_off TO memory_off");
   if ((d.pragma("user_version", { simple: true }) as number) < 6) filesOnOldCalls(d);
   const agentCols = (d.prepare("PRAGMA table_info(agents)").all() as { name: string }[]).map((c) => c.name);
   for (const col of ["voice", "quiet_start", "quiet_end", "last_heartbeat", "heartbeat_status"]) {
@@ -707,24 +1252,17 @@ function migrate(d: Database.Database): void {
     const runs = d.prepare("SELECT count(*) AS n FROM sessions WHERE kind = 'routine'").get() as { n: number };
     if (runs.n) d.prepare("UPDATE sessions SET workspace = ? WHERE kind = 'routine'").run(agentHome());
   }
+  // Who may drive the browser, as a routine's switch, until schema 8 wrote it into the routine's tools (see
+  // browserGrantsToSwitches). Kept, unread, as the sessions' column above is.
   if (routineCols.length && !routineCols.includes("browser")) {
     d.exec("ALTER TABLE routines ADD COLUMN browser INTEGER NOT NULL DEFAULT 0");
   }
   // A routine's exceptions to what its agent and project leave, as a chat keeps
-  // them. The `browser` column above stays: it answers for the browser's tools
-  // where these say nothing about them (see routineTools).
-  // Each on its own, as for sessions: a database with one of them is given the other.
+  // them. Each on its own, as for sessions: a database with one of them is given the other.
   for (const col of ["tools_off", "tools_on"]) {
     if (routineCols.length && !routineCols.includes(col)) d.exec(`ALTER TABLE routines ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
   }
   d.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_slug ON routines(slug)");
-  // Where a picture that was found in a folder lies (see image-gallery.ts). The
-  // gallery was first kept without it, and CREATE TABLE above leaves such a table as it is.
-  const imageCols = (d.prepare("PRAGMA table_info(images)").all() as { name: string }[]).map((c) => c.name);
-  if (imageCols.length && !imageCols.includes("folder")) d.exec("ALTER TABLE images ADD COLUMN folder TEXT");
-  d.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_images_folder_file ON images(folder, path) WHERE folder IS NOT NULL");
-  // What was made of a picture, looked for whenever a picture is forgotten: without it each of them is a pass over the whole gallery.
-  d.exec("CREATE INDEX IF NOT EXISTS idx_images_source ON images(source_id) WHERE source_id IS NOT NULL");
   d.exec("CREATE INDEX IF NOT EXISTS idx_notes_pending ON notes(session_id, consumed_at)");
   d.exec("CREATE INDEX IF NOT EXISTS idx_grants_open ON grants(session_id, tool, used_at)");
   d.exec("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC)");
@@ -750,16 +1288,21 @@ function migrate(d: Database.Database): void {
     `CREATE INDEX IF NOT EXISTS idx_events_commands ON events(session_id, seq)
        WHERE type IN ('portal_command', 'portal_command_end')`,
   );
+  // The questions a chat has asked and their ends, read for every child chat in the chat list: see openChatQuestions.
+  d.exec(
+    `CREATE INDEX IF NOT EXISTS idx_events_questions ON events(session_id, seq)
+       WHERE type IN ('portal_question', 'portal_question_end')`,
+  );
   const ruleCols = (d.prepare("PRAGMA table_info(tool_rules)").all() as { name: string }[]).map(
     (c) => c.name
   );
   if (ruleCols.length && !ruleCols.includes("person_key")) {
     d.exec("ALTER TABLE tool_rules ADD COLUMN person_key TEXT");
   }
-  // A rule for a tool that runs as the primary user never applies now, and the API refuses to make one. Those an older
-  // version made would stay listed as working: dropped, but for a heartbeat's own.
+  // A rule for a tool that runs as the primary user never applies now, a heartbeat's included, and the API refuses to
+  // make one. Those an older version made would stay listed as working: dropped.
   const asPrimary = Object.keys(RUNS_AS_PRIMARY);
-  d.prepare(`DELETE FROM tool_rules WHERE role != 'heartbeat' AND tool IN (${asPrimary.map(() => "?").join(", ")})`).run(...asPrimary);
+  d.prepare(`DELETE FROM tool_rules WHERE tool IN (${asPrimary.map(() => "?").join(", ")})`).run(...asPrimary);
   const questionCols = (d.prepare("PRAGMA table_info(questions)").all() as { name: string }[]).map(
     (c) => c.name
   );
@@ -775,8 +1318,8 @@ function migrate(d: Database.Database): void {
     d.exec("ALTER TABLE notes ADD COLUMN pending_delivery INTEGER NOT NULL DEFAULT 0");
   }
   seedCodemodeOff(d);
-  // Last, because it reads the settings the tables above have to exist for.
-  adoptBrowserGrants(d);
+  // Last, because it reads the tables and settings above.
+  if ((d.pragma("user_version", { simple: true }) as number) < 8) browserGrantsToSwitches(d);
 }
 
 /**
@@ -805,11 +1348,25 @@ export function createSession(row: {
   channel_key?: string | null;
   routine_slug?: string | null;
   auto_title?: number;
+  /** A child chat's (see child-chats.ts): what it starts from, taken from its parent. */
+  parent_id?: string | null;
+  listed?: number;
+  creator?: string | null;
+  role?: SessionRow["role"];
+  last_person_key?: string | null;
+  mode?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  thinking_level?: string | null;
+  tools_off?: string;
+  tools_on?: string;
 }): void {
   getDb()
     .prepare(
-      `INSERT INTO sessions (id, title, workspace, executor, kind, channel_slug, channel_key, routine_slug, auto_title)
-       VALUES (@id, @title, @workspace, @executor, @kind, @channel_slug, @channel_key, @routine_slug, @auto_title)`
+      `INSERT INTO sessions (id, title, workspace, executor, kind, channel_slug, channel_key, routine_slug, auto_title,
+                             parent_id, listed, creator, role, last_person_key, mode, provider, model, thinking_level, tools_off, tools_on)
+       VALUES (@id, @title, @workspace, @executor, @kind, @channel_slug, @channel_key, @routine_slug, @auto_title,
+               @parent_id, @listed, @creator, @role, @last_person_key, @mode, @provider, @model, @thinking_level, @tools_off, @tools_on)`
     )
     .run({
       kind: "task",
@@ -817,26 +1374,55 @@ export function createSession(row: {
       channel_slug: null,
       channel_key: null,
       routine_slug: null,
+      parent_id: null,
+      listed: 1,
+      creator: null,
+      role: "primary",
+      last_person_key: null,
+      mode: null,
+      provider: null,
+      model: null,
+      thinking_level: null,
+      tools_off: "",
+      tools_on: "",
       ...row,
     });
 }
 
-/** The sessions you create yourself. Agent sessions have their own tab. */
+/** A child chat that is kept out of the lists: it is found by its id alone. */
+const UNLISTED = "parent_id IS NOT NULL AND listed = 0";
+
+/** The sessions you create yourself, and the children of chats that are listed. Agent sessions have their own tab. */
 export function listSessions(): SessionRow[] {
   // Pinned first, then most recently touched — the order the sidebar shows.
   return getDb()
-    .prepare("SELECT * FROM sessions WHERE kind = 'task' ORDER BY pinned DESC, updated_at DESC")
+    .prepare(`SELECT * FROM sessions WHERE kind = 'task' AND NOT (${UNLISTED}) ORDER BY pinned DESC, updated_at DESC`)
     .all() as SessionRow[];
+}
+
+/** The children of a chat, listed or not: see child-chats.ts. */
+export function childSessions(parentId: string): SessionRow[] {
+  return getDb().prepare("SELECT * FROM sessions WHERE parent_id = ? ORDER BY created_at, rowid").all(parentId) as SessionRow[];
+}
+
+/**
+ * One session of every kind (tasks, routine runs, Agent-page and channel conversations, heartbeats) for each workspace they were made for, as stored.
+ * Sessions are not pruned (a routine that makes a fresh session for each run keeps every one), but what an agent can reach depends on the workspace
+ * and not on the session, so one of them stands for the rest. One query, and a row for each workspace, not for each session.
+ */
+export function sessionsByWorkspace(): SessionRow[] {
+  return getDb().prepare("SELECT s.* FROM sessions s JOIN (SELECT MIN(id) AS id FROM sessions GROUP BY workspace) m ON s.id = m.id").all() as SessionRow[];
 }
 
 /**
  * The chats the sidebar lists: the tasks, and the conversations started on the
  * Agent page, which are chats with that agent like any other. Those that came
- * through a channel stay on the Agent page.
+ * through a channel stay on the Agent page. A child chat is listed where it
+ * was made to be (its parent named on it), and left out otherwise.
  */
 export function listChatSessions(): SessionRow[] {
   return getDb()
-    .prepare("SELECT * FROM sessions WHERE kind = 'task' OR (kind = 'agent' AND channel_slug = ?) ORDER BY pinned DESC, updated_at DESC")
+    .prepare(`SELECT * FROM sessions WHERE (kind = 'task' OR (kind = 'agent' AND channel_slug = ?)) AND NOT (${UNLISTED}) ORDER BY pinned DESC, updated_at DESC`)
     .all(BROWSER_CHANNEL) as SessionRow[];
 }
 
@@ -911,6 +1497,9 @@ export function updateSession(
       | "pinned"
       | "auto_title"
       | "pi_session_file"
+      | "mode"
+      | "role"
+      | "last_person_key"
     >
   >
 ): void {
@@ -933,32 +1522,14 @@ export const deleteSession = (id: string): void => getDb().transaction(() => rem
 
 function removeSession(id: string): void {
   const d = getDb();
-  const folder = (d.prepare("SELECT workspace FROM sessions WHERE id = ?").get(id) as { workspace: string } | undefined)?.workspace;
+  // Its children go with it, in the same transaction: a child is the chat's own work, and has nothing to go on from
+  // without it. One level only, so a child has none of its own.
+  for (const child of childSessions(id)) removeSession(child.id);
   d.prepare("DELETE FROM events WHERE session_id = ?").run(id);
   d.prepare("DELETE FROM message_versions WHERE session_id = ?").run(id);
   d.prepare("DELETE FROM sessions WHERE id = ?").run(id);
-  setSessionSubagentModel(id, null);
   d.prepare("DELETE FROM open_subagents WHERE session_id = ?").run(id);
   d.prepare("DELETE FROM settings WHERE key = ?").run(trustedKey(id));
-  // The pictures stay in the chat's folder, which is not the chat's to take away, and so they stay in the gallery, as pictures of that folder with what they were asked for.
-  // Nothing else may name the folder once the chat is gone, so it is kept with them (see image-gallery.ts).
-  let real: string | undefined;
-  try {
-    real = folder ? realpathSync(folder) : undefined;
-  } catch {
-    // A folder that cannot be reached is not one to keep pictures of: there is nothing to find them in.
-  }
-  if (real) d.prepare("UPDATE OR IGNORE images SET origin = 'folder', folder = ?, session_id = NULL WHERE session_id = ?").run(real, id);
-  // What is left is what could not be kept, and what was made of it no longer names it.
-  d.prepare("UPDATE images SET source_id = NULL WHERE source_id IN (SELECT id FROM images WHERE session_id = ?)").run(id);
-  const left = (d.prepare("SELECT id FROM images WHERE session_id = ?").all(id) as { id: string }[]).map((row) => row.id);
-  d.prepare("DELETE FROM images WHERE session_id = ?").run(id);
-  removeThumbs(left);
-  // The same for its clips (see video-gallery.ts).
-  if (real) d.prepare("UPDATE OR IGNORE videos SET origin = 'folder', folder = ?, session_id = NULL WHERE session_id = ?").run(real, id);
-  const leftClips = (d.prepare("SELECT id FROM videos WHERE session_id = ?").all(id) as { id: string }[]).map((row) => row.id);
-  d.prepare("DELETE FROM videos WHERE session_id = ?").run(id);
-  removePosters(leftClips);
 }
 
 /**
@@ -1053,6 +1624,142 @@ function placeOf(
   if (row.type !== "portal_prompt" || !(JSON.parse(row.payload) ?? {}).queued) return row.seq;
   return settled.taken.get(row.seq) ?? settled.unsent.get(row.seq) ?? Number.POSITIVE_INFINITY;
 }
+
+/** Whether a message or a command was ever sent in the chat: what fixes its mode. One whose messages were all removed has none again. */
+export function chatSaid(sessionId: string): boolean {
+  return Boolean(getDb().prepare("SELECT 1 FROM events WHERE session_id = ? AND type IN ('portal_prompt', 'portal_command') LIMIT 1").get(sessionId));
+}
+
+/** A mode the person made (Settings → Modes), as chat_modes keeps it: a chat in it stores "custom/<id>". */
+export interface ChatModeRow {
+  /** A slug of the label it was made with: a new label does not change it. */
+  id: string;
+  label: string;
+  description: string;
+  /** Its tool layer: exceptions to what the layers under it leave, one name a line, as a project's. */
+  tools_off: string;
+  tools_on: string;
+  /** 1 where its chats work through the code tool alone. */
+  codemode: number;
+  /** Said in its chats' system prompt. */
+  instructions: string;
+  /** What a chat is put on as it is put in the mode, where set. */
+  provider: string | null;
+  model: string | null;
+  thinking_level: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** The modes the person made, by their labels. */
+export const customModes = (): ChatModeRow[] => getDb().prepare("SELECT * FROM chat_modes ORDER BY label COLLATE NOCASE").all() as ChatModeRow[];
+
+export const customMode = (id: string): ChatModeRow | undefined => getDb().prepare("SELECT * FROM chat_modes WHERE id = ?").get(id) as ChatModeRow | undefined;
+
+/**
+ * Makes a mode, its id a slug of its label that no mode has, and no chat still stores: a chat keeps the mode of one
+ * that was deleted, which a new mode of that name would take over. A slug and not a random id, so that such a chat
+ * is said to be in "research", not in a code.
+ */
+export function createCustomMode(fields: { label: string; description: string }): ChatModeRow {
+  const d = getDb();
+  const made = d.prepare("SELECT id FROM chat_modes").all() as { id: string }[];
+  const kept = d.prepare("SELECT DISTINCT substr(mode, ?) AS id FROM sessions WHERE mode LIKE ?").all(CUSTOM.length + 1, `${CUSTOM}%`) as { id: string }[];
+  const id = freeSlug(fields.label, [...made, ...kept].map((row) => row.id), "mode");
+  d.prepare("INSERT INTO chat_modes (id, label, description) VALUES (?, ?, ?)").run(id, fields.label, fields.description);
+  return customMode(id)!;
+}
+
+/**
+ * Changes what a mode says. Made to work through the code tool, it has that tool on in its layer too, where it had
+ * it off: the mode works through it. Switched off in the mode's tools after that, it is the person's word, as in a chat.
+ * Made not to, its layer no longer switches the tool on, which is then as the layers under the mode leave it.
+ */
+export function updateCustomMode(
+  id: string,
+  fields: Partial<Pick<ChatModeRow, "label" | "description" | "codemode" | "instructions" | "provider" | "model" | "thinking_level">>,
+): ChatModeRow | undefined {
+  const d = getDb();
+  d.transaction(() => {
+    const said = Object.entries(fields);
+    d.prepare(`UPDATE chat_modes SET ${said.map(([name]) => `${name} = ?, `).join("")}updated_at = datetime('now') WHERE id = ?`).run(...said.map(([, value]) => value), id);
+    if (fields.codemode !== undefined) {
+      const tools = customModeTools(id);
+      const on = tools.on.filter((name) => name !== CODEMODE_TOOL);
+      setCustomModeTools(id, fields.codemode === 1 ? { off: tools.off.filter((name) => name !== CODEMODE_TOOL), on: [...on, CODEMODE_TOOL] } : { off: tools.off, on });
+    }
+  })();
+  return customMode(id);
+}
+
+/** What a mode says about tools, as exceptions to what the layers under it leave. */
+export function customModeTools(id: string): SessionTools {
+  const row = getDb().prepare("SELECT tools_off, tools_on FROM chat_modes WHERE id = ?").get(id) as { tools_off: string; tools_on: string } | undefined;
+  return { off: parseToolsOff(row?.tools_off), on: parseToolsOff(row?.tools_on) };
+}
+
+export function setCustomModeTools(id: string, tools: SessionTools): SessionTools {
+  const stored = { off: clean(tools.off), on: clean(tools.on) };
+  getDb()
+    .prepare("UPDATE chat_modes SET tools_off = ?, tools_on = ?, updated_at = datetime('now') WHERE id = ?")
+    .run(stored.off.join("\n"), stored.on.join("\n"), id);
+  return stored;
+}
+
+/** Deletes a mode. The chats in it keep what they store, and are in a mode that is not there now. */
+export function deleteCustomMode(id: string): boolean {
+  return getDb().prepare("DELETE FROM chat_modes WHERE id = ?").run(id).changes > 0;
+}
+
+/** A mode the person made, as the modes are listed. */
+export const customEntry = (row: ChatModeRow): ChatModeEntry => ({
+  id: CUSTOM + row.id,
+  label: row.label,
+  description: row.description,
+  tools: { off: parseToolsOff(row.tools_off), on: parseToolsOff(row.tools_on) },
+  codemode: row.codemode === 1,
+  ...(row.instructions ? { instructions: row.instructions } : {}),
+  ...(row.provider ? { provider: row.provider } : {}),
+  ...(row.model ? { model: row.model } : {}),
+  ...(row.thinking_level ? { thinkingLevel: row.thinking_level } : {}),
+});
+
+/**
+ * The modes a chat may be put in: none where it may not choose. A chat with the person on the portal's pages (a task
+ * chat or an Agent-page chat, of the primary user: see asksQuestions), where pi runs in the portal's own process: a
+ * mode is carried out where the portal starts a chat's pi, which a container's pi is not. The portal's own first,
+ * then the ones the person made, by their names, then the extensions' in the order they were offered.
+ */
+export function modesFor(session: Pick<SessionRow, "kind" | "role" | "channel_slug"> & { parent_id?: string | null }): readonly ChatModeEntry[] {
+  const host = dialogHost(session);
+  return EXECUTOR_KIND === "host" && asksQuestions({ kind: host.kind, role: session.role }, onChannel(host))
+    ? [...CORE_MODES, ...customModes().map(customEntry), ...providedModes()]
+    : [];
+}
+
+/** A chat's mode, as it stores it: none for Standard, and none for one that is not there now. */
+export function modeOf(stored: string | null | undefined): ChatModeEntry | undefined {
+  if (!stored) return undefined;
+  if (stored.startsWith(CUSTOM)) {
+    const row = customMode(stored.slice(CUSTOM.length));
+    return row && customEntry(row);
+  }
+  return CORE_MODES.find((mode) => mode.id === stored);
+}
+
+/**
+ * Whether a chat in `mode` has the code tool held on: the mode's tools switch it on, whoever made the mode. The chat's
+ * own switches cannot turn it off there (ownTools).
+ */
+export function modeHoldsCodemode(mode: string | null | undefined): boolean {
+  return Boolean(modeOf(mode)?.tools?.on.includes(CODEMODE_TOOL));
+}
+
+/** The tools off for a chat in `mode`, given those off under it: the mode's layer folded in, as each layer is. */
+const withMode = (off: string[], mode: string | null | undefined): string[] => {
+  const layer = modeOf(mode)?.tools;
+  return layer ? defaultsFor(off, layer) : off;
+};
 
 /** Whether the agent has answered in a chat: there is a conversation of its own to lose. */
 export function hasAnswer(sessionId: string): boolean {
@@ -1469,6 +2176,29 @@ export function trustResult(sessionId: string, id: string): void {
   putSetting(trustedKey(sessionId), JSON.stringify([...trustedResults(sessionId), id]));
 }
 
+/** Takes a trusted result back. False when it was not trusted. */
+export function untrustResult(sessionId: string, id: string): boolean {
+  const had = trustedResults(sessionId);
+  if (!had.has(id)) return false;
+  const left = [...had].filter((one) => one !== id);
+  putSetting(trustedKey(sessionId), left.length ? JSON.stringify(left) : "");
+  return true;
+}
+
+/** Every conversation's trusted results, by the conversation: what the Guard page lists, to take back. */
+export function allTrustedResults(): { sessionId: string; ids: string[] }[] {
+  const prefix = trustedKey("");
+  const rows = getDb().prepare("SELECT key, value FROM settings WHERE substr(key, 1, ?) = ?").all(prefix.length, prefix) as { key: string; value: string }[];
+  return rows.flatMap(({ key, value }) => {
+    try {
+      const ids = JSON.parse(value);
+      return Array.isArray(ids) && ids.length ? [{ sessionId: key.slice(prefix.length), ids: ids.filter((id): id is string => typeof id === "string") }] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
 /**
  * The speaking instructions saved with the voice settings; empty where the
  * built-in ones are used. They live in the same JSON as the rest of them.
@@ -1503,14 +2233,16 @@ export function getVoiceModel(): { provider: string; modelId: string } | undefin
   }
 }
 
-/** Whether voice mode can speak: the add-on is on, with a speech engine (not recognition alone). */
+/**
+ * Whether voice mode can speak: voice mode has a source, and it can speak now (not recognition alone). Set by the voice
+ * routes, which know the source, and which this module cannot import.
+ */
+let speaks: () => boolean = () => false;
+export function setVoiceSpeaks(read: typeof speaks): void {
+  speaks = read;
+}
 export function voiceSpeaks(): boolean {
-  try {
-    const voice = JSON.parse(getSetting("voice") ?? "{}");
-    return voice.enabled === true && voice.runtime !== "none";
-  } catch {
-    return false;
-  }
+  return speaks();
 }
 
 /**
@@ -1530,7 +2262,7 @@ export function getStoredSettings(): Partial<GlobalSettings> {
 
 /**
  * The stored defaults the page may see: the three it edits. The table holds
- * much else — passwords, tokens, keys the portal keeps for its add-ons — and
+ * much else — passwords, tokens and keys the portal keeps — and
  * none of that is the page's to have.
  */
 export function shownStoredSettings(): Partial<GlobalSettings> {
@@ -1768,6 +2500,31 @@ export function useGrant(sessionId: string, tool: string, subject: string): bool
   return true;
 }
 
+/** An approval that is still good: not spent, not run out. */
+export interface OpenGrant {
+  id: string;
+  session_id: string;
+  tool: string;
+  subject: string;
+  created_at: string;
+  expires_at: string;
+}
+
+/** The approvals that are still good, the newest first: what the Guard page lists, to revoke. */
+export function openGrants(): OpenGrant[] {
+  return getDb()
+    .prepare("SELECT id, session_id, tool, subject, created_at, expires_at FROM grants WHERE used_at IS NULL AND expires_at > ? ORDER BY created_at DESC")
+    .all(new Date().toISOString()) as OpenGrant[];
+}
+
+/** Takes an approval back before it is spent: it is marked used, as one that was, so it never is. What it was; undefined when there was none to take. */
+export function revokeGrant(id: string): OpenGrant | undefined {
+  const open = openGrants().find((grant) => grant.id === id);
+  if (!open) return undefined;
+  getDb().prepare("UPDATE grants SET used_at = ? WHERE id = ? AND used_at IS NULL").run(new Date().toISOString(), id);
+  return open;
+}
+
 export interface AuditRow {
   id: number;
   at: string;
@@ -1832,117 +2589,53 @@ export function clearAudit(through?: number): number {
   })();
 }
 
-/** Does this routine's runs get the guard's blocking rules? Unknown means yes. */
-export function routineGuards(slug: string | null | undefined): boolean {
-  if (!slug) return true;
-  const row = getDb().prepare("SELECT guard FROM routines WHERE slug = ?").get(slug) as
-    | { guard: number }
-    | undefined;
-  return row ? row.guard === 1 : true;
-}
+/** Where a routine's exemptions from the guard's rules are kept, by its id (a slug can be renamed): see routineExemptions. */
+const exemptionsKey = (routineId: string) => `routine_guard_off:${routineId}`;
 
 /**
- * Carry the old per-session browser grant into the tool switches.
- *
- * The browser used to be opt-in per conversation, stored in `sessions.browser`
- * and off by default. It is an MCP server now, and a server's tools are on
- * unless something says otherwise — which on an upgrade would hand every
- * conversation that ever existed a browser signed into real accounts, because
- * nobody had said otherwise about a switch that did not exist yet.
- *
- * So the posture is carried over rather than replaced: the browser's tools go
- * into the defaults as off, and the conversations that had the grant get it
- * back as their own exception. A new install is unaffected and starts the way
- * any other server does. Run once, because after it the operator's own choices
- * are the ones in there.
- *
- * It cannot run when the database opens. Which tools are the browser's is only
- * known once a session has registered them, and on the first start after an
- * upgrade none has: the catalogue is a key this build introduced. So the first
- * call only decides whether there is a posture to carry — an install with
- * conversations in it — and marks it `pending`. It runs again from
- * `rememberTools()` and does the carrying the moment the browser's tools
- * appear. Until then `browserAllowed()` goes on reading the old column. After
- * it, a browser tool that shows up later is carried the same way.
+ * The guard's rules (GUARD_RULE_NAMES) a routine's runs are exempt from: what the person switched off for it on the
+ * Guard page, read at each call so that a change holds for a run that is going. A routine from before that page,
+ * whose one switch was off, is exempt from all of them. An unknown routine, and every other session, from none.
  */
-export function adoptBrowserGrants(d: Database.Database = getDb(), fresh: string[] = []): void {
-  const flag = d
-    .prepare("SELECT value FROM settings WHERE key = 'browser_tools_adopted'")
-    .get() as { value: string } | undefined;
-  if (flag?.value === "1") return;
-  const mark = (value: string) =>
-    d
-      .prepare(
-        "INSERT INTO settings (key, value) VALUES ('browser_tools_adopted', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-      )
-      .run(value);
-
-  let state = flag?.value;
-  if (!state) {
-    // Nobody has ever had a conversation: nothing was granted, nothing to keep.
-    if (!d.prepare("SELECT 1 FROM sessions LIMIT 1").get()) return void mark("1");
-    mark((state = "pending"));
+export function routineExemptions(slug: string | null | undefined): Set<string> {
+  if (!slug) return new Set();
+  const row = getDb().prepare("SELECT id, guard FROM routines WHERE slug = ?").get(slug) as { id: string; guard: number } | undefined;
+  if (!row) return new Set();
+  const stored = getSetting(exemptionsKey(row.id));
+  if (stored === undefined) return new Set(row.guard === 1 ? [] : GUARD_RULE_NAMES);
+  try {
+    const names = JSON.parse(stored);
+    return new Set(Array.isArray(names) ? names.filter((name): name is string => (GUARD_RULE_NAMES as readonly string[]).includes(name)) : []);
+  } catch {
+    // Not readable is not a reason to let anything through.
+    return new Set();
   }
-
-  const servers = mcpServerNames();
-  const browsers = browserServers();
-  // Waiting: every browser tool seen so far. Carrying: only the ones that are
-  // new. The catalogue is what one session happened to have registered — a lazy
-  // server has cached some of its tools and not others, and a pinned version
-  // that is bumped adds names — so the posture has to reach whatever turns up
-  // later, not only what was there on the first day. What was carried over and
-  // since changed by the operator is not touched again.
-  const names =
-    state === "pending"
-      ? knownTools()
-          .map((t) => t.name)
-          .filter((name) => browserTool(name, servers, browsers))
-      : fresh.filter((name) => browserTool(name, servers, browsers));
-  if (!names.length) return;
-
-  setToolDefaultsOff([...new Set([...toolDefaultsOff(), ...names])]);
-  const granted = d
-    .prepare("SELECT id FROM sessions WHERE browser = 1 AND kind != 'routine'")
-    .all() as { id: string }[];
-  for (const { id } of granted) {
-    const tools = sessionTools(id);
-    setSessionTools(id, { off: tools.off, on: [...new Set([...tools.on, ...names])] });
-  }
-  mark("carry");
-}
-
-/** Is there a grant still waiting for the browser's tools to be seen? */
-function browserAdoptionPending(): boolean {
-  return getSetting("browser_tools_adopted") === "pending";
 }
 
 /**
- * Does this session get the browser? Routines answer for their own runs.
- *
- * For an ordinary conversation this is not stored any more: the browser is an
- * MCP server like any other, so its tools are switched in the tools list, and
- * having the browser is having its tools. A second place recording the same
- * answer could only ever disagree with the first.
- *
- * The `sessions.browser` column is what that second place was. It is still
- * read, and not to be dropped: here while no browser tool has been seen (see
- * `browserColumnDecides`, which a container deployment always is), by
- * `adoptBrowserGrants` to carry the grants over, and by `browserExceptions`.
+ * Sets the rules a routine is exempt from, by name, and its one old switch with them: on (1) while it is exempt from
+ * none, so that what reads only that sees the routine as it is. Names that are no rule are dropped.
  */
-export function browserAllowed(session: SessionRow): boolean {
-  return browserAllowedWith(session, browserPolicy());
+export function setRoutineExemptions(routineId: string, names: readonly string[]): void {
+  const exempt = GUARD_RULE_NAMES.filter((name) => names.includes(name));
+  getDb().transaction(() => {
+    getDb().prepare("UPDATE routines SET guard = ? WHERE id = ?").run(exempt.length ? 0 : 1, routineId);
+    putSetting(exemptionsKey(routineId), JSON.stringify(exempt));
+  })();
+}
+
+/** Forgets a routine's exemptions, with the routine. */
+export function forgetRoutineExemptions(routineId: string): void {
+  putSetting(exemptionsKey(routineId), "");
 }
 
 /**
- * What the answer is worked out from apart from the conversation asked about:
- * the browser's tools as far as they have been seen, the defaults, and whether
- * the old column decides. A pass over many conversations asks for it once. Each
- * of them used to read the MCP file three times and the settings table twice.
+ * What the answer for some tools is worked out from apart from the conversation
+ * asked about: the tools, and the defaults. A pass over many conversations asks
+ * for it once.
  */
-export interface BrowserPolicy {
+export interface ToolsPolicy {
   names: string[];
-  /** With none of its tools seen: whether the old column is what answers. */
-  columnDecides: boolean;
   defaultsOff: string[];
   /** What a place starts with, by agent, project and routine, worked out the first time a conversation there is asked about. */
   projects: Map<string, string[]>;
@@ -1950,112 +2643,60 @@ export interface BrowserPolicy {
   homes?: AgentHome[];
 }
 
-export function browserPolicy(): BrowserPolicy {
-  const names = seenBrowserTools();
-  return { names, columnDecides: names.length ? false : browserColumnDecides(), defaultsOff: toolDefaultsOff(), projects: new Map() };
+/** The policy of some tools, by name, whether or not a session has registered them: a tool nobody switched off is on. */
+function toolPolicy(names: string[]): ToolsPolicy {
+  return { names: [...new Set(names)], defaultsOff: toolDefaultsOff(), projects: new Map() };
 }
 
-/** `browserAllowed`, against a policy asked for once; `exceptions` are the conversation's own, where the caller has them already. */
-export function browserAllowedWith(session: SessionRow, policy: BrowserPolicy, exceptions?: SessionTools): boolean {
+/** Whether any of the policy's tools is on for a session; `exceptions` are the conversation's own, where the caller has them already. */
+export function toolsOnWith(session: Pick<SessionRow, "id" | "kind" | "routine_slug" | "workspace" | "mode">, policy: ToolsPolicy, exceptions?: SessionTools): boolean {
   const routine = routineOf(session);
-  if (routine) {
-    const row = getDb().prepare("SELECT browser FROM routines WHERE slug = ?").get(routine) as { browser: number } | undefined;
-    // A routine that is gone gets nothing; with no browser tool seen, its old switch is all there is to go by.
-    if (!row) return false;
-    if (!policy.names.length) return row.browser === 1;
-  } else if (!policy.names.length) return session.browser === 1 || !policy.columnDecides;
-  // Every layer under the conversation's own: its agent, its project, its routine.
+  // Every layer under the conversation's own: its agent, its project, its routine (none where the routine is gone), its mode.
   // By what decides it, not by folder: the chats in one project's subfolders share it.
   const homes = (policy.homes ??= agentHomes());
-  const key = `${agentIdOf(session.workspace, homes) ?? ""}\u0000${projectOf(session.workspace) ?? ""}\u0000${routine ?? ""}`;
+  const key = `${agentIdOf(session.workspace, homes) ?? ""}\u0000${projectOf(session.workspace) ?? ""}\u0000${routine ?? ""}\u0000${session.mode ?? ""}`;
   let defaults = policy.projects.get(key);
-  if (!defaults) policy.projects.set(key, (defaults = toolDefaultsFor(session.workspace, routine, undefined, policy.defaultsOff, homes)));
+  if (!defaults) policy.projects.set(key, (defaults = withMode(toolDefaultsFor(session.workspace, routine, undefined, policy.defaultsOff, homes), session.mode)));
   const own = exceptions ?? sessionTools(session.id);
   return policy.names.some((name) => toolEnabled(name, defaults, own));
 }
 
-/** The browser's tools, as far as any session has registered them. */
-export function seenBrowserTools(): string[] {
-  // Asked for by every routine's tools, so kept until the MCP file or the settings (what was seen) are written.
-  const stamp = `${fileStamp(mcpConfigPath())}|${settingsWrites}`;
-  if (lastBrowserTools?.stamp === stamp) return lastBrowserTools.names;
-  const { servers, browsers } = serversAndBrowsers();
-  const names = knownTools()
-    .map((t) => t.name)
-    .filter((name) => browserTool(name, servers, browsers));
-  lastBrowserTools = { stamp, names };
-  return names;
+/**
+ * Where some tools are not what the default says: whether a conversation that has never said anything about them
+ * has any of them on, the chats that have them otherwise, and the routines whose own settings give their runs
+ * another answer than a routine that sets nothing would have, each with that answer. What `portal.tools.exceptions`
+ * answers.
+ */
+export interface ToolsDiffer {
+  byDefault: boolean;
+  /** Newest first. Each has the other answer to `byDefault`. */
+  chats: SessionRow[];
+  /** By name. */
+  routines: { slug: string; name: string; allowed: boolean }[];
 }
 
-let lastBrowserTools: { stamp: string; names: string[] } | undefined;
+/** Where these tools are not what the default says (see ToolsDiffer). None named: none is on anywhere. */
+export function toolExceptions(names: string[]): ToolsDiffer {
+  if (!names.length) return { byDefault: false, chats: [], routines: [] };
+  const policy = toolPolicy(names);
+  const off = new Set(policy.defaultsOff);
+  const byDefault = policy.names.some((name) => !off.has(name));
+  return { byDefault, chats: chatsDifferingWith(policy, byDefault), routines: routinesDifferingWith(policy) };
+}
 
 /**
- * With no browser tool seen there is no switch to read, and three situations
- * look the same from here:
+ * The conversations whose answer for the policy's tools is not `byDefault`.
  *
- * - A container deployment, where pi is reached over RPC and never reports its
- *   registry. The old per-session grant is still the only answer anyone has.
- * - An upgrade still waiting for the browser's tools to appear, so the grants
- *   can be carried over. The old column stands until they do.
- * - No server that is the browser at all: nothing here to switch, so the column.
- *
- * Anything else is a browser server configured and not yet registered by any
- * session — a fresh install whose first conversation is still starting, or a
- * lazy server whose tools pi has not cached yet. Nobody has said anything about
- * it, which is what a default is for, so it is on, as any other server is.
+ * Every one that says anything about tools is asked — not those whose switches
+ * happen to mention one of the names, which misses the ones that differ through
+ * their project or their agent. And every one in a mode, which can differ through
+ * its mode's layer without having said anything itself.
  */
-function browserColumnDecides(): boolean {
-  if (EXECUTOR_KIND === "container") return true;
-  if (browserAdoptionPending()) return true;
-  return !browserConfigured();
-}
-
-/**
- * Whether the portal's own browser tools are connected: "1" on, "0" switched
- * off, and unset where nobody has decided — an install from before them, which
- * adoptPortalBrowser moves over once.
- */
-export function portalBrowserState(): "on" | "off" | "unset" {
-  const value = getSetting("browser_tools");
-  return value === "1" ? "on" : value === "0" ? "off" : "unset";
-}
-
-export const portalBrowserOn = () => portalBrowserState() === "on";
-
-export function setPortalBrowser(on: boolean): void {
-  putSetting("browser_tools", on ? "1" : "0");
-}
-
-/**
- * Whether the browser tools show their cursor: on unless switched off on the
- * Browser page ("0"). Off, nothing moves and the actions do not wait for it.
- */
-export function browserCursorOn(): boolean {
-  return getSetting("browser_cursor") !== "0";
-}
-
-export function setBrowserCursor(on: boolean): void {
-  putSetting("browser_cursor", on ? "1" : "0");
-}
-
-/** Whether the agent has a browser at all: the portal's tools, or an MCP server pointed at it. */
-export function browserConfigured(): boolean {
-  return portalBrowserOn() || browserServers().length > 0;
-}
-
-/**
- * The conversations that disagree with the default about the browser.
- *
- * Every one that says anything about tools, and every one that holds the old
- * grant, is asked — not those whose switches happen to mention the word
- * `browser`, which is not what a server is called when it is called something
- * else, and misses the column where that is still the only record.
- */
-export function browserExceptions(): SessionRow[] {
+function chatsDifferingWith(policy: ToolsPolicy, byDefault: boolean): SessionRow[] {
   const rows = getDb()
     .prepare(
       `SELECT * FROM sessions
-       WHERE COALESCE(tools_off, '') != '' OR COALESCE(tools_on, '') != '' OR browser = 1
+       WHERE COALESCE(tools_off, '') != '' OR COALESCE(tools_on, '') != '' OR mode IS NOT NULL
        ORDER BY updated_at DESC`
     )
     .all() as SessionRow[];
@@ -2078,22 +2719,25 @@ export function browserExceptions(): SessionRow[] {
     rows.sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
   }
   // The policy once for all of them, and what each says about tools from the row that was read.
-  const policy = browserPolicy();
-  const byDefault = browserByDefaultWith(policy);
-  return rows.filter(
-    (row) => browserAllowedWith(row, policy, { off: parseToolsOff(row.tools_off), on: parseToolsOff(row.tools_on) }) !== byDefault
-  );
+  return rows.filter((row) => toolsOnWith(row, policy, ownTools(row)) !== byDefault);
 }
 
-/** Is the browser on for a conversation that has never said anything about it? */
-export function browserByDefault(): boolean {
-  return browserByDefaultWith(browserPolicy());
-}
-
-function browserByDefaultWith(policy: BrowserPolicy): boolean {
-  if (!policy.names.length) return !policy.columnDecides;
-  const off = new Set(policy.defaultsOff);
-  return policy.names.some((name) => !off.has(name));
+/**
+ * The routines whose own lists give their runs another answer for the policy's tools than a routine that says
+ * nothing would have in the same place: a run as it starts, with what its agent and its project say, and nothing of a
+ * chat's own. Each with its runs' answer.
+ */
+function routinesDifferingWith(policy: ToolsPolicy): { slug: string; name: string; allowed: boolean }[] {
+  const rows = getDb().prepare("SELECT slug, name, workspace FROM routines ORDER BY name COLLATE NOCASE").all() as { slug: string; name: string; workspace: string | null }[];
+  const homes = (policy.homes ??= agentHomes());
+  return rows.flatMap((row) => {
+    // Where its runs work: its project's folder, or Home.
+    const workspace = row.workspace ?? agentHomePath();
+    const allowed = toolsOnWith({ id: "", kind: "routine", routine_slug: row.slug, workspace, mode: null }, policy, { off: [], on: [] });
+    const unsaidOff = toolDefaultsFor(workspace, null, undefined, policy.defaultsOff, homes);
+    const otherwise = policy.names.some((name) => toolEnabled(name, unsaidOff, { off: [], on: [] }));
+    return allowed === otherwise ? [] : [{ slug: row.slug, name: row.name, allowed }];
+  });
 }
 
 /**
@@ -2111,10 +2755,19 @@ export interface SessionTools {
 }
 
 export function sessionTools(sessionId: string): SessionTools {
-  const row = getDb().prepare("SELECT tools_off, tools_on FROM sessions WHERE id = ?").get(
+  const row = getDb().prepare("SELECT tools_off, tools_on, mode FROM sessions WHERE id = ?").get(
     sessionId
-  ) as { tools_off: string | null; tools_on: string | null } | undefined;
-  return { off: parseToolsOff(row?.tools_off), on: parseToolsOff(row?.tools_on) };
+  ) as Pick<SessionRow, "tools_off" | "tools_on" | "mode"> | undefined;
+  return ownTools(row);
+}
+
+/**
+ * What a chat's own switches say, from its row. Where its mode holds the code tool on (modeHoldsCodemode), an off of
+ * the chat's own for it does not count: it stays stored, and counts again once the mode no longer holds it.
+ */
+function ownTools(row: Pick<SessionRow, "tools_off" | "tools_on" | "mode"> | undefined): SessionTools {
+  const off = parseToolsOff(row?.tools_off);
+  return { off: modeHoldsCodemode(row?.mode) ? off.filter((name) => name !== CODEMODE_TOOL) : off, on: parseToolsOff(row?.tools_on) };
 }
 
 export function parseToolsOff(raw: string | null | undefined): string[] {
@@ -2177,27 +2830,27 @@ export function projectsWithTools(): Set<string> {
 export interface ProjectAgent {
   /** The agent's id; "" for none. */
   agent: string;
-  /** Whether Understory is not this project's memory, though it is the portal's. */
-  understoryOff: boolean;
+  /** Whether this project does without the agent's memory, where an extension holds it (memory-holder.ts). */
+  memoryOff: boolean;
 }
 
 export function projectAgent(project: string): ProjectAgent {
-  const row = getDb().prepare("SELECT agent, understory_off FROM project_agent WHERE project = ?").get(project) as
-    | { agent: string; understory_off: number }
+  const row = getDb().prepare("SELECT agent, memory_off FROM project_agent WHERE project = ?").get(project) as
+    | { agent: string; memory_off: number }
     | undefined;
-  return { agent: row?.agent ?? "", understoryOff: !!row?.understory_off };
+  return { agent: row?.agent ?? "", memoryOff: !!row?.memory_off };
 }
 
 export function setProjectAgent(project: string, say: ProjectAgent): ProjectAgent {
-  if (!say.agent && !say.understoryOff) clearProjectAgent(project);
+  if (!say.agent && !say.memoryOff) clearProjectAgent(project);
   else
     getDb()
       .prepare(
-        `INSERT INTO project_agent (project, agent, understory_off) VALUES (?, ?, ?)
-         ON CONFLICT(project) DO UPDATE SET agent = excluded.agent, understory_off = excluded.understory_off`
+        `INSERT INTO project_agent (project, agent, memory_off) VALUES (?, ?, ?)
+         ON CONFLICT(project) DO UPDATE SET agent = excluded.agent, memory_off = excluded.memory_off`
       )
-      .run(project, say.agent, say.understoryOff ? 1 : 0);
-  return { agent: say.agent, understoryOff: say.understoryOff };
+      .run(project, say.agent, say.memoryOff ? 1 : 0);
+  return { agent: say.agent, memoryOff: say.memoryOff };
 }
 
 /** Forgets what a project said about its agent, as when it is deleted or made again. */
@@ -2207,23 +2860,23 @@ export function clearProjectAgent(project: string): void {
 
 /**
  * Lets go of an agent that is deleted: the projects that worked with it are
- * blank slates again, and keep what they said about Understory.
+ * blank slates again, and keep what they said about the agent's memory.
  */
 export function releaseProjectsOf(agent: string): void {
   getDb().transaction(() => {
     getDb().prepare("UPDATE project_agent SET agent = '' WHERE agent = ?").run(agent);
-    getDb().prepare("DELETE FROM project_agent WHERE agent = '' AND understory_off = 0").run();
+    getDb().prepare("DELETE FROM project_agent WHERE agent = '' AND memory_off = 0").run();
   })();
 }
 
 /** What every project that says something about its agent says, by name. */
 export function projectAgents(): Map<string, ProjectAgent> {
-  const rows = getDb().prepare("SELECT project, agent, understory_off FROM project_agent").all() as {
+  const rows = getDb().prepare("SELECT project, agent, memory_off FROM project_agent").all() as {
     project: string;
     agent: string;
-    understory_off: number;
+    memory_off: number;
   }[];
-  return new Map(rows.map((r) => [r.project, { agent: r.agent, understoryOff: !!r.understory_off }]));
+  return new Map(rows.map((r) => [r.project, { agent: r.agent, memoryOff: !!r.memory_off }]));
 }
 
 /**
@@ -2286,46 +2939,12 @@ export function agentHomes(): AgentHome[] {
 /**
  * What a routine says about tools, as exceptions to what its agent and project
  * leave: the same two lists a chat keeps.
- *
- * Its old **Browser** switch (the `browser` column) answers for every browser
- * tool its lists do not name: off unless it is on, as it always was for a
- * routine. It is read here, as the lists are, rather than written into them
- * ahead of time: a tool that comes to count as the browser's later — a server
- * pointed at the browser, a catalogue that could not be read for a while — is
- * then held to it as well, with nothing to copy and nothing to miss. The
- * routine's page writes down what it showed of each browser tool, so what was
- * switched there is the lists' to answer.
  */
-export function routineTools(slug: string, browser: string[] = seenBrowserTools()): SessionTools {
-  const row = getDb().prepare("SELECT tools_off, tools_on, browser FROM routines WHERE slug = ?").get(slug) as
-    | { tools_off: string; tools_on: string; browser: number }
-    | undefined;
-  if (!row) return { off: [], on: [] };
-  const own = { off: parseToolsOff(row.tools_off), on: parseToolsOff(row.tools_on) };
-  const unnamed = browser.filter((name) => !own.off.includes(name) && !own.on.includes(name));
-  return row.browser === 1 ? { off: own.off, on: [...own.on, ...unnamed] } : { off: [...own.off, ...unnamed], on: own.on };
-}
-
-/** Only the switch: what the browser tools a routine's lists do not name follow. */
-export function setRoutineBrowserSwitch(slug: string, on: boolean): void {
-  getDb().prepare("UPDATE routines SET browser = ? WHERE slug = ?").run(on ? 1 : 0, slug);
-}
-
-/**
- * The routine's Browser switch, as the API still takes it: every browser tool
- * taken out of its lists, so that all of them follow the switch.
- */
-export function setRoutineBrowser(slug: string, on: boolean): void {
-  const names = new Set(seenBrowserTools());
+export function routineTools(slug: string): SessionTools {
   const row = getDb().prepare("SELECT tools_off, tools_on FROM routines WHERE slug = ?").get(slug) as
     | { tools_off: string; tools_on: string }
     | undefined;
-  if (!row) return;
-  setRoutineBrowserSwitch(slug, on);
-  setRoutineTools(slug, {
-    off: parseToolsOff(row.tools_off).filter((name) => !names.has(name)),
-    on: parseToolsOff(row.tools_on).filter((name) => !names.has(name)),
-  });
+  return { off: parseToolsOff(row?.tools_off), on: parseToolsOff(row?.tools_on) };
 }
 
 export function setRoutineTools(slug: string, tools: SessionTools): SessionTools {
@@ -2344,7 +2963,8 @@ export function setRoutineTools(slug: string, tools: SessionTools): SessionTools
  * 1. the portal-wide default (Settings → Tools);
  * 2. the agent whose home it is in, for its chats and its own runs;
  * 3. the project it is in;
- * 4. the routine, for its runs.
+ * 4. the routine, for its runs;
+ * 5. the chat's mode, for a chat (toolDefaultsForSession): a run has none.
  *
  * A chat's own switches are held against this, and stay the last word. An agent
  * and a project do not meet in practice — a project is under the workspace root,
@@ -2378,8 +2998,8 @@ export const routineOf = (session: Pick<SessionRow, "kind" | "routine_slug"> | u
   session?.kind === "routine" ? (session.routine_slug ?? null) : null;
 
 /** What a session starts with off, every layer under its own switches. */
-export function toolDefaultsForSession(session: Pick<SessionRow, "kind" | "routine_slug" | "workspace"> | undefined, homes?: AgentHome[]): string[] {
-  return toolDefaultsFor(session?.workspace, routineOf(session), undefined, undefined, homes);
+export function toolDefaultsForSession(session: Pick<SessionRow, "kind" | "routine_slug" | "workspace" | "mode"> | undefined, homes?: AgentHome[]): string[] {
+  return withMode(toolDefaultsFor(session?.workspace, routineOf(session), undefined, undefined, homes), session?.mode);
 }
 
 /**
@@ -2432,6 +3052,26 @@ export function extensionStash(): Record<string, unknown> {
 
 export function setExtensionStash(stash: Record<string, unknown>): void {
   putSetting("extension_stash", Object.keys(stash).length ? JSON.stringify(stash) : "");
+}
+
+/** What an extension said of a package it installed from its data folder (`extensions.install`), and when: by the package's spec. */
+export type InstallNote = { note?: string; at: string };
+
+export function installNotes(): Record<string, InstallNote> {
+  try {
+    const raw = JSON.parse(getSetting("extension_install_notes") || "{}");
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Keeps what was said of the package `spec`, or with nothing, forgets it. */
+export function setInstallNote(spec: string, record: InstallNote | undefined): void {
+  const notes = installNotes();
+  if (record) notes[spec] = record;
+  else delete notes[spec];
+  putSetting("extension_install_notes", Object.keys(notes).length ? JSON.stringify(notes) : "");
 }
 
 /** The minutes ask_question waits for an answer; 0, the default, is until it is answered. */
@@ -2497,7 +3137,7 @@ export function lazyAllowed(
   // Never in what the model is offered, so a mark would keep nothing out of the prompt: it is code mode's description that carries it.
   if (tool.scriptsOnly) return false;
   if (tool.cached || adapterTool({ source: tool.source, package: tool.package })) return false;
-  if (!noServerOf(tool.name) && mcpServerOf(tool.name, servers) !== undefined) return false;
+  if (!noServerOf(tool) && mcpServerOf(tool.name, servers) !== undefined) return false;
   if (PI_BUILT_IN_TOOLS.includes(tool.name)) return false;
   // Code mode is the way to make many calls in one: reached through another tool it would be one more step to it, and the
   // box the lists show it in has no set of its own on the server to mark.
@@ -2565,7 +3205,7 @@ export function lazySetLabels(names: Iterable<string>): string[] {
   for (const tool of knownTools()) {
     if (!wanted.has(tool.name)) continue;
     const set = toolSetOf(tool, servers);
-    labels.add(given[set] ?? (set === MEDIA_SET ? "media" : set));
+    labels.add(given[set] ?? set);
   }
   return [...labels].sort();
 }
@@ -2608,10 +3248,17 @@ export interface KnownTool {
   scriptsOnly?: true;
   /** Said by the tool: off until somebody switches it on. Read the first time the tool is seen, and not kept. */
   offByDefault?: true;
+  /** The parameters that hold the files it is approved for, as its definition declares them: what an approval of it is written as, answered when no chat of it is running. */
+  approvalFiles?: string[];
+}
+
+/** The parameters that hold the files a tool is approved for, as it last declared them: see declaredFiles in guard.ts. */
+export function approvalFilesOf(toolName: string): string[] | undefined {
+  return knownTools().find((t) => t.name === toolName)?.approvalFiles;
 }
 
 /** A tool a session reported, as it is remembered. */
-export const remembered = (t: { name: string; source: string; description?: string; package?: string; inline?: true; scriptsOnly?: true; offByDefault?: true }): KnownTool => ({
+export const remembered = (t: { name: string; source: string; description?: string; package?: string; inline?: true; scriptsOnly?: true; offByDefault?: true; approvalFiles?: string[] }): KnownTool => ({
   name: t.name,
   source: t.source,
   description: t.description,
@@ -2619,6 +3266,7 @@ export const remembered = (t: { name: string; source: string; description?: stri
   inline: t.inline === true,
   ...(t.scriptsOnly ? { scriptsOnly: true } : {}),
   ...(t.offByDefault ? { offByDefault: true } : {}),
+  ...(t.approvalFiles?.length ? { approvalFiles: t.approvalFiles } : {}),
 });
 
 /**
@@ -2675,6 +3323,7 @@ export function knownTools(): KnownTool[] {
         ...(typeof t.package === "string" && t.package ? { package: t.package } : t.package === null ? { package: null } : {}),
         ...(typeof t.inline === "boolean" ? { inline: t.inline } : {}),
         ...(t.scriptsOnly === true ? { scriptsOnly: true } : {}),
+        ...(Array.isArray(t.approvalFiles) && t.approvalFiles.length && t.approvalFiles.every((n: unknown) => typeof n === "string") ? { approvalFiles: t.approvalFiles as string[] } : {}),
       }));
   } catch {
     return [];
@@ -2689,6 +3338,25 @@ export function knownTools(): KnownTool[] {
  * For a chat, `folder` is where it runs, whose project may bring packages of
  * its own.
  */
+/**
+ * What each running server half that follows its settings offers now, by its name (`portal.tools.offer`): set by the
+ * extension host, which this module cannot import.
+ */
+let serverHalfOffers: () => Map<string, { name: string; description?: string }[]> = () => new Map();
+export function setServerHalfOffers(read: typeof serverHalfOffers): void {
+  serverHalfOffers = read;
+}
+
+/**
+ * The names of the server halves the extension host was last asked to run (askedHalves): of the installed packages,
+ * those switched on that have one, running or not. Undefined until it has been asked once. Set by the extension host,
+ * which this module cannot import.
+ */
+let serverHalvesAsked: () => ReadonlySet<string> | undefined = () => undefined;
+export function setServerHalvesAsked(read: typeof serverHalvesAsked): void {
+  serverHalvesAsked = read;
+}
+
 export function shownTools(folder?: string, view: McpView = mcpView()): (Omit<KnownTool, "package" | "inline"> & { inline?: true; cached?: true })[] {
   const user = readPiSettings().packages;
   const project = folder ? readProjectPiSettings(folder).packages : undefined;
@@ -2696,75 +3364,37 @@ export function shownTools(folder?: string, view: McpView = mcpView()): (Omit<Kn
   // is not there to be switched: listing it was the list saying otherwise.
   const { offers } = view;
   const catalogue = mcpCatalogueIn(view, user, project);
-  // The portal's own tools belong to no package, so the packages cannot say
-  // that one is not offered: image generation and image editing say so
-  // themselves, while they are off.
-  // Only their own tools, which are known by being inline, as no label can say: an
-  // extension of the same name is loaded whatever the add-on says, and a file
-  // called image-generation.ts has the label the portal's factory has.
-  const images = imageGenerationReady();
-  const editing = imageEditingReady();
-  // The video tools, which exist while video generation is on: the same, for the same reasons.
-  const videos = videoGenerationReady();
   const known = [...view.known().values()];
   // Every MCP server's tools, from the adapter's cache, whether a chat has had them one by one or not: a server is a
   // group like any other, whole or tool by tool. A tool a chat reported is listed as it reported it.
   const seen = new Set(known.map((t) => t.name));
-  const available = [...known, ...catalogue.filter((t) => !seen.has(t.name))].filter(toolAvailability(user, project));
-  return [...available, ...notYetSeen(available, images, editing, videos)]
-    .filter((tool) => images || !(tool.name === GENERATE_IMAGE_TOOL && tool.inline))
-    .filter((tool) => editing || !(tool.name === EDIT_IMAGE_TOOL && tool.inline))
-    .filter((tool) => videos || !((tool.name === GENERATE_VIDEO_TOOL || tool.name === SHOW_VIDEO_TOOL) && tool.inline))
-    .flatMap((known) => {
-      const offer = offers(known);
-      if (unlisted(offer)) return [];
-      const { package: _package, inline: _inline, ...tool } = known;
-      return [{
-        ...tool,
-        ...(portalOwned(known) ? { inline: true as const } : {}),
-        ...(offer === "cached" ? { cached: true as const } : {}),
-      }];
-    });
-}
-
-/**
- * The portal's own tools that a setting just made, for the lists to show before any chat has reported them.
- *
- * What the lists show is what a chat once registered, and one that is open while the add-on is switched on
- * registers the tool after a reload without telling anyone. The tool is the portal's, so the lists know it
- * without waiting; a tool of the same name that a chat has reported, an extension's included while its package is on, is kept as it is.
- */
-function notYetSeen(available: KnownTool[], images: boolean, editing: boolean, videos: boolean): KnownTool[] {
-  // Of the tools that can be loaded: an extension's of the same name in a package that is switched off is not, and the portal's is then the one chats have.
-  const seen = new Set(available.map((tool) => tool.name));
-  const wanted: [string, string, boolean][] = [
-    [GENERATE_IMAGE_TOOL, GENERATE_IMAGE_SOURCE, images],
-    [EDIT_IMAGE_TOOL, EDIT_IMAGE_SOURCE, editing],
-    [GENERATE_VIDEO_TOOL, GENERATE_VIDEO_SOURCE, videos],
-    [SHOW_VIDEO_TOOL, SHOW_VIDEO_SOURCE, videos],
-  ];
-  return wanted.filter(([name, , ready]) => ready && !seen.has(name)).map(([name, source]) => ({ name, source, package: null, inline: true }));
-}
-
-/** What the portal files its own picture and video tools under, by name. Read when asked: image-generation.ts and video-generation.ts import this module. */
-const pictureSource = (name: string): string | undefined =>
-  ({
-    show_image: SHOW_IMAGE_SOURCE,
-    [GENERATE_IMAGE_TOOL]: GENERATE_IMAGE_SOURCE,
-    [EDIT_IMAGE_TOOL]: EDIT_IMAGE_SOURCE,
-    [GENERATE_VIDEO_TOOL]: GENERATE_VIDEO_SOURCE,
-    [SHOW_VIDEO_TOOL]: SHOW_VIDEO_SOURCE,
-  } as Record<string, string>)[name];
-
-/**
- * Whether the portal registered this tool itself, for the pages to group its picture tools apart from an extension's of the same name.
- *
- * An entry remembered before `inline` was recorded has no mark at all, so a picture tool of no package,
- * filed under the label the portal files it under, counts too. A report always carries the mark, `false`
- * for an extension's tool, so a loose file called image-generation.ts is never taken for the portal's.
- */
-export function portalOwned(tool: KnownTool): boolean {
-  return tool.inline === true || (tool.inline === undefined && typeof tool.package !== "string" && pictureSource(tool.name) === tool.source);
+  // A server half that says what its pi extension registers now (portal.tools.offer): of its tools that are remembered,
+  // only those are listed, and those are listed before a chat has reported them. Its tools are known by its name, which
+  // the portal files them under as an inline extension's.
+  const halves = serverHalfOffers();
+  const offered = (tool: KnownTool) => !(tool.inline === true && halves.has(tool.source)) || halves.get(tool.source)!.some((t) => t.name === tool.name);
+  // A server half's tool, which is an inline extension's that is not the portal's own, is listed while its package is
+  // installed and switched on, whether the half runs, crashed or failed to start: one switched off or uninstalled
+  // registers none, as a package's own tools are not listed then (toolAvailability). What was switched for it is kept,
+  // for when it is switched on again. Before the halves have been asked for once, as the portal starts, nothing is
+  // judged: hiding a tool on a guess is worse than showing a dead one.
+  const asked = serverHalvesAsked();
+  const halfOn = (tool: KnownTool) => !asked || tool.inline !== true || INLINE_EXTENSIONS.includes(tool.source) || asked.has(tool.source);
+  const remembered = [...known, ...catalogue.filter((t) => !seen.has(t.name))].filter(toolAvailability(user, project)).filter(halfOn).filter(offered);
+  const listed = new Set(remembered.map((t) => t.name));
+  const fromHalves: KnownTool[] = [...halves].flatMap(([source, tools]) =>
+    tools.filter((t) => !listed.has(t.name)).map((t) => ({ name: t.name, source, package: null, inline: true, ...(t.description ? { description: t.description } : {}) })),
+  );
+  return [...remembered, ...fromHalves].flatMap((known) => {
+    const offer = offers(known);
+    if (unlisted(offer)) return [];
+    const { package: _package, inline, ...tool } = known;
+    return [{
+      ...tool,
+      ...(inline ? { inline: true as const } : {}),
+      ...(offer === "cached" ? { cached: true as const } : {}),
+    }];
+  });
 }
 
 /** The keys of the packages pi's settings list, or undefined when they cannot be read. */
@@ -2783,8 +3413,7 @@ function listedPackages(): Set<string> | undefined {
  * loaded.
  *
  * An MCP server's tools are kept although the adapter registers them: the
- * server is configured apart from the package and comes back with it, and a
- * browser tool seen as new again would be given the browser's old default.
+ * server is configured apart from the package and comes back with it.
  */
 export function forgetPackageTools(spec: string): void {
   const listed = listedPackages();
@@ -2811,10 +3440,10 @@ export function forgetPackageTools(spec: string): void {
  * `before` is the servers as they were, because a tool is told to a server by
  * its name (`browser_staging_click` is not the tool of `browser`) and that
  * needs the longer name to still be there; `after` is what is left. The
- * portal's own browser tools and the adapter's own are the ones a server's
- * name can claim without being its, and they stay. The defaults and exceptions
- * somebody set for the tools are kept, as for any tool that is not loaded: a
- * server that comes back gets them back.
+ * adapter's own tools and those of the portal's inline extensions are the ones
+ * a server's name can claim without being its, and they stay. The defaults and
+ * exceptions somebody set for the tools are kept, as for any tool that is not
+ * loaded: a server that comes back gets them back.
  */
 export function mcpServersRemoved(before: string[], after: string[]): void {
   const removed = before.filter((name) => !after.includes(name));
@@ -2825,7 +3454,7 @@ export function mcpServersRemoved(before: string[], after: string[]): void {
   const all = knownTools();
   const kept = all.filter((t) => {
     // A server's name is also the start of other tools' names: `web` and pi-web-access's `web_search`.
-    if (!adapterTool(t) || noServerOf(t.name)) return true;
+    if (!adapterTool(t) || noServerOf(t)) return true;
     const server = mcpServerOf(t.name, before);
     return server === undefined || !removed.includes(server);
   });
@@ -2848,13 +3477,43 @@ function setRemovedMcpServers(names: string[]): void {
   if (JSON.stringify(unique) !== JSON.stringify(removedMcpServers())) putSetting("mcp_removed", JSON.stringify(unique));
 }
 
+/**
+ * The servers of the portal's mcp.json as the portal last saw them, by name:
+ * what an edit made outside the portal is judged against (noticeMcpEdits).
+ * Kept in the settings, so one made while the portal was not running is
+ * noticed when it starts again. Undefined until the portal first looks at the
+ * file, which on an install from before this was kept is after whatever was
+ * taken out of it by hand until then.
+ */
+function configuredMcpServers(): string[] | undefined {
+  const value = getSetting("mcp_configured");
+  if (value === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((n): n is string => typeof n === "string") : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function setConfiguredMcpServers(names: string[]): void {
+  const unique = [...new Set(names)].sort();
+  if (JSON.stringify(unique) !== JSON.stringify(configuredMcpServers())) putSetting("mcp_configured", JSON.stringify(unique));
+}
+
 const ADAPTER_LABEL = "pi-mcp-adapter";
 
-/** The tools that carry no server's name: the adapter's own and the portal's browser tools, which a server's name can start without them being its. */
-const noServerOf = (name: string): boolean => (PORTAL_BROWSER_TOOLS as readonly string[]).includes(name) || name === "mcp" || name === "mcp_script" || name === "mcpScript";
+/**
+ * The tools that are no server's, though a server's name can start theirs: the adapter's own, by their names, and
+ * every tool the portal's inline extensions register (its own, and each server half's under its package's name),
+ * which no MCP server brings. Told by what is known of the tool, not by a list of names: a package's `browser_open`
+ * is not the tool of a server called `browser`.
+ */
+const noServerOf = (tool: { name: string; inline?: boolean }): boolean =>
+  tool.inline === true || tool.name === "mcp" || tool.name === "mcp_script" || tool.name === "mcpScript";
 
 /** Does the MCP adapter register this tool? By its package where it is recorded, by the label it is filed under where it is not. */
-function adapterTool(t: Pick<KnownTool, "source" | "package">): boolean {
+export function adapterTool(t: Pick<KnownTool, "source" | "package">): boolean {
   return typeof t.package === "string" ? packageLabel(t.package) === ADAPTER_LABEL : t.source === ADAPTER_LABEL;
 }
 
@@ -2884,6 +3543,8 @@ export interface McpView {
   catalogue: KnownTool[];
   serverTool: (name: string) => boolean;
   servers: string[];
+  /** The naming the adapter gives each configured server's tools (`toolPrefix`, see mcpPrefixAs). */
+  naming: (server: string) => string;
   gone: string[];
   /** What the portal remembers of every tool, read when first asked for. */
   known: () => Map<string, KnownTool>;
@@ -2899,6 +3560,56 @@ function fileStamp(file: string): string {
   }
 }
 
+/** The mcp.json that was last compared with the servers the portal last saw in it, by fileStamp. */
+let noticedMcpFile: string | undefined;
+
+/**
+ * An edit made to the portal's mcp.json outside the portal — by hand, by a
+ * script — taken in as a write of its own: the listeners are told
+ * (onMcpWritten), with the servers the portal last saw in the file as the ones
+ * it had before. A server the edit took out is removed as one taken out
+ * through the panel is (its tools forgotten, its cache entry dropped, and it
+ * recorded: see mcpServersRemoved), and a chat still running with it has its
+ * tools off.
+ * Asked for before the tools are listed or a chat's are worked out (mcpView),
+ * and as the portal starts, so an edit made while it was not running is
+ * noticed then. The file is read again only when it changed, and the
+ * listeners are told only when its servers did.
+ *
+ * Only the servers of this file are judged: the adapter also loads some from a
+ * project's own files, from `~/.config/mcp/mcp.json` and from what a file
+ * imports, which are in no file the portal writes. Their tools are left as
+ * they are, except where one of them has the name of a server taken out of
+ * this file, or a name that starts with it and an underscore: its tools are
+ * then taken for that server's, as for a removal through the panel. The first
+ * time there is nothing to compare with, the servers there are now are
+ * remembered and nothing is judged: a tool that a server taken out before then
+ * left behind cannot be told from one of a project's own servers.
+ * A file that cannot be read takes nothing out, as a typo in it withdraws
+ * nothing (readableMcpConfig): it is compared again once it can be read. Nor
+ * does one that is not there, as for a moment while an editor or a script puts
+ * a new one in its place (`mv mcp.json mcp.json.bak` and then a new one
+ * written): the file that is there next is compared with the servers last
+ * seen, and a write of the portal's is judged against them too (onMcpWritten).
+ */
+export function noticeMcpEdits(): void {
+  const stamp = fileStamp(mcpConfigPath());
+  if (stamp === noticedMcpFile) return;
+  // Before the listeners are told: what they do lists the tools again (mcpView), which must not compare the file again.
+  noticedMcpFile = stamp;
+  // Not there: fileStamp has "-" for a file it cannot look at.
+  if (stamp === "-") return;
+  const { config, error } = readMcpFile();
+  if (error) return;
+  const now = Object.keys(config.mcpServers);
+  const seen = configuredMcpServers();
+  if (seen === undefined) {
+    setConfiguredMcpServers(now);
+    return;
+  }
+  if (seen.length !== now.length || seen.some((name) => !now.includes(name))) mcpWritten(seen);
+}
+
 let lastView: { stamp: string; view: McpView } | undefined;
 
 /**
@@ -2906,6 +3617,8 @@ let lastView: { stamp: string; view: McpView } | undefined;
  * so kept until one of the files it reads, or the settings, are written.
  */
 export function mcpView(): McpView {
+  // An edit made outside the portal first: taking it in forgets tools and writes the cache, and the view is of what is left.
+  noticeMcpEdits();
   const stamp = `${fileStamp(mcpConfigPath())}|${fileStamp(mcpCachePath())}|${settingsWrites}`;
   if (lastView?.stamp === stamp) return lastView.view;
   const view = readMcpView();
@@ -2918,7 +3631,7 @@ function readMcpView(): McpView {
   let known: Map<string, KnownTool> | undefined;
   const knownNow = () => (known ??= new Map(knownTools().map((t) => [t.name, t])));
   if (!config) {
-    return { offers: () => undefined, direct: () => undefined, catalogue: [], serverTool: () => false, servers: [], gone: [], known: knownNow };
+    return { offers: () => undefined, direct: () => undefined, catalogue: [], serverTool: () => false, servers: [], naming: () => "server", gone: [], known: knownNow };
   }
   const cache = readMcpCache();
   const offer = mcpOffer(config, cache);
@@ -2928,10 +3641,10 @@ function readMcpView(): McpView {
     ...(t.description ? { description: t.description } : {}),
   }));
   const offers = (tool: Pick<KnownTool, "name" | "source" | "package">) =>
-    adapterTool(tool) && !noServerOf(tool.name) ? offer(tool.name) : undefined;
+    adapterTool(tool) && !noServerOf(tool) ? offer(tool.name) : undefined;
   const directly = mcpDirect(config, cache);
   const direct = (tool: Pick<KnownTool, "name" | "source" | "package">) =>
-    adapterTool(tool) && !noServerOf(tool.name) ? directly(tool.name) : undefined;
+    adapterTool(tool) && !noServerOf(tool) ? directly(tool.name) : undefined;
   let reachable: Set<string> | undefined;
   const serverTool = (name: string) => {
     if (!reachable) {
@@ -2945,7 +3658,7 @@ function readMcpView(): McpView {
   };
   const servers = Object.keys(config.mcpServers ?? {});
   const gone = removedMcpServers().filter((name) => !servers.includes(name));
-  return { offers, direct, catalogue, serverTool, servers, gone, known: knownNow };
+  return { offers, direct, catalogue, serverTool, servers, naming: (server: string) => namingOf(config, server), gone, known: knownNow };
 }
 
 /**
@@ -2962,31 +3675,39 @@ function mcpCatalogueIn(view: McpView, packages: unknown, projectPackages: unkno
   return view.catalogue.map((t) => ({ ...t, package: adapter.source }));
 }
 
-// A server taken out of the file, whoever wrote it, takes its tools with it.
+// A server taken out of the file, whoever wrote it, takes its tools with it. Judged against the servers the file had
+// and those the portal last saw in it: an edit made outside the portal that has not been noticed yet (noticeMcpEdits)
+// may have taken one out, and a write of the portal's right after it must not make that one forgotten unjudged.
 onMcpWritten((before) => {
   const after = Object.keys(readableMcpConfig()?.mcpServers ?? {});
-  if (before.some((name) => !after.includes(name)) || after.some((name) => !before.includes(name))) mcpServersRemoved(before, after);
+  const was = [...new Set([...(configuredMcpServers() ?? []), ...before])];
+  setConfiguredMcpServers(after);
+  if (was.some((name) => !after.includes(name)) || after.some((name) => !was.includes(name))) mcpServersRemoved(was, after);
 });
 
 /**
- * The tools of these that the MCP adapter no longer registers, by name: what a
- * chat's pi is told to have off on top of its switches, so that one still
- * holding such a tool from before the configuration changed cannot use it.
- * Told by what the portal remembers of each, which is what says it is the
- * adapter's; a name it has never seen is not judged — unless a server the
- * portal removed claims it: removing a server forgets its tools, and a chat
- * still running with it would otherwise go on using the tools of a server that
- * is gone, where one merely switched off would have them off.
+ * The tools of these, as a chat reported them, and of those the portal
+ * remembers, that the MCP adapter no longer registers, by name: what a chat's
+ * pi is told to have off on top of its switches, so that one still holding
+ * such a tool from before the configuration changed cannot use it. Told by
+ * what the portal remembers of each, which is what says it is the adapter's;
+ * a name it has never seen is not judged — unless a server the portal removed
+ * claims it and the chat's report does not make it one of no server's
+ * (noServerOf): removing a server forgets its tools, and a chat still running
+ * with it would otherwise go on using the tools of a server that is gone,
+ * where one merely switched off would have them off.
  */
-export function withdrawnMcpTools(names: Iterable<string> = [], view: McpView = mcpView()): string[] {
+export function withdrawnMcpTools(reported: Iterable<{ name: string; inline?: boolean }> = [], view: McpView = mcpView()): string[] {
   const known = view.known();
   const { servers, gone } = view;
+  const asReported = new Map<string, { name: string; inline?: boolean }>();
+  for (const tool of reported) if (!asReported.has(tool.name)) asReported.set(tool.name, tool);
   const withdrawn = new Set<string>();
-  for (const name of new Set([...names, ...known.keys()])) {
+  for (const name of new Set([...asReported.keys(), ...known.keys()])) {
     const tool = known.get(name);
     if (tool) {
       if (view.offers(tool) === "withdrawn") withdrawn.add(name);
-    } else if (gone.length && !noServerOf(name) && gone.includes(mcpServerOf(name, [...servers, ...gone]) ?? "")) {
+    } else if (gone.length && !noServerOf(asReported.get(name) ?? { name }) && gone.includes(mcpServerOf(name, [...servers, ...gone]) ?? "")) {
       withdrawn.add(name);
     }
   }
@@ -3009,9 +3730,10 @@ export function mcpCatalogueFor(folder: string | undefined, view: McpView): (Omi
 }
 
 /**
- * What a package that has been uninstalled leaves behind: its tools, and what
- * was kept aside for switching it back on, which has nothing left to go to —
- * dropped in turn with the switches, which read and write it too.
+ * What a package that has been uninstalled leaves behind: its tools, what was
+ * kept aside for switching it back on, which has nothing left to go to, and what
+ * an extension that installed it said of it — dropped in turn with the switches,
+ * which read and write the first too.
  */
 export async function packageRemoved(source: string): Promise<void> {
   forgetPackageTools(source);
@@ -3023,6 +3745,7 @@ export async function packageRemoved(source: string): Promise<void> {
       delete stash[source];
       setExtensionStash(stash);
     }
+    if (source in installNotes()) setInstallNote(source, undefined);
   });
 }
 
@@ -3046,15 +3769,15 @@ export function rememberTools(reported: KnownTool[]): string[] {
   // since removed: its tools are the adapter's, and would be written straight back.
   // Only the servers the portal removed count: the adapter also loads some from
   // a project's own files, which are not in the portal's mcp.json and are no
-  // removed server's. The adapter's own tools and the portal's browser tools
-  // are no server's.
+  // removed server's. The adapter's own tools and those of the portal's inline
+  // extensions are no server's.
   const configured = readMcpFile();
   const gone = removedMcpServers().filter((name) => !Object.hasOwn(configured.config.mcpServers, name));
   const noServer = (t: KnownTool) =>
     gone.length > 0 &&
     !configured.error &&
     adapterTool(t) &&
-    !noServerOf(t.name) &&
+    !noServerOf(t) &&
     // Told apart from the configured servers too: `notes` removed leaves `notes_staging_read` to the server that is still there.
     gone.includes(mcpServerOf(t.name, [...Object.keys(configured.config.mcpServers), ...gone]) ?? "");
   const tools = reported.filter(
@@ -3083,23 +3806,22 @@ export function rememberTools(reported: KnownTool[]): string[] {
       ...(pkg !== undefined ? { package: pkg } : {}),
       ...(tool.inline !== undefined ? { inline: tool.inline } : {}),
       ...(tool.scriptsOnly ? { scriptsOnly: true } : {}),
+      // As its latest report says: a tool that stopped declaring its files is approved whole again.
+      ...(tool.approvalFiles?.length ? { approvalFiles: tool.approvalFiles } : {}),
     });
   }
   const sorted = [...merged.values()].sort((a, b) => a.name.localeCompare(b.name));
   putSetting("tools_seen", JSON.stringify(sorted));
   const off = tools.filter((t) => t.offByDefault && fresh.includes(t.name)).map((t) => t.name);
   if (off.length) setToolDefaultsOff([...new Set([...toolDefaultsOff(), ...off])]);
-  // The first moment the browser's tools can be told apart from the rest, and
-  // every moment a new one turns up.
-  adoptBrowserGrants(getDb(), fresh);
   const lazy = lazyToolNames();
   return fresh.filter((name) => lazy.has(name) || off.includes(name));
 }
 
 /**
- * Domains the browser may be pointed at, as globs. Empty means no restriction —
- * the on/off switch is the gate, and a list nobody filled in should not quietly
- * block everything.
+ * The sites the agent's tools may reach, as globs (Settings → Guard). Empty
+ * means no restriction — the tools' switches are the gate, and a list nobody
+ * filled in should not quietly block everything.
  */
 export function browserAllowlist(): string[] {
   const raw = getSetting("browser_allowlist") ?? "";
@@ -3114,15 +3836,30 @@ export function setBrowserAllowlist(domains: string): void {
 }
 
 /**
- * The model a chat's subagents run on, where the chat says one: "provider/model",
- * or "auto" for the one the chat is on. Null follows the portal's default.
+ * The MCP servers whose tools' output the person counts as their own and not outside content, by the names they are
+ * configured under: the guard neither wraps nor scans it (see untrustedResult in pi/guard.ts). Every other server's is
+ * somebody else's words, and so is the browser's, trusted or not. Read at each result, so a change holds at once.
  */
-export function sessionSubagentModel(sessionId: string): string | null {
-  return getSetting(`subagent_model:${sessionId}`) ?? null;
+export function trustedMcpServers(): Set<string> {
+  // Until the person, or an extension on their word (`portal.mcp.set` with `trusted`), says one is, none.
+  const set = getSetting("guard_trusted_mcp_servers");
+  if (set === undefined) return new Set();
+  try {
+    const names = JSON.parse(set);
+    return new Set(Array.isArray(names) ? names.filter((name): name is string => typeof name === "string") : []);
+  } catch {
+    return new Set();
+  }
 }
 
-export function setSessionSubagentModel(sessionId: string, model: string | null): void {
-  putSetting(`subagent_model:${sessionId}`, model ?? "");
+export function setTrustedMcpServers(names: readonly string[]): void {
+  putSetting("guard_trusted_mcp_servers", JSON.stringify([...new Set(names.map((name) => name.trim()).filter(Boolean))]));
+}
+
+/** One server no longer counted as the person's own. */
+export function untrustMcpServer(name: string): void {
+  const trusted = trustedMcpServers();
+  if (trusted.delete(name)) setTrustedMcpServers([...trusted]);
 }
 
 /** A background subagent's start or end, as written: kept in open_subagents while it runs. */

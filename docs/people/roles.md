@@ -85,10 +85,11 @@ so give a rule the folder it is for. The heartbeat keeps the rules written for *
 roles*, as it reads what its `WATCH.md` names wherever that is.
 
 Four tools are not opened by a rule at all, nor by an approval: `subagent`,
-`routine_create`, `routine_update` and `routine_run`. A subagent is a pi of its own
-and has no guard, and a routine runs as you, with your private notes and your
-rights; what a colleague or a guest wrote into either would be done as you, and
-what it read would be handed back to them. The agent is told so and does not ask
+`routine_create`, `routine_update` and `routine_run`. A subagent works in a chat of
+its own, which an approval given here does not reach, and a routine runs as you,
+with your private notes and your rights; what a colleague or a guest wrote into
+either would be done beyond what was approved, or as you, and what it read would
+be handed back to them. The agent is told so and does not ask
 you for them, a rule for one cannot be saved, and the conversations that are your
 own have them as before.
 
@@ -116,7 +117,11 @@ When an agent [looks around on its own](/guide/agents#its-heartbeat) nobody is
 speaking, and it runs as a role that is not for people: `heartbeat`. It
 may read files and leave notes, and nothing else: no commands, no edits, no
 messages. What you [allow anyway](/people/rules) for it is a rule for the role,
-listed in People as for every agent's heartbeat.
+listed in People as for every agent's heartbeat. It reads what its `WATCH.md`
+names wherever that is, and your notes, but a rule for it reaches no more than
+one for a colleague does: no place secrets are kept (nor a search through the
+portal's home or pi's folder, which holds its keys), nothing loaded as the
+agent's own, by a tool or by a command, and no subagent or routine.
 
 ## What each can see
 

@@ -6,9 +6,11 @@ import { sourceOf } from "../extension-switch.js";
 import { piPackageArg } from "../features.js";
 import { packageRemoved } from "../db.js";
 import express, { type Router } from "express";
+import semver from "semver";
 import { searchCatalog } from "../catalog.js";
 import { oneAtATime } from "../one-at-a-time.js";
 import { followPackages } from "./extensions.js";
+import { sessions } from "../session-manager.js";
 
 const run = promisify(execFile);
 
@@ -38,6 +40,12 @@ async function runPi(args: string[]): Promise<{ stdout: string; stderr: string }
 // string), but keep it to shapes pi documents so typos fail fast and nothing
 // odd reaches execFile.
 const SPEC_RE = /^(npm:|git:|https:\/\/|\.{0,2}\/)[\w@./:+-]+$/;
+/** An npm package within a range of versions, as an extension that requires it says it: `npm:<name>@^1.0.0` (see install-plan.ts). */
+const inRange = (spec: string) => {
+  const match = /^npm:((?:@[\w.~-]+\/)?[\w.~-]+)@(.+)$/.exec(spec);
+  return !!match && semver.validRange(match[2]) !== null;
+};
+const isSpec = (spec: unknown): spec is string => typeof spec === "string" && (SPEC_RE.test(spec) || inRange(spec));
 
 export function packagesRouter(): Router {
   const router = express.Router();
@@ -64,7 +72,7 @@ export function packagesRouter(): Router {
 
   router.post("/packages", async (req, res) => {
     const spec = req.body?.spec;
-    if (typeof spec !== "string" || !SPEC_RE.test(spec)) {
+    if (!isSpec(spec)) {
       return res.status(400).json({
         error: "Spec must look like npm:pkg@1.0.0, git:github.com/user/repo, https://…, or a path",
       });
@@ -72,7 +80,10 @@ export function packagesRouter(): Router {
     try {
       const { stdout, stderr } = await pi(["install", spec]);
       await followPackages();
-      res.json({ ok: true, output: (stdout + stderr).trim() });
+      // The open chats load it: an idle one at once, a working one at its next step. A folder installed again is
+      // how a package being written there is loaded again in place.
+      const { reloaded, waiting } = await sessions.reloadIdle();
+      res.json({ ok: true, output: (stdout + stderr).trim(), reloaded, waiting });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }
@@ -83,14 +94,15 @@ export function packagesRouter(): Router {
     // What the list shows comes back, so also a folder inside pi's own one, which is written there without a leading "./".
     const packages = readPiSettings().packages;
     const listed = Array.isArray(packages) && packages.some((e) => sourceOf(e) === spec);
-    if (typeof spec !== "string" || !(listed || SPEC_RE.test(spec))) {
+    if (typeof spec !== "string" || !(listed || isSpec(spec))) {
       return res.status(400).json({ error: "Invalid package spec" });
     }
     try {
       const { stdout, stderr } = await pi(["remove", piPackageArg(spec)]);
       await packageRemoved(spec);
       await followPackages();
-      res.json({ ok: true, output: (stdout + stderr).trim() });
+      const { reloaded, waiting } = await sessions.reloadIdle();
+      res.json({ ok: true, output: (stdout + stderr).trim(), reloaded, waiting });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }
@@ -102,7 +114,8 @@ export function packagesRouter(): Router {
       // (the image), and says so with an error after the packages were updated. pi comes with the portal's version.
       const { stdout, stderr } = await pi(["update", "--extensions"]);
       await followPackages();
-      res.json({ ok: true, output: (stdout + stderr).trim() });
+      const { reloaded, waiting } = await sessions.reloadIdle();
+      res.json({ ok: true, output: (stdout + stderr).trim(), reloaded, waiting });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }
@@ -144,7 +157,9 @@ export function packagesRouter(): Router {
       await writePiSettingsText(content);
       // The file names the packages: one taken out of it, or switched in it, by hand.
       await followPackages();
-      res.json({ ok: true, path: piSettingsPath(), note: "Applies to newly started sessions" });
+      // pi reads the file as a chat loads.
+      const { reloaded, waiting } = await sessions.reloadIdle();
+      res.json({ ok: true, path: piSettingsPath(), reloaded, waiting });
     } catch (e) {
       res.status(500).json({ error: (e as Error).message });
     }

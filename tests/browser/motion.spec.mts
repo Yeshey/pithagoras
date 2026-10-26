@@ -77,7 +77,7 @@ async function portal(page: Page, { off = false, confirms = true, places, many =
     if (p === '/api/projects') return { root: '/w', home: '/w', projects: [] };
     if (p === '/api/workspaces') return { root: '/w', workspaces: [] };
     if (p === '/api/models') return { models: [], providers: {} };
-    if (p === '/api/features/flags') return { subagent: { enabled: false }, understory: { enabled: false } };
+    if (p === '/api/features/flags') return { memory: { held: false, by: null } };
     if (p === '/api/settings') return { settings: {}, defaults: {}, stored: {}, executor: 'host', workspaceRoot: '/w', piSettingsPath: '/p/settings.json', compaction: { keepRecentTokens: 20000 }, contextDefault: null };
     if (p === '/api/extensions') return { extensions: [], settingsPath: '/p/settings.json' };
     if (/report/.test(p)) return { targets: [], default: null };
@@ -559,7 +559,6 @@ test("the Stop button of voice mode is there at once when a run starts, and the 
   await page.route('**/api/sessions/test/commands', (route) => route.fulfill({ json: { commands: [] } }));
   await page.route('**/api/sessions/test/config', (route) => route.fulfill({ status: 503, json: {} }));
   await page.route('**/api/voice', (route) => route.fulfill({ json: { enabled: true } }));
-  await page.route('**/api/browser', (route) => route.fulfill({ json: { install: { container: 'running' } } }));
   await page.setViewportSize({ width: 1400, height: 860 });
   await page.goto('/tests/voice.html');
   await page.evaluate(() => { document.documentElement.dataset.motion = 'fancy'; });

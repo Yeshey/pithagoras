@@ -1,64 +1,192 @@
 # Opt-in features
 
 Four capabilities ship with Pithagoras and are **off** until you switch them on
-in **Settings**: a **subagent tool** and **Understory** as the agent's memory
-under **Add-ons**, and **image generation and editing** and **video generation** under
-**Agent → Media**. A fresh
-install has none of them. (The Add-ons page also holds the Docker-based
-[Browser and Voice](/guide/add-ons).) Switching on
-the first two writes them into pi's own configuration — a package, an MCP
-server — so they can also be seen, and undone, from Settings → Extensions and
-Settings → MCP. Switching one off removes it. Image and video generation are
-the portal's own tools and keep their settings in the portal.
+in **Settings**: a **subagent tool**, **Understory** as the
+agent's memory under **Extension settings → Memory**, and **image generation and
+editing** and **video generation** under **Extension settings → Media**. A fresh
+install has none of them. ([Voice mode](/guide/voice)'s settings are at the end of **Settings → Defaults**;
+the [voice service](/guide/voice-service), [Voice servers](/guide/voice-servers) and the agent's [browser](/guide/browser) are extensions.)
+The subagent tool is the `pithagoras-subagent` extension, which comes with the
+portal and is switched on in **Settings → Extensions** like any other, with its
+settings under **Extension settings → Subagents**. Switching Understory on
+writes it into pi's own configuration as an MCP server, so it can also be seen,
+and undone, from Settings → MCP. Understory is the
+`pithagoras-understory` extension, which you install first (see
+[Memory: Understory](#memory-understory)). Image and video generation are
+the tools of the [Media](/guide/media) extension, which a portal installs when
+it first starts, and keep their settings in its own store.
 
 The first two are reference implementations behind a seam the portal already
 has, so a third-party equivalent can take their place without changing the
 portal:
 
 - the subagent tool speaks the [subagent protocol](/guide/extensions#the-subagent-protocol);
-  any extension that does is shown and steered the same way;
+  any extension that does is shown and steered the same way, in the subagent
+  extension's panel;
 - Understory is an [MCP server](/guide/mcp); any memory server can be attached
   the same way.
 
 A switch reloads the idle open chats so they have the change at once. A chat
-that is busy — running, compacting, or with a subagent still working in the
-background — keeps what it had until it is idle and reloaded (`/reload`).
+that is busy has it from its next step, and one with a subagent still working
+in the background once that is done: see
+[a chat that is working](/guide/extensions#a-chat-that-is-working).
 
 ## Subagents
 
-**Settings → Add-ons → Subagents.** The `subagent` tool hands a self-contained
-task to a second pi with a context of its own and gets its answer back. You can
-watch it beside the chat (the robot button in the chat's header), give it
-instructions while it works, and stop it.
+**Settings → Extension settings → Subagents.** The `subagent` tool hands a
+self-contained task to a second agent with a context of its own and gets its
+answer back. The subagent works in a **chat of its own**, a child chat of the
+chat that asked: in the same folder, in the chat's mode (see *The mode a subagent
+works in*), with its tools and its model, under the [guard](/guide/security) and the [sandbox](/guide/sandbox) as
+the person the chat works for, and with a transcript of its own. You can watch
+it beside the chat, give it instructions while it works, open its chat, and stop
+it. A subagent's chat has no subagent tool of its own: there is one level, and a
+heartbeat, which is held to reading, has none either. A subagent keeps to the
+tools of its chat as they are now: one you switch off in the chat after the
+subagent was made is off for it from its next task, which matters for a kept
+subagent that is continued. If it read something that looked like a prompt
+injection, the chat it works for is held back as well once its answer arrives
+([the guard](/guide/security)).
 
-Switching it on installs the bundled `extensions/subagent` folder as a local pi
-package; switching it off removes it. One you installed by hand from a clone is
-recognised as the same tool.
+It is the `pithagoras-subagent` extension, which comes with the portal in its
+`extensions/subagent` folder. Install it, or switch it on and off, in
+**Settings → Extensions**: switched off, no chat has the tool, and its page is
+gone from Settings, and so is everything it draws beside a chat. Its server half
+gives every chat's pi the tool and keeps its settings. A portal that had the
+tool on before it was an extension keeps it on, with the settings it had (see
+[Upgrading](/guide/upgrading)).
+
+### Watching a subagent
+
+What the extension draws beside a chat, for every subagent of the
+[subagent protocol](/guide/extensions#the-subagent-protocol) — its own and
+any other extension's:
+
+- **The Subagents panel** (its button in the chat's header, there once the chat
+  has had one, with a dot while one is working): a tab for each subagent, what
+  it was asked, its replies and tool calls drawn as the chat draws its own (read
+  from its own chat), how long it has run, **Open as chat**, a box to tell it
+  something while it works, and **Stop**.
+- **A chip in the running tray** above the message box for each one at work,
+  which opens it in the panel.
+- **Waiting for you**: a subagent's chat is under the guard, so it may ask you
+  something there (a guard question, a dialog). Nobody may have that chat open,
+  so its chip in the tray and its head in the panel say *waiting for you*, and
+  the panel has the link that opens its chat to answer. Its slot stays taken
+  meanwhile (see *Subagents at once*), so with the default limit of 1 no other
+  chat's subagent starts until you answer, or stop it.
+- **Watch** beside the tool call that started one (**Open** once it is over),
+  without opening the call's card.
+
+Code mode, a web search, a fetch and other tools that report while they run are
+not subagents: they are not in the panel or the tray, and show their output on
+their own card, as always. With the extension switched off, a chat shows none of this, and a
+subagent another extension runs over the protocol is not drawn either.
 
 ### How it runs against the agent
 
 | Mode | What happens | When to use it |
 | --- | --- | --- |
 | **Interrupt** (default) | The tool call waits for the subagent's answer, so the agent's turn is held while it runs. Subagents asked for together run one after the other. | Local hosting, a single GPU: only one model call at a time. |
-| **Background** | The tool call returns at once and the agent goes on working. The subagent's answer arrives later as a message in the chat and starts a turn if the agent is idle. A subagent you stop does not start one. | Hosted models, or hardware that can serve two agents at once. |
+| **Background** | The tool call returns at once and the agent goes on working. The subagent's answer arrives later as a message in the chat and starts a turn if the agent is idle. A subagent you stop does not start one. Meanwhile the agent can list, message and stop its subagents (see [What the agent can do with its subagents](#what-the-agent-can-do-with-its-subagents)). | Hosted models, or hardware that can serve two agents at once. |
 
 Background runs two agents — two model processes — at the same time. With a
 local model that means two model calls at once, which a single GPU may not
 hold. Stopping the chat does not stop a background subagent; stop it from its
-window. Closing or reloading the chat does.
+window, or the agent stops it with `subagents`. Closing or reloading the chat does.
+
+### Kept subagent chats
+
+**Keep subagent chats** on its page, off by default:
+
+- **Off**: a subagent's chat is not in the chat lists. It is opened from the
+  panel (**Open as chat**), and once it has finished it is not given more. Its
+  transcript stays, to be read beside the chat.
+- **On**: it is a [sub-chat](/guide/sessions#sub-chats), listed under its chat,
+  and the agent can go on with it. Every result names the subagent's id ("Its
+  chat is kept as `k3f9x2`: pass that id to continue it."), and a later call
+  with that `id` gives the same chat a further task, with everything it already
+  knows. Another chat's subagent and one that was not kept are refused before
+  anything starts, with the reason. A call with the id of one that is still
+  working sends it a message instead (see below).
+
+Either way a subagent's chat is deleted with its chat. With it on, the tool's
+description says that a finished one can be continued, and the tool takes an
+`id`: about 19 tokens more on every request, and the `subagents` tool below
+about 49 more.
+
+### What the agent can do with its subagents
+
+In the background, or with kept chats on, the agent can act while a subagent
+works, so it can also look after its subagents, as you can from the panel:
+
+- **List them**: the `subagents` tool (`action: list`) lists the chat's
+  subagents with their id: those at work and how long they have run, those
+  waiting for a slot, and those that have ended (the latest 20), kept ones
+  marked as such. It shows nothing of what one at work has said: that comes
+  with its answer (see [Security](/guide/security#limiting-what-happens-next) for
+  why). A kept one you are working with in its own chat is listed as at work,
+  not on a task from the agent, and the agent cannot stop it.
+- **Send one a message**: a `subagent` call with the `id` of one at work sends
+  it the task as a message, which it reads after the step it is on, as yours
+  from the panel; it shows in its chat as a message. One still waiting for a
+  slot gets it with its task. Its answer comes as it would have. A message
+  its chat does not take in (it is being deleted, or its run has just ended)
+  is refused with the reason, so the agent does not wait for it.
+- **Stop one** (`action: stop` with its `id`): it stops as with **Stop** in the
+  panel, and once its run has ended the agent is told what it had said so far. One still waiting for a
+  slot is taken off the queue and never starts, so the next one gets the slot.
+  A subagent the agent stopped itself sends no message later and starts no
+  turn.
+
+The agent reaches only its own chat's subagents: an id of another chat's is
+refused as unknown. In interrupt mode with kept chats off the `subagents` tool
+is not there, as the agent waits for each subagent's answer and has nothing to
+talk to meanwhile. In the background the `subagent` tool takes an `id` for
+messages, about 14 tokens more on every request, and `subagents` costs about
+49.
+
+### The mode a subagent works in
+
+**Subagents work in the chat's mode**, on by default: a subagent's chat is made
+in the [mode](/guide/sessions#modes) of the chat it works for, with that
+mode's tools and instructions, and on the model and effort its chat is on now
+(not the ones the mode starts a chat on). In a chat in **Code mode** the subagent
+works through the code tool as well, in a mode you made it has the mode's tool
+layer and instructions, and in an extension's mode it is in that mode. Off, every
+subagent works in Standard mode: without the code tool, the mode's instructions
+and an extension's mode. The tools its chat's mode switched off stay off for it
+(a mode with `bash` and `write` off gives no subagent either), and so do the ones
+you switched off in the chat itself; what Standard gives beyond those it has.
+
+- A subagent that is **kept** keeps the mode it was made in when it is continued
+  (a chat's mode is fixed once it has said something), so a change of the
+  setting reaches the subagents made after it.
+- Where the chat's mode is not there for a child — the extension that offers it
+  is off, or the mode you made was deleted — the subagent works in Standard
+  mode, and its result says so ("The chat's mode, custom/x, is not there for it,
+  so it works in Standard mode.").
+- A mode that asks you first (an extension's) is given to a subagent because its
+  chat is in it already.
+
+The setting is read when a subagent starts, so it needs no restart and the chats
+are not reloaded.
 
 ### Which model a subagent runs on
 
 By default a subagent runs on **the model its chat is on** when it starts one —
 the one already loaded, so a local server does not have to load a second one.
-**Model** on the Subagents tab names another for every chat instead, and each
-chat can say its own in its model menu (*Subagents in this chat run on*):
-the default, this chat's model, or any model there is. A choice is read when a
-subagent starts, so it needs no restart.
+**Model** on its page names another for every chat instead, and each
+chat can say its own in its model menu (*Subagents in this chat run on*, a row
+the extension adds under the models): the default, this chat's model, or any
+model there is. A choice is read when a subagent starts, so it needs no restart.
 
-Stored as `subagentModel` in pi's `settings.json` (`"provider/model"`, or
-absent for the chat's own); a chat's own is the portal's, and reaches the tool
-over the protocol's `subagent:v1:config`.
+Both are the extension's own: the page's in its settings (`"provider/model"`, or
+absent for the chat's own), each chat's in `chats.json` beside them, by chat id,
+removed with the chat (or at the extension's next start, where it was deleted
+while the extension was off; `/api/x/pithagoras-subagent/chats/:id/model`, see
+the [API](/reference/api)). The portal no longer keeps a chat's choice, and answers
+the protocol's `subagent:v1:config` with nothing.
 
 ### Subagents at once
 
@@ -67,22 +195,49 @@ every chat — each one is a model running. One asked for beyond it waits for a
 free slot: in interrupt mode its tool call waits (and gives up if the chat is
 stopped meanwhile); in the background the call returns saying it is queued,
 and it starts once another has finished. A queued one does not start once its
-chat has been closed or reloaded.
+chat has been closed or reloaded. A subagent holds its slot while it waits for
+you to answer a question in its chat, because its model is still the one in use:
+raise the limit if that is in your way.
 
-Both choices are stored in pi's `settings.json` — `subagentMode`
-(`"background"`, or absent for interrupt) and `subagentMaxParallel` (absent
-for 1, at most 16) — so the tool behaves the same when pi runs outside the
-portal. `PI_SUBAGENT_BIN` picks the `pi` it starts (default: `pi` on `PATH`).
+The mode, the limit, the model, whether chats are kept and whether subagents
+work in the chat's mode are kept in the extension's own folder of the portal's
+data folder (`extension-data/pithagoras-subagent/settings.json`), each left out
+while it is the default. Before it was an extension, the tool read
+them from pi's `settings.json` (`subagentMode`, `subagentMaxParallel`,
+`subagentModel`): the upgrade hands them over once, and takes them out of pi's
+file. They are set on its page or through its own address
+(`/api/x/pithagoras-subagent/settings`, see the [API](/reference/api)).
 
 Subagents need the host executor (`EXECUTOR=host`): only there does the portal
-share pi's event bus with the tool.
+run pi in its own process, where the extension gives a chat's pi the tool and
+shares its event bus. The subagent's own chat runs as any chat does.
+
+### What the agent is told
+
+The `subagent` tool's description names the mode it runs in and the limit
+("One runs at a time: further calls wait for it to finish", or "At most 3 run
+at once; further calls wait for a free one"), so the agent does not ask for more
+than will start. The results carry the live numbers, counted across every chat:
+a background call says how many are running and how many wait ("2 of 2 running,
+1 waiting, this one included"), and an interrupt call that had to wait for a
+slot ends its answer with how long it waited, so the agent can tell the wait
+from the subagent's own work time. Every result names the subagent's id, and
+with kept chats the description adds that a finished one can be continued by
+it. Nothing is added to the system prompt, so its cache holds.
+
+The description is read when a chat loads the tool, so a change under
+**Subagents at once** or **Mode** reaches an idle chat at once (it is reloaded),
+a busy one at its next step, and one with a subagent still working in the
+background once that is done. The limit is enforced live all the same, so a
+chat that has not yet taken the change never runs more than the settings say.
 
 ## Image generation
 
-**Settings → Agent → Media**, **Image model.** The image endpoint, and the switches for
+**Settings → Extension settings → Media**, **Image model.** The image endpoint, and the switches for
 **Image generation**, **Image editing**, **Several pictures per edit** and **Stable Diffusion extra settings**. The section opens and
 closes, with the first two switches always in view; the editing endpoint and the last two switches are groups in it
-(**Editing endpoint**, **More options**). It was a tab of Settings → Add-ons before; nothing stored changed with the move.
+(**Editing endpoint**, **More options**). Before Media became an extension it was on other Settings pages, last
+**Settings → Agent → Media**; what was set there is carried over.
 
 The two switches, **Image generation** and **Image editing**, are the general switches of the
 feature: they decide whether it exists. Switched on, with an address, the [Media page](/guide/media)
@@ -129,7 +284,7 @@ speaks one needs a small adapter in front.
 The address, model, size, time limit and key are read at each call, so changing them needs
 no restart. Switching the tool on or off, though, is decided when a chat loads:
 like the other features, a switch reloads the idle open chats, and a busy one
-has it after it is idle and reloaded (`/reload`). The tool belongs to the
+has it from its next step. The tool belongs to the
 in-process agent (`EXECUTOR=host`), as `show_image` does.
 
 ### What the agent gets
@@ -143,22 +298,23 @@ with a title, as `show_image`'s does, so the chat draws the picture, in a previe
 that holds its place while it is made (see
 [Sessions](/guide/sessions#pictures-the-agent-makes)) and opens in the
 [viewer](/guide/sessions#looking-at-a-picture) on a click, and voice mode opens
-the Pictures window on it. The portal marks its own calls when they start, and
-the page draws a call as that preview only with the mark: another extension's
-tool of the same name, which pi may keep in the portal's place, has no such mark
-and stays a plain tool card while it runs or fails, with what it gave under it. A failure — nothing configured, the endpoint's error, a reply that is
+the Pictures window on it. The preview is Media's card for a call of
+`generate_image`, and it goes by the tool's name, as every extension's card
+does: another extension's tool of the same name is drawn with it too while
+Media is installed. A failure — nothing configured, the endpoint's error, a reply that is
 no picture — is an error result the agent sees and can pass on, never a
 silent success.
 
 The tool is a tool like the others: it can be switched off for a chat, a project
-or everywhere in the tool menus and Settings → Tools, where it sits in one **Media**
-group with `show_image` and `edit_image` (and the video tools), and then the model does not
+or everywhere in the tool menus and Settings → Tools, where it sits in Media's
+group, `pithagoras-media`, with `show_image` and `edit_image` (and the video tools), and then the model does not
 have it and the voice instructions say nothing of it either. Its name is
 `generate_image`, which an image extension you installed may use too. pi keeps
-the first tool of a name it loads, and the portal's loads last, so then the
-extension's tool is the one the model has, the portal's is left unused, and the
-voice instructions do not mention it. Switch that extension off to use the
-add-on's tool.
+the first tool of a name it loads, and Media's tools, which its server half
+registers, load after those of pi's own packages, so then the other
+extension's tool is the one the model has, Media's is left unused, and the
+voice instructions do not mention it. Switch that extension off to use
+Media's tool.
 
 Only the primary user's conversations can have the agent make a picture: like
 any tool that is not a plain read, it is refused in a conversation with a
@@ -190,7 +346,7 @@ money at a hosted endpoint.
 
 An `edit_image` tool: the agent changes a picture that is in the chat's folder
 as it is told, and the result appears in the chat, and in voice mode's picture
-window, as a generated one does. It is the same add-on and the same endpoint
+window, as a generated one does. It is the same feature and the same endpoint
 rules, with a switch of its own: an endpoint that makes pictures does not always
 change them, so editing is opt-in apart from generation and says whether it is
 available. While it is off, or has no address, the agent has no `edit_image`
@@ -224,8 +380,8 @@ translated.
 
 `edit_image(path, prompt, title?)` reads the picture at `path` (relative to the
 chat's folder, or absolute inside it), asks for the change, saves the result and
-shows it. Its answer is the same as `generate_image`'s — the new picture's path,
-a title and the mark only the portal's tools set — so the page treats it alike. A
+shows it. Its answer is the same as `generate_image`'s — the new picture's path
+and a title — so the page treats it alike. A
 failure — switched off since, a path that is no picture of the folder, the
 endpoint's error, an answer that is no picture — is an error result the agent
 sees and can pass on.
@@ -296,13 +452,13 @@ What was decided for it:
 The same rules as for generation apply to who may use it: the primary user's
 conversations only, unless a [tool rule](/people/rules) allows it, and each edit
 can cost money at a hosted endpoint. The tool is a tool like the others and can
-be switched off in the tool menus and Settings → Tools, in the same **Media** group; an extension's tool of
+be switched off in the tool menus and Settings → Tools, in the same group; another extension's tool of
 the name `edit_image` is the one pi keeps, as for `generate_image`.
 
 | | |
 | --- | --- |
-| Stored as | The portal's own settings (`image_generation`), not pi's `settings.json`, which the Advanced tab shows in full. |
-| API | [`/api/features/images`](/reference/api#opt-in-features) |
+| Stored as | Media's own store (`image_generation` in its `media.db`), not pi's `settings.json`, which the Advanced tab shows in full. |
+| API | [`/api/x/pithagoras-media/settings/images`](/reference/api#media) |
 
 ### Several pictures
 
@@ -391,7 +547,7 @@ What was decided for it:
 
 ## Video generation
 
-**Settings → Agent → Media**, **Video model.** The video endpoint and the switch for **Video generation**. It is
+**Settings → Extension settings → Media**, **Video model.** The video endpoint and the switch for **Video generation**. It is
 built on the same pattern as [image generation](#image-generation), and takes the same trouble not to assume
 one server or model: the address, the model and the key are yours.
 
@@ -400,8 +556,8 @@ tools: `generate_video`, in which the agent describes a video (or gives a pictur
 model you set up makes it, and it plays in the chat; and `show_video`, which plays a video that is in the chat's
 folder. Switched off, or without an address, there are no such tools at all, and the page says in its form
 that it is not set up, with a link here. Whether a chat's agent actually has them is answered only in the
-**tool lists** (Settings → Agent → Tools, a project's Tools, the tools control of a chat), where they sit in the
-**Media** group, with the picture tools. The switch here does not decide it, and the Media page does not
+**tool lists** (Settings → Agent → Tools, a project's Tools, the tools control of a chat), where they sit in
+Media's group, `pithagoras-media`, with the picture tools. The switch here does not decide it, and the Media page does not
 look at those lists.
 
 While it is on and has an address the sidebar has a [Media](/guide/media) page, with a form to make videos and a
@@ -433,7 +589,7 @@ plain words. Other request and answer shapes are not translated; an endpoint tha
 
 The address, model, size, frames, frame rate, time limit and key are read at each call, so changing them needs no
 restart. Switching the tools on or off, though, is decided when a chat loads: a switch reloads the idle open chats, and a busy
-one has it after it is idle and reloaded (`/reload`). The tools belong to the in-process agent (`EXECUTOR=host`), as
+one has it from its next step. The tools belong to the in-process agent (`EXECUTOR=host`), as
 `show_image` does.
 
 ### The agent's video tools
@@ -447,9 +603,8 @@ picture in the chat's folder, which is the first frame of the video; it is read 
 and a picture outside the folder is refused. `lastFrame` is a picture to end the video on, read and checked in the same way; it goes only to a server that says it takes one, and the call fails with the reason where it does not. Whether the clip really ends on it depends on the model, which some ignore without saying so, and the tool's description tells the agent so, so that it reports the picture as asked for and not as reached. A picture only attached to a message is not in the folder, and the tool's
 description says so. The call waits for the video and stopping the chat stops the wait.
 
-Its answer is the video's path and a title, with the mark only the portal's tool sets (`portalVideo`), and the chat plays the
-video only with that mark: another extension's `generate_video`, which pi may keep in the portal's place, stays a plain tool
-card. `show_video(path, title?)` plays a WebM or an MP4 of the chat's folder by what its bytes say, and nothing else. Voice mode
+Its answer is the video's path and a title, and the chat plays the video in Media's card for the call, which goes by the
+tool's name: another extension's `generate_video` is drawn with it too while Media is installed. `show_video(path, title?)` plays a WebM or an MP4 of the chat's folder by what its bytes say, and nothing else. Voice mode
 shows no videos: while the model has `generate_video`, the voice instructions say that a video is not shown in a spoken
 conversation, only in the chat, and tell it to make one only when asked.
 
@@ -470,11 +625,22 @@ always costs minutes of its model.
 
 ## Memory: Understory
 
-**Settings → Add-ons → Memory.** [Understory](https://github.com/thecodacus/understory)
-is a memory that grows: plain markdown on disk, cross-linked and maintained,
-which the agent looks things up in and adds to through its tools
+**Understory** (`extensions/understory`, the package `pithagoras-understory`)
+gives the agent [Understory](https://github.com/thecodacus/understory) as its
+memory: a memory that grows, plain markdown on disk, cross-linked and
+maintained, which the agent looks things up in and adds to through its tools
 (`understory_memory_query`, `…_add`, `…_update`, `…_status`, `…_maintain`).
 The bundle is human-readable and git-diffable.
+
+Neither Understory nor [Docker](/guide/docker), which it requires, is installed
+by default: install them from **Settings → Extensions → Discover → Comes with
+Pithagoras → Understory**, which installs Docker first
+([Installing what it requires](/guide/extension-ui#installing-what-it-requires)).
+Its page is **Settings → Extension settings → Memory**
+(`/settings/x/pithagoras-understory`), and its **Memory** page is in the
+sidebar's **Extensions** group. A portal that ran Understory before it was an
+extension handed what it kept over to it: see
+[Upgrading](/guide/upgrading#understory-is-an-extension).
 
 A [project](/guide/projects#an-agent-for-a-project) can do without it: its **Understory
 as memory** switch is off, and its chats are neither told about Understory nor have it
@@ -482,29 +648,36 @@ instead of the agent's `MEMORY.md`. Home keeps it, and so does a project with an
 
 ### Running it here
 
-With Docker access (see [Docker add-ons](/guide/add-ons#docker-access)), the
-portal runs Understory itself, in a container of its own (`pithagoras-understory`)
-with its memory in a volume (`pithagoras_understory-memory`). In Settings → Add-ons → Memory:
+With Docker access (see [Giving the portal Docker](/guide/docker#giving-the-portal-docker)),
+Understory runs in a container of its own (`pithagoras-understory`), made
+through Docker, with its memory in a volume (`pithagoras_understory-memory`). On
+its page, **Run it here**:
 
 - **The model that keeps the memory.** Understory uses a model to file, link
   and tidy notes. By default **the chat's model**: the one the chat calling its
   tool is on, already loaded, so writing with one model does not load another
-  for the memory. Understory is pointed at the portal as its model server, with
-  a key of its own, and the portal passes each request on to that chat's model,
-  with its address and key. With no chat asking — tidying up at night — the one
-  that asked last, and before any has, the default model for new chats. It
-  takes a model with an OpenAI-compatible API (local servers, OpenRouter); for
-  another, and when the portal serves its own TLS, give Understory one of its
-  own: *a provider set up here* — one and one of its models, its address and
-  key taken from the provider each time Understory starts — or *an address of
-  its own*: the API address, a key (none needed for a local server), a model
-  and the format (OpenAI-compatible or Anthropic). A saved key is never shown
-  again; leave the field empty to keep it.
+  for the memory. Understory is pointed at a model server the extension runs
+  on the portal's own loopback (`127.0.0.1:3801`, `UNDERSTORY_LLM_PORT`), with
+  a key of its own, and the extension passes each request on to that chat's
+  model, with its address and key. With no chat asking — tidying up at night —
+  the one that asked last, and before any has, the default model for new
+  chats. It takes a model with an OpenAI-compatible API (local servers,
+  OpenRouter). Where that port is taken by something else, the chat's model is
+  not offered, and the page says so: set `UNDERSTORY_LLM_PORT` to a free one.
+  An Understory made for the chat's model is stopped then, and not started
+  again until the model server listens, since what it sends would go to
+  whatever holds the port.
+  For another API, give Understory a model of its own: *a provider set up
+  here* — one and one of its models, its address and key taken from the
+  provider each time Understory starts — or *an address of its own*: the API
+  address, a key (none needed for a local server), a model and the format
+  (OpenAI-compatible or Anthropic). A saved key is never shown again; leave the
+  field empty to keep it.
 - **Tidying up.** How often Understory goes over the whole memory on its own —
   merging duplicates, linking orphans, splitting notes grown too long (its
   "dreaming"). One of three: **never** (the default); **at a time of day** —
   every day at, say, 03:00 when nobody is using the model, in the portal's
-  time zone, started by the portal while Understory runs, with Understory's
+  time zone, started by the extension while Understory runs, with Understory's
   own timer left off; or **on an interval** — every hour, 6, 12 or 24 hours
   or week, Understory's own timer, which counts from when it starts, so
   saving begins the count anew. Never both. Each pass costs tokens, and does
@@ -518,16 +691,27 @@ with its memory in a volume (`pithagoras_understory-memory`). In Settings → Ad
 Understory reads its model and interval only when it starts, so **Save and
 restart Understory** makes its container again with the new ones; the memory
 is untouched. Understory has no way to be asked for a pass, so at a set time
-the portal runs the very pass its timer runs, inside its container with its
-own settings (`docker exec`). It runs on the host network, like the browser, so a model server
-the portal reaches on `localhost` is reached the same way. It is given a token
-of its own (`AUTH_TOKEN`), which the portal writes into the agent's MCP entry
-and uses for the Memory page; nothing else can read the memory through it.
+the extension runs the very pass its timer runs, inside its container with its
+own settings (Docker's `containers.exec`). It runs on the portal's own network
+(Docker's [`sharedNetwork()`](/guide/docker#a-container-on-the-portal-s-network)),
+so a model server the portal reaches on `localhost` is reached the same way.
+When the portal's container is made again, as a Compose update does, the
+extension makes Understory's again on the new one within half a minute, with its
+memory and its token. It is given a token of its own (`AUTH_TOKEN`), which the
+extension writes into the agent's MCP entry and uses for the Memory page; nothing
+else can read the memory through it.
+
+Removing or switching off the extension in Settings → Extensions leaves the
+container as it is: it is made to restart with Docker (`unless-stopped`), and
+stays listed under `pithagoras-understory` in **Settings → Docker**, where it can
+be stopped or removed. Remove it on its page in Settings first to have it
+go. The agent's MCP entry stays in `mcp.json` too, until it is switched off.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `UNDERSTORY_PORT` | `3800` | The port the portal's Understory listens on. |
+| `UNDERSTORY_PORT` | `3800` | The port the Understory run here listens on. |
 | `UNDERSTORY_VOLUME` | `pithagoras_understory-memory` | The volume that holds its memory. |
+| `UNDERSTORY_LLM_PORT` | `3801` | The port on the portal's loopback (`127.0.0.1`) where the extension's model server listens for Understory, in the chat's model mode. Understory's container is told it when it is made, and made again with a new one as the extension starts after a change. |
 | `UNDERSTORY_LLM_HEADERS_TIMEOUT_MS` | `1800000` | How long, in ms, to wait for the model's answer — until its headers arrive — before it is given up on and said so as a timeout; an answer that does not stream (what Understory gets today) sends no byte until it is done, so this covers the whole of it there. `0` sets no wait. |
 | `UNDERSTORY_LLM_BODY_TIMEOUT_MS` | `1800000` | How long, in ms, a streaming answer may go quiet between its bytes before it is cut off. `0` turns the wait off. |
 | `PORTAL_FETCH_HEADERS_TIMEOUT_MS` | `1800000` | A ceiling of quiet, not of work: how long, in ms, any fetch the portal's process makes — pi's MCP tool calls among them — may wait for an answer's first byte before it is cut off; Node's own fetch cuts one off after five quiet minutes. The default outlasts Understory's own model wait, so a run allowed to think half an hour is not cut off mid-thought by the client waiting on it. `0` sets no wait. |
@@ -538,8 +722,8 @@ Without Docker access, or to keep running your own, see
 
 ### Reading the memory
 
-While Understory is on, **Memory** appears in the sidebar. Its page is laid out
-as Understory's own:
+While Understory is on, **Memory** appears in the sidebar's **Extensions** group.
+Its page is laid out as Understory's own:
 
 - down the side, the memory's folders and notes, each with its type, and
   Understory's own `index.md` and `log.md` set apart; a search; and whether the
@@ -551,8 +735,10 @@ as Understory's own:
   Understory's own runs took (lit in the graph when you point at one), and zoom,
   drag and click to open.
 
-What is open is in the address (`/memory?note=…`, `?view=log`,
-`?view=graph`), so it can be linked to. Understory's chat is not there.
+What is open is in the address (`/x/pithagoras-understory/memory?note=…`,
+`?view=log`, `?view=graph`, `?view=chat`), so it can be linked to. The page and
+its [librarian](/guide/memory#memory) are described under
+[Memory and audit](/guide/memory).
 
 ### Changing a note by hand
 
@@ -583,8 +769,8 @@ paths Understory's queries took; the notes stay. **Clear the memory** (the bin
 beside the heading) starts the memory from nothing: every note and folder
 deleted, the index and log as a new memory has them, and Understory started
 again so it holds nothing of what was there. Both ask first, and cannot be
-undone. (**Remove and forget the memory** in the add-on removes Understory as
-well.)
+undone. (**Remove and forget the memory** on its page in Settings removes
+Understory as well.)
 
 The portal asks Understory for all of it, at the address in `mcp.json` and
 with its token, so the page works wherever the portal does: over HTTPS, from a
@@ -601,12 +787,16 @@ Switching it on:
 1. installs `pi-mcp-adapter` if it is not installed yet, which makes MCP servers
    into tools;
 2. writes an `understory` server into `mcp.json`, with its tools directly in the
-   agent's tool list — the portal's own Understory with its token, or the
+   agent's tool list — the Understory run here with its token, or the
    address given;
-3. stops reading `MEMORY.md`.
+3. counts what its server says as your own words, so the guard neither marks
+   nor checks it: it is added to the trusted MCP servers in **Settings → Guard**,
+   where you can take it out (see [Prompt injection](/guide/security#marking-untrusted-output));
+4. stops reading `MEMORY.md`.
 
-Switching it off removes the server, and `MEMORY.md` is read again. Removing
-the portal's own Understory switches it off too.
+Switching it off removes the server, takes it out of the trusted servers again,
+and `MEMORY.md` is read again. Removing the Understory run here switches it off
+too.
 
 ### MEMORY.md while it is on
 
@@ -625,7 +815,8 @@ conversation cannot use the memory tools unless a rule allows it (see
 
 Understory can also run anywhere the portal reaches, set up by you; the portal
 then only points the agent at its MCP address (*Or use one you run yourself*
-in the Memory add-on). Its model and tidying up are then set in its own
+on Understory's page in Settings, which needs the extension installed all the
+same). Its model and tidying up are then set in its own
 environment — `LLM_*` and `DREAM_INTERVAL`, which the portal cannot change.
 
 ```yaml
@@ -649,9 +840,9 @@ volumes:
 
 The address is what the **portal** reaches: `http://localhost:3800/mcp` with
 the shipped compose file's host networking, or `http://understory:3800/mcp` on
-a shared Docker network. It can be changed in the Memory add-on.
+a shared Docker network. It can be changed on Understory's page in Settings.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `MEMORY_UNDERSTORY_URL` | `http://localhost:3800/mcp` | The address the Memory add-on starts from. |
+| `MEMORY_UNDERSTORY_URL` | `http://localhost:3800/mcp` | The address Understory's page in Settings starts from. |
 | `MEMORY_UNDERSTORY_AUTH_TOKEN` | — | Sent as `Authorization: Bearer …` when Understory has an `AUTH_TOKEN`. Named in `mcp.json` (`bearerTokenEnv`), never copied into it. |

@@ -7,11 +7,24 @@ German. Navigation runs down the left edge, in four groups:
 | Group | Pages |
 | --- | --- |
 | **Models** | **Providers** — where models come from, see [Models and providers](/guide/models); **Defaults** — model, effort and context for new chats |
-| **Agent** | **Tools**, **Media**, **Skills**, **MCP**, **Extensions** |
+| **Agent** | **Tools**, **Modes**, **Sandbox**, **Guard**, **Skills**, **MCP**, **Extensions** |
 | **Reach** | **Channels**, **People** |
-| **Portal** | **This browser**, **Authentication**, **Add-ons**, **Shortcuts**, **Logs**, **About** (with **Update** and **Restart**), **Advanced** |
+| **Portal** | **This browser**, **Authentication**, **Shortcuts**, **Logs**, **About** (with **Update** and **Restart**), **Advanced** |
 
-Plus a page for every extension that exposes configuration.
+Plus a page for every extension that exposes configuration, under **Extension
+settings**: [Media](/guide/media)'s is **Media**, at
+`/settings/x/pithagoras-media`.
+
+Each group folds under its heading: a click, or Enter or Space on it, hides its
+pages and shows them again, and the arrow beside the name says which it is. All
+of them are open until you fold one, and what you fold stays folded in this
+browser, through closing Settings and reloading the page. The group of the page
+showing is held open, so the page marked as the current one is always in the
+rail: a search, a link or an address that goes to a page in a folded group
+finds the group open, and it folds again once you go to a page in another
+group. While it is held, its heading does nothing. The search lists what it
+finds whatever is folded. On a phone, folding a group keeps you in the list of
+pages; it does not open one.
 
 The dialog takes the room the screen has: nearly all of a laptop's, and three
 quarters of the width of a wider one. Every page uses that width. Lists
@@ -33,7 +46,7 @@ A page that cannot read what it shows, because the portal was restarting or coul
 not be reached, says so in red with the reason and a **Try again** button, in the
 place of its list. It does not show an empty list or "Nobody yet" as if that were
 what the portal holds. The same goes for the Projects, Audit and Agents pages and
-for the add-ons. A refresh that fails while a page is already showing something
+for the **Subagents** page under **Extension settings**. A refresh that fails while a page is already showing something
 is a message at the top of the dialog instead, and what was shown stays.
 
 ## Defaults
@@ -43,6 +56,14 @@ is a message at the top of the dialog instead, and what was shown stays.
 What new chats start with: provider, model, effort, the context window, how much
 is kept when a chat is compacted, and where routines report. The fields are
 described in [Models and providers](/guide/models#defaults).
+
+At the end of the page, **Voice mode** holds what voice mode does whatever
+listens and speaks for it: whether voice conversations are offered at all (off,
+only dictation is), speech detection, the speaking instructions, the model that
+answers spoken messages and the providers that reply without thinking first,
+each saved as it is changed. It names voice mode's source too, says whether it
+is running, and has a button to its page and **Stop using**: see
+[Voice mode's settings](/guide/voice#voice-mode-s-settings).
 
 The fields show **only your explicit overrides**. Leave one empty and it
 inherits, with the inherited value shown as the placeholder. Clearing a field
@@ -74,12 +95,34 @@ that, a session asking for a local model silently started on pi's fallback.
 
 ## Tools, Skills and MCP
 
+**Guard**, beside **Sandbox**, is the [guard](/guide/security)'s page: the rules that hold after a suspected
+injection, each routine's exemptions from them (one switch per rule), which MCP servers count as your own and are
+not marked as outside content (the portal's own memory server until you say otherwise, and a server an extension counts
+so when you switch it on from its page; the browser never), the sites
+the agent's tools may reach (one list, one domain per line, for every tool that says where it goes and for the browser
+tools an MCP server brings; an empty list means any site; saved with its **Save** button), the approvals not yet spent
+and the flagged results you trusted, each of which can be taken back, and what is always on. Each other change is
+saved as it is made.
+
 **Tools** sets which tools every conversation starts with, see
-[The interface](/guide/interface#tools). **Skills** lists, creates, imports and
+[The interface](/guide/interface#tools). **Subagents**, under **Extension
+settings** while the subagent extension is on, sets how the subagent tool runs;
+the extension is switched in **Extensions**, see
+[Opt-in features](/guide/features#subagents). **Skills** lists, creates, imports and
 switches the agent's procedures, see [Skills](/guide/skills). **MCP** manages MCP servers, see
 [MCP servers](/guide/mcp).
 
-**Media** has two sections, **Image model** and **Video model**. Each has its **switches** at the top, always in view,
+**Browser**, under **Extension settings** while the [Browser](/guide/browser)
+extension is installed, installs, starts, stops and removes the agent's browser,
+with the password of its web UI and how the download of its image goes; see
+[Installing it](/guide/browser#installing-it). The voice service and Voice
+servers, which voice mode can listen and speak through, and Understory, the
+agent's memory, are extensions with pages there too: see
+[The voice service](/guide/voice-service), [Voice servers](/guide/voice-servers)
+and [Memory: Understory](/guide/features#memory-understory).
+
+**Media**, under **Extension settings**, is the page of the [Media](/guide/media)
+extension. It has two sections, **Image model** and **Video model**. Each has its **switches** at the top, always in view,
 and under them a heading with a line under it, which opens and closes the section with a click; what opens is directly
 under the heading. The line says what the section is for
 while it is open, and the address and model while it is closed. A model that is not set up starts open, to show its
@@ -90,7 +133,7 @@ typed in it and not saved stays open, and the search of Settings opens the secti
 switches for **Image generation** and **Image editing** (always in view), and **Several pictures per edit** and **Stable Diffusion extra settings** (under **More options**). The image endpoint is in the section; **Editing endpoint**, a group of its own that opens and closes, holds the address, key, model and maximum size for editing, which are empty when editing uses the image endpoint. See
 [Opt-in features](/guide/features#image-generation). The first two switch the feature on or off as a whole: the
 [Media page](/guide/media) and the existence of the tools. Whether a chat's agent gets the tools,
-`show_image`, `generate_image` and `edit_image`, is set only in the Tools list, where they are together in one **Media** group, with the video tools. **Stable Diffusion extra settings** (off by default) is
+`show_image`, `generate_image` and `edit_image`, is set only in the Tools list, where they are together in Media's group, `pithagoras-media`, with the video tools. **Stable Diffusion extra settings** (off by default) is
 for an endpoint that is a stable-diffusion.cpp server: it lets the Media page offer and send the settings only that server
 reads, see [Media](/guide/media#stable-diffusion-settings). The tools do not use it.
 
@@ -98,7 +141,18 @@ reads, see [Media](/guide/media#stable-diffusion-settings). The tools do not use
 limit, the disk limit, and the switch for **Video generation**, see
 [Opt-in features](/guide/features#video-generation). The switch turns the feature on or off as a whole: the
 [Media page](/guide/media) and the existence of the tools. Whether a chat's agent gets the tools, `generate_video` and
-`show_video`, is set only in the Tools list, in the same **Media** group.
+`show_video`, is set only in the Tools list, in the same group.
+
+## Modes
+
+Your own [chat modes](/guide/sessions#modes-you-make): the ways a chat can work
+that the menu above the message box of a new chat offers after Standard and
+Code mode. The page lists them, and **New mode** makes one from a name and a
+description and opens it. A mode's page has its name, description and
+instructions, saved with **Save**; the model and effort a chat put in it starts
+on, which use the same menus as **Defaults**; whether its chats work through
+the code tool; and its tools, the same list as a project's. Each of those is
+saved as it is changed. The bin at the top deletes the mode, after asking.
 
 ## Channels
 
@@ -115,6 +169,22 @@ browser used to re-parse it and listed some packages twice.
 
 Any extension whose settings the server can recover gets its own page in the
 navigation, with a field per key.
+
+The list follows what is installed elsewhere (another tab, the API, an agent)
+while it is open. Beside a package is why a half of it is not working: its
+server half could not be started, or crashed (with what it said last), its
+interface could not be loaded in this page, or its interface failed in a page:
+in this one, or in another before this one last went through what is installed
+(when it was opened, or when what is installed last changed). A page that one of them breaks is opened with `?extensions=off` on its
+address (`/settings/extensions?extensions=off`): it loads no extension's
+interface, and the package can be switched off or removed here. See
+[What is loaded, and when](/guide/extension-ui#what-is-loaded-and-when).
+
+A package in an extension's own data folder says **From** that extension: one
+the extension installed itself ([Extensions it installs](/guide/extension-ui#extensions-it-installs)),
+or one installed from there by its path. Where the extension installed it, the
+note it gave is under it, as the extension wrote it, and pointing at the pill
+says when.
 
 ::: warning Recovered, not declared
 pi publishes no schema for extension settings — extensions simply read keys off
@@ -230,12 +300,6 @@ change to the provider or to **OIDC only** signs out every other
 browser; this one stays signed in. **Take out single sign-on** removes the button
 and the settings, after asking. Wrong passwords here are counted like those of
 **Change password**; settings refused after the right password are not.
-
-## Add-ons
-
-Installs the optional parts of the portal itself: Browser, Voice, Subagents and
-Memory, see [Docker add-ons](/guide/add-ons) and
-[Opt-in features](/guide/features).
 
 ## Logs
 
@@ -510,7 +574,8 @@ the message box — are listed there too, and are fixed.
 pi's raw `settings.json`, edited in place. It is validated as JSON before
 writing — a broken file stops every future session from starting, so an invalid
 save is refused rather than accepted. It has to be an object, and what a save
-replaces is kept beside the file as `settings.json.bak`.
+replaces is kept beside the file as `settings.json.bak`. A save reloads the
+open chats, as installing a package does.
 
 If you edit the file by hand and leave it unreadable, the other places that
 write to it (the compaction slider, the extension switches and forms) refuse to

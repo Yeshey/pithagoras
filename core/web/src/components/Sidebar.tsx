@@ -1,4 +1,4 @@
-import { memo, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, memo, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { SessionActions, sessionError } from "./SessionActions";
 import { TitleInput } from "./TitleInput";
@@ -11,10 +11,7 @@ import {
   LuPanelLeftOpen,
   LuClock,
   LuFolderKanban,
-  LuGlobe,
-  LuBrain,
   LuChevronRight,
-  LuImages,
   LuMessagesSquare,
   LuPlus,
   LuPuzzle,
@@ -32,9 +29,12 @@ import { HOME, folderKeys, hasMoreThanHome, folderName, folderNameOf, groupByFol
 import { useFolderPrefs, useOpenFolders } from "../use-session-folders";
 import { t, useLanguage } from "../i18n";
 import { titleOf, useSlot, type Registered } from "../extensions/slots";
+import { failedIn } from "../extensions/loader";
 import { ErrorBoundary } from "./ErrorBoundary";
+import { SubChats } from "./SubChats";
+import { familiesFound, familyRunning, searchFolderOf, shownStatus, splitSubChats, topOf, type ShownStatus } from "../sub-chats";
 
-/** How many unpinned sessions the sidebar shows before deferring to Sessions. */
+/** How many unpinned sessions the sidebar shows before deferring to Sessions. A chat's sub-chats come with it, uncounted. */
 const RECENTS_LIMIT = 12;
 /** How many of a folder's chats the sidebar shows before deferring to Sessions, opened at that folder. */
 const FOLDER_LIMIT = 8;
@@ -58,9 +58,6 @@ export const Sidebar = memo(function Sidebar({
   executor,
   activeId,
   view,
-  hasBrowser,
-  hasMemory = false,
-  hasMedia = false,
   places,
   onSelect,
   onNewChat,
@@ -77,12 +74,6 @@ export const Sidebar = memo(function Sidebar({
   activeId: string | null;
   /** Which top-level destination is showing, so the nav can mark it. */
   view: "chat" | Destination;
-  /** Whether the optional browser service is there at all. */
-  hasBrowser: boolean;
-  /** Understory is the agent's memory: its page is there to read. */
-  hasMemory?: boolean;
-  /** Image or video generation is on and has an address: the Media page is there to make pictures and videos in and to look through them. */
-  hasMedia?: boolean;
   /** Where Home and the projects are, to list the chats by folder: undefined until known, null if they could not be. */
   places?: Places | null;
   onSelect: (id: string) => void;
@@ -125,10 +116,12 @@ export const Sidebar = memo(function Sidebar({
     }
   };
 
+  // Sub-chats are listed under their chat, and counted nowhere on their own (see sub-chats.ts).
+  const all = useMemo(() => splitSubChats(sessions), [sessions]);
   // Only worth a field once the list is longer than it shows: below that the
   // chat you want is in front of you, and a search box is one more thing to skip.
   const [query, setQuery] = useState("");
-  const searchable = sessions.length > RECENTS_LIMIT;
+  const searchable = all.top.length > RECENTS_LIMIT;
   // The field goes away when the list shrinks below the limit; what was typed
   // in it must not go on hiding chats from a list that has no box to clear it.
   const searching = searchable && query.trim() !== "";
@@ -138,11 +131,13 @@ export const Sidebar = memo(function Sidebar({
   // Until the places are known, the chats are listed as they were: not held back for them.
   const byFolder = grouping === "folders" && hasPlaces;
   // The search goes by what the list shows: the name, and the folder's name where the chats are gathered under it.
-  // A pinned chat is listed at the top with no folder next to it, so it is found by its title only.
-  const found = useMemo(() => {
-    const nameOf = searching && byFolder ? folderNameOf(sessions, places) : undefined;
-    return filterSessions(sessions, searching ? query : "", nameOf && ((s) => (s.pinned ? "" : nameOf(s))));
-  }, [sessions, searching, query, byFolder, places]);
+  // A pinned chat is listed at the top with no folder next to it, so it is found by its title only, and so are its
+  // sub-chats. A sub-chat that is found is shown under its chat (`under`).
+  const { top: found, under } = useMemo(() => {
+    if (!searching) return all;
+    const nameOf = byFolder ? folderNameOf(sessions, places) : undefined;
+    return familiesFound(all, filterSessions(sessions, query, nameOf && searchFolderOf(sessions, nameOf)));
+  }, [all, sessions, searching, query, byFolder, places]);
   const pinned = found.filter((s) => s.pinned);
   const recents = found.filter((s) => !s.pinned);
   // A search looks through all of them, not only the dozen that are listed.
@@ -163,11 +158,13 @@ export const Sidebar = memo(function Sidebar({
   /** Every folder there can be, for what is kept about them: see folderKeys. */
   const allKeys = useMemo(() => (places ? folderKeys(places) : undefined), [places]);
   const openFolders = useOpenFolders("sidebarFoldersOpen", (key) => key === HOME, searching, allKeys);
+  /** The chat listed on its own that the open chat is, or is a sub-chat of. */
+  const activeTop = useMemo(() => topOf({ top: found, under }, activeId)?.id, [found, under, activeId]);
   // The chat opened is in a folder that is open, however it was opened — once
   // for each chat opened and the folder it is in: a folder shut while its chat
   // is open stays shut, and a chat first put in Elsewhere, before its project
   // was known, still has its project opened once it is.
-  const activeFolder = useMemo(() => folders.find((f) => listed.get(f.key)!.some((s) => s.id === activeId))?.key, [folders, listed, activeId]);
+  const activeFolder = useMemo(() => folders.find((f) => listed.get(f.key)!.some((s) => s.id === activeTop))?.key, [folders, listed, activeTop]);
   const openedFor = useRef<string | null>(null);
   useEffect(() => {
     const opened = `${activeId}\n${activeFolder}`;
@@ -175,12 +172,32 @@ export const Sidebar = memo(function Sidebar({
     openedFor.current = opened;
     openFolders.set(activeFolder, true);
   }, [activeId, activeFolder]);
+  // A chat's sub-chats are shut until opened, and open while one of them works or waits for you; the one opened is
+  // shown the way its folder is, once for each time it is opened.
+  const parents = useMemo(() => [...all.under.keys()], [all]);
+  const openSubs = useOpenFolders(
+    "sidebarSubChatsOpen",
+    (id) => (all.under.get(id) ?? []).some((c) => c.status === "running" || c.asking),
+    searching,
+    parents,
+  );
+  // The chat whose sub-chat is open, where it is listed with its sub-chats under it.
+  const activeParent = sessions.find((s) => s.id === activeId)?.parent;
+  const openedUnder = activeParent && all.under.has(activeParent) ? activeParent : null;
+  useEffect(() => {
+    if (openedUnder) openSubs.set(openedUnder, true);
+  }, [activeId, openedUnder]);
+  /** The sub-chats shown under a chat's row: none while they are shut. */
+  const subsShown = (id: string) => (openSubs.isOpen(id) ? (under.get(id) ?? []) : []);
 
   const headingProps = { grouping, sort, onGrouping: setGrouping, onSort: setSort };
 
   // Rows slide to their new places, and new ones come in (see motion.ts): not
   // while a search is typed, which moves them with every key.
-  const rowsOrder = [byFolder ? "folders" : "recents", ...pinned.map((s) => s.id), "|", ...(byFolder ? folders.flatMap((f) => listed.get(f.key)!) : shownRecents).map((s) => s.id)].join();
+  // A chat's sub-chats are rows of their own once shown, after it.
+  const rowsOrder = [byFolder ? "folders" : "recents", ...pinned, "|", ...(byFolder ? folders.flatMap((f) => listed.get(f.key)!) : shownRecents)]
+    .flatMap((s) => (typeof s === "string" ? [s] : [s.id, ...subsShown(s.id).map((c) => c.id)]))
+    .join();
   const list = useFlip<HTMLDivElement>(rowsOrder, searching);
   // The chat that is picked lights up: when the open chat changes, not each time its row is shown again.
   const opened = useRef(activeId);
@@ -190,10 +207,13 @@ export const Sidebar = memo(function Sidebar({
     if (activeId) pick(list.current?.querySelector(`[data-flip="${CSS.escape(activeId)}"]`));
   }, [activeId]);
 
-  const item = (s: Session) => (
+  const row = (s: Session, status: ShownStatus, subChats?: readonly Session[], nested = false) => (
     <SessionItem
       key={s.id}
       session={s}
+      status={status}
+      subChats={subChats}
+      nested={nested}
       active={activeId === s.id}
       onSelect={() => onSelect(s.id)}
       onRename={onRename}
@@ -202,19 +222,24 @@ export const Sidebar = memo(function Sidebar({
       onError={setStartError}
     />
   );
+  /** A chat's row, and its sub-chats under it. */
+  const item = (s: Session) => {
+    const subs = all.under.get(s.id);
+    return (
+      <Fragment key={s.id}>
+        {row(s, shownStatus(s, subs), subs)}
+        <SubChats title={s.title} subs={under.get(s.id) ?? []} open={openSubs.isOpen(s.id)} onToggle={() => openSubs.toggle(s.id)}>
+          {(c) => row(c, shownStatus(c), undefined, true)}
+        </SubChats>
+      </Fragment>
+    );
+  };
 
   const destinations: { to: Destination; icon: ReactNode; label: string }[] = [
     { to: "sessions", icon: <LuMessagesSquare />, label: t("Sessions") },
     { to: "projects", icon: <LuFolderKanban />, label: t("Projects") },
     { to: "agents", icon: <LuBot />, label: t("Agents") },
     { to: "routines", icon: <LuClock />, label: t("Routines") },
-    // Hidden unless there is one. The browser is an optional service, and
-    // a dead link to a feature you did not install is just clutter.
-    ...(hasBrowser ? [{ to: "browser" as const, icon: <LuGlobe />, label: t("Browser") }] : []),
-    // Likewise: only while Understory holds the agent's memory.
-    ...(hasMemory ? [{ to: "memory" as const, icon: <LuBrain />, label: t("Memory") }] : []),
-    // And only while there is an endpoint to make pictures or videos with.
-    ...(hasMedia ? [{ to: "media" as const, icon: <LuImages />, label: t("Media") }] : []),
   ];
   // Last of the destinations, after the extensions' group.
   const audit = { to: "audit" as const, icon: <LuShield />, label: t("Audit") };
@@ -233,7 +258,7 @@ export const Sidebar = memo(function Sidebar({
     <aside aria-label={t("Sidebar")} className={`relative flex shrink-0 flex-col overflow-hidden border-r border-line bg-surface transition-[width] duration-300 ease-in-out motion-reduce:transition-none ${collapsed ? "w-12" : "w-64"}`}>
       {/* One that fails to answer is not listed: its page is at its address all the same. */}
       {entries.filter((page) => page.useShown).map((page) => (
-        <ErrorBoundary key={page.key} resetKey={page.key} fallback={() => null}>
+        <ErrorBoundary key={page.key} resetKey={page.key} fallback={() => null} onError={failedIn(page.extension)}>
           <PageShown entry={page} onChange={(shown) => setShownPages((keys) => (shown ? (keys.includes(page.key) ? keys : [...keys, page.key]) : keys.filter((key) => key !== page.key)))} />
         </ErrorBoundary>
       ))}
@@ -328,14 +353,15 @@ export const Sidebar = memo(function Sidebar({
               folders={folders}
               isOpen={openFolders.isOpen}
               onToggle={openFolders.toggle}
+              running={(s) => familyRunning(s, all.under.get(s.id))}
               onMove={searching || !allKeys ? undefined : (shown, key, to) => move(shown, key, to, allKeys)}
               onNewChat={(f) => newChat(f.path || undefined)}
             >
               {(f) => {
                 const chats = listed.get(f.key)!;
                 const first = searching ? chats : chats.slice(0, FOLDER_LIMIT);
-                // The chat that is open is listed, however far down its folder it is.
-                const open = first.some((s) => s.id === activeId) ? null : chats.find((s) => s.id === activeId);
+                // The chat that is open is listed, however far down its folder it is: or the chat it is a sub-chat of.
+                const open = first.some((s) => s.id === activeTop) ? null : chats.find((s) => s.id === activeTop);
                 const shown = open ? [...first, open] : first;
                 return (
                   <>
@@ -402,7 +428,7 @@ const GroupLabel = ({ children }: { children: ReactNode }) => (
 );
 
 /** A page of the portal's, or one an extension brought: `x/<extension>/<page id>`. */
-type Destination = "sessions" | "projects" | "agents" | "routines" | "browser" | "memory" | "media" | "audit" | `x/${string}`;
+type Destination = "sessions" | "projects" | "agents" | "routines" | "audit" | `x/${string}`;
 
 function RailButton({
   icon,
@@ -645,6 +671,9 @@ function RailMenu({
 
 function SessionItem({
   session: s,
+  status,
+  subChats,
+  nested,
   active,
   onSelect,
   onRename,
@@ -653,6 +682,12 @@ function SessionItem({
   onError,
 }: {
   session: Session;
+  /** How it shows, with its sub-chats: see shownStatus. */
+  status: ShownStatus;
+  /** Its sub-chats, which a delete names. */
+  subChats?: readonly Session[];
+  /** It is shown under its chat. */
+  nested: boolean;
   active: boolean;
   onSelect: () => void;
   onRename: (id: string, title: string) => Promise<void>;
@@ -681,7 +716,7 @@ function SessionItem({
       }`}
     >
       <div className="flex items-center gap-2">
-        <StatusDot status={s.status} />
+        <StatusDot status={status} />
         {renaming ? (
           <TitleInput
             value={s.title}
@@ -696,7 +731,7 @@ function SessionItem({
           />
         ) : (
           <span
-            className={`truncate text-sm text-fg ${workingText(s.status)}`}
+            className={`truncate text-sm text-fg ${workingText(status)}`}
             onDoubleClick={(e) => {
               e.stopPropagation();
               setRenaming(true);
@@ -708,7 +743,7 @@ function SessionItem({
 
         {/* Without a mouse there is no hover: the open chat's row keeps them. */}
         <div className={`ml-auto hidden shrink-0 items-center gap-0.5 group-focus-within:flex group-hover:flex ${active ? "[@media(hover:none)]:flex" : ""}`}>
-          <SessionActions session={s} small onPin={onPin} onStartRename={() => setRenaming(true)} onDelete={onDelete} onError={onError} />
+          <SessionActions session={s} subChats={subChats} nested={nested} small onPin={onPin} onStartRename={() => setRenaming(true)} onDelete={onDelete} onError={onError} />
         </div>
       </div>
     </div>

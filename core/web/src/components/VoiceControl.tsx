@@ -14,7 +14,7 @@ import { micError } from "../mic-error";
 import type { Item } from "../transcript";
 import { LiveTranscription } from "../live-transcription";
 import { preparePcmSpeech, readPcmStream, playAudioBuffer, bufferOf } from "../pcm-stream";
-import { stretch, stretchInSteps } from "../time-stretch";
+import { stretchInSteps } from "../time-stretch";
 import { joinSamples } from "../samples";
 import { asksToRepeat, couldAskToRepeat } from "../voice-commands";
 import { isImage, pending, type Attachment } from "../attachments";
@@ -23,20 +23,24 @@ import { describe, matches, useKeyLabels, useKeybindings } from "../keybindings"
 import { HandsFreeVoice, type VoicePhase } from "../hands-free";
 import { t } from "../i18n";
 
+/** The waits between the tries at fetching the spoken error line as voice mode starts. */
+const ERROR_LINE_WAITS_MS = [1000, 3000];
+/** How long an error waits for an error line that is still being fetched. */
+const ERROR_LINE_WAIT_MS = 8000;
 /** How much of the last reply Repeat keeps: two minutes is about 11 MB of samples. */
 const REPEAT_SECONDS = 120;
 /** A phrase of the last reply, and the last speed Repeat played it at, so a second Repeat need not work it out again. */
 type KeptPhrase = { samples: Float32Array[]; sampleRate: number; stretched?: { rate: number; samples: Promise<Float32Array>; signal: AbortSignal; ready?: boolean } };
 const seconds = (phrase: KeptPhrase) => phrase.samples.reduce((n, s) => n + s.length, 0) / phrase.sampleRate;
 
-export function VoiceControl({ sessionId, folder, items, running, work, onSend, onAbort, stageTarget, onModeChange, title, browserAvailable, browserActivity, toolEvents }: {
+export function VoiceControl({ sessionId, folder, items, running, work, onSend, onAbort, stageTarget, onModeChange, title, toolEvents }: {
   sessionId: string;
   /** The folder the chat works in: a tool card names a file by its path there, and the windows are told of it. */
   folder: string;
   stageTarget: HTMLElement | null;
   onModeChange: (active: boolean) => void;
   title: string;
-  browserAvailable: boolean; browserActivity: number; toolEvents: PortalEvent[];
+  toolEvents: PortalEvent[];
   items: Item[];
   running: boolean;
   /** What the agent is doing now (the chat works it out once, from the same events), or null when it is not running. */
@@ -170,13 +174,19 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
   const [sequentialMode, setSequentialMode] = useState(false);
   const context = useRef<AudioContext | null>(null);
   const stream = useRef<MediaStream | null>(null);
-  const managed = useRef(false);
   const connection = useRef<string | null>(null);
   const heartbeat = useRef<ReturnType<typeof setInterval>>();
-  const connectVoice = async(client:string,active:boolean)=>{
-    await json(`/api/sessions/${sessionId}/voice/connection`,{method:'POST',body:JSON.stringify({client,active}),keepalive:!active});
+  // The lease's updates go one after another, in the order they were made: a heartbeat still on its way when voice mode
+  // stops would otherwise reach the server after the release, and take the lease again.
+  const connectionUpdates = useRef<Promise<unknown>>(Promise.resolve());
+  const connectVoice = (client:string,active:boolean)=>{
+    const update = connectionUpdates.current.then(()=>json(`/api/sessions/${sessionId}/voice/connection`,{method:'POST',body:JSON.stringify({client,active}),keepalive:!active}));
+    connectionUpdates.current = update.catch(()=>{});
+    return update;
   };
   const maxTurn = useRef<ReturnType<typeof setTimeout>>();
+  // The spoken error line, asked for as voice mode started, in the chat's own voice: its audio once it is there, or nothing.
+  const errorLine = useRef<{ ready: Promise<ArrayBuffer | undefined> } | null>(null);
 
   useEffect(() => {
     if (!error || error !== fadingError || enabled || starting) return;
@@ -200,6 +210,7 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
     clearTimeout(maxTurn.current);
     clearTimeout(holdLimit.current); clearTimeout(held.current?.timer); held.current = null;
     replay.current?.abort(); replay.current = null;
+    errorLine.current = null;
     voice.current?.stop(); voice.current = null; setErrorsAfter(null);
     transcription.current?.reset(); transcription.current = null;
     const detector = vad.current; vad.current = null;
@@ -213,7 +224,6 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
     mounted.current = true;
     const load = () => api.voice().then(config => {
       if (!mounted.current) return;
-      managed.current=config.managed===true;
       statusSpeech.current = config.statusSpeech !== false;
       setComparison(config.comparison === true);
       sequential.current = config.pipelineMode === "sequential";
@@ -223,10 +233,13 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
       ttsPrefetch.current = config.ttsPrefetch === true;
       setPrefetchMode(ttsPrefetch.current);
       vadSettings.current = { ...DEFAULT_VAD, ...config.vad };
-      // Voice mode speaks its replies: without speech synthesis there is nothing for it to do. Dictation, which only listens, stays.
-      const usable = config.enabled && config.speech !== false;
+      // Voice mode speaks its replies: without speech synthesis, or with voice conversations switched off in Settings, there
+      // is nothing for it to do. Dictation, which only listens, stays.
+      const usable = config.enabled && config.speech !== false && config.conversation !== false;
       setAvailable(usable);
-      if (!usable) stop();
+      // Ended here, voice mode that was on in this tab before a reload is not brought back later either: this runs again
+      // each time Settings is closed, and once voice mode can be used again it would start, microphone and all, with no click.
+      if (!usable) { resume.current = false; stop(); }
       // Voice mode was on in this tab when the page was reloaded: carry on.
       else if (resume.current && !voice.current && !restoring.current) { restoring.current = true; void start(true); }
     }).catch(() => { if (mounted.current) { setAvailable(false); stop(); } });
@@ -382,38 +395,53 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
     })().catch(() => {}).finally(() => { if (replay.current === controller) replay.current = null; });
     return true;
   };
+  /**
+   * Asks for the spoken error line as voice mode starts, and keeps its audio. Tried again while voice mode is still on,
+   * as the speech model is often just coming up then.
+   */
+  const prepareErrorLine = (version: number) => {
+    const current = () => mounted.current && epoch.current === version;
+    const fetchLine = async (): Promise<ArrayBuffer | undefined> => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const response = await fetch(`/api/sessions/${sessionId}/voice/speech`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: t("An error occurred.") }),
+          });
+          if (response.ok && response.headers.get("content-type")?.startsWith("audio/pcm")) return await response.arrayBuffer();
+        } catch {}
+        if (attempt >= ERROR_LINE_WAITS_MS.length || !current()) return undefined;
+        await new Promise(resolve => setTimeout(resolve, ERROR_LINE_WAITS_MS[attempt]));
+        if (!current()) return undefined;
+      }
+    };
+    errorLine.current = { ready: fetchLine() };
+  };
   const synthesize = async (text: string, signal: AbortSignal, audio: AudioContext, kind:'reply'|'status'|'error'='reply') => {
     const trace=profiling.current?profiler.current!.current:undefined;
     const mark=(name:string,detail?:Record<string,number|string|boolean>,at?:number)=>{if(trace)profiler.current!.mark(kind+'_'+name,detail,trace,at);};
     mark('tts_request');
     let response: Response;
-    // The previous cancelled request may still be releasing Breeze's GPU lock.
-    const deadline = Date.now() + 15000;
     if (kind === 'error') {
-      // Said from the file made when voice mode began: the speech model is not asked at the moment something has gone wrong.
-      response = await fetch(`/api/sessions/${sessionId}/voice/error-line?text=${encodeURIComponent(text)}`, { signal });
-      if (!response.ok) throw new Error(t("The spoken error line is not available, so the error is shown in writing only. The speech model was not ready when voice mode started."));
-    } else do {
+      // Played from the line fetched as voice mode began: the speech model is not asked at the moment something has gone wrong.
+      // It may still be on its way, as the speech model is often just coming up when voice mode begins.
+      const line = errorLine.current;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const bytes = line && await Promise.race([line.ready, new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), ERROR_LINE_WAIT_MS); })]);
+      clearTimeout(timer);
       signal.throwIfAborted();
+      if (!bytes) throw new Error(t("The spoken error line is not available, so the error is shown in writing only. The speech model was not ready when voice mode started."));
+      response = new Response(bytes.slice(0), { headers: { "content-type": "audio/pcm", "x-sample-rate": "24000" } });
+    } else {
       response = await fetch(`/api/sessions/${sessionId}/voice/speech`, {
-        method: "POST", headers: { "Content-Type": "application/json", "Accept": "audio/pcm" },
+        method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }), signal,
       });
-      if (response.ok) break;
-      mark('tts_retry',{http:response.status});
-      const failure = await response.json().catch(() => ({}));
-      // Older portal processes wrap Breeze's busy response in HTTP 502. This
-      // also permits updating the UI without restarting an active session.
-      const busy = response.status === 409 && failure.error === "Breeze is finishing another request"
-        || response.status === 502 && /^Breeze returned HTTP 409/.test(failure.error || "");
-      if (!busy || Date.now() >= deadline) throw new Error(failure.error || t("Speech generation failed"));
-      await new Promise<void>((resolve, reject) => {
-        const cancel = () => { clearTimeout(timer); reject(signal.reason); };
-        const timer = setTimeout(() => { signal.removeEventListener("abort", cancel); resolve(); }, 500);
-        signal.addEventListener("abort", cancel, { once: true });
-        if (signal.aborted) cancel();
-      });
-    } while (true);
+      if (!response.ok) {
+        const failure = await response.json().catch(() => ({}));
+        throw new Error(failure.error || t("Speech generation failed"));
+      }
+    }
     mark('tts_headers',{serverTiming:response.headers.get('server-timing')??''});
     let body=response.body;
     if(body&&trace){let first=true;body=body.pipeThrough(new TransformStream<Uint8Array<ArrayBuffer>,Uint8Array<ArrayBuffer>>({transform(chunk,controller){if(first&&chunk.length){first=false;mark('first_bytes');}controller.enqueue(chunk);}}));}
@@ -422,18 +450,10 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
     // Kept for Repeat once it is played; a phrase prepared and then cancelled was never heard.
     const phrase = { samples: [] as Float32Array[], sampleRate: 24000 };
     const options = { rate: speed.current, ...(kind === 'reply' ? { record: (samples: Float32Array) => { phrase.samples.push(samples); } } : {}) };
-    if (response.headers.get("content-type")?.startsWith("audio/pcm")) {
-      if (response.headers.get("x-sample-rate") !== "24000" || !body) throw new Error(t("Unsupported speech stream"));
-      if (!sequential.current && response.headers.get("x-voice-streaming") === "true") stream = await preparePcmSpeech(body!, audio, signal, options);
-      else buffer = await readPcmStream(body!, audio, signal, options);
-    } else {
-      const bytes = await new Response(body).arrayBuffer(); signal.throwIfAborted();
-      const decoded = await audio.decodeAudioData(bytes); signal.throwIfAborted();
-      const samples = decoded.getChannelData(0).slice();
-      phrase.sampleRate = decoded.sampleRate; options.record?.(samples);
-      buffer = options.rate === 1 ? decoded : bufferOf(audio, stretch(samples, options.rate), decoded.sampleRate);
-      if (!buffer) throw new Error(t("Speech generation returned no audio"));
-    }
+    if (!response.headers.get("content-type")?.startsWith("audio/pcm") || response.headers.get("x-sample-rate") !== "24000" || !body) throw new Error(t("Unsupported speech stream"));
+    // Played as it arrives, unless the pipeline speaks one phrase after another.
+    if (!sequential.current) stream = await preparePcmSpeech(body, audio, signal, options);
+    else buffer = await readPcmStream(body, audio, signal, options);
     mark('audio_ready');
     const play = async (playbackSignal: AbortSignal) => {
       playbackSignal.throwIfAborted();
@@ -505,15 +525,14 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
       } });
       if (!current()) { mic.getTracks().forEach(track => track.stop()); return; }
       stream.current = mic;
-      if(managed.current){
-        const lease=crypto.randomUUID();connection.current=lease;
-        await connectVoice(lease,true);
-        if(!current())return;
-        heartbeat.current=setInterval(()=>{void connectVoice(lease,true).catch(e=>{if(current()){setError(e.message);stop();}});},25000);
-      }
-      // The spoken error line is made now, while the speech model is at hand, and kept: at error time it is only played. Not waited
-      // for, and no failure here is shown: if it is missing then, that is said with the error.
-      void json(`/api/sessions/${sessionId}/voice/error-line`, { method: 'POST', body: JSON.stringify({ text: t("An error occurred.") }) }).catch(() => {});
+      // The session's lease, before anything listens: what voice mode listens and speaks through gets ready for it (a model loaded), and says here when it cannot.
+      const lease=crypto.randomUUID();connection.current=lease;
+      await connectVoice(lease,true);
+      if(!current())return;
+      heartbeat.current=setInterval(()=>{void connectVoice(lease,true).catch(e=>{if(current()){setError(e.message);stop();}});},25000);
+      // The spoken error line is fetched now, while the speech model is at hand, and kept: at error time it is only played. Not
+      // waited for, and no failure here is shown: if it is missing then, that is said with the error.
+      prepareErrorLine(version);
       const detectorModule = await import("@ricky0123/vad-web");
       if (!current()) return;
       const live = new LiveTranscription(async (samples, signal) => {
@@ -657,7 +676,7 @@ export function VoiceControl({ sessionId, folder, items, running, work, onSend, 
 
     {(starting || enabled) && stageTarget && createPortal(
       <VoiceStage sessionId={sessionId} folder={folder} workPhase={work} title={sequentialMode ? `${title} · ${sentenceMode ? (prefetchMode ? t("Sentence pipeline · buffered audio") : t("Sentence chunks · buffered audio")) : t("Sequential baseline")}` : comparison ? `${title} · ${t("Streaming pipeline")}` : title} phase={phase} starting={starting} muted={muted} speaking={speaking}
-        browserAvailable={browserAvailable} browserActivity={browserActivity} toolEvents={toolEvents} sounds={sounds} onSounds={toggleSounds} onCue={cue}
+        toolEvents={toolEvents} sounds={sounds} onSounds={toggleSounds} onCue={cue}
         levels={levels} transcript={transcript} error={error} onMute={toggleMute} onEnd={endMode} waitingForTap={waitingForTap}
         items={items} errorsAfter={errorsAfter} running={running} onStop={() => { void latest.current.onAbort().catch(e => setError((e as Error).message)); }}
         attachments={attachments} onAddPictures={files => { void addPictures(files); }} onRemovePicture={id => pending.set(sessionId, pending.get(sessionId).filter(a => a.id !== id))}

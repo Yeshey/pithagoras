@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
+import { LuContainer } from "react-icons/lu";
 import type { Portal } from "@pithagoras/extension-api";
 import type { ContainerInfo, VolumeInfo } from "./api";
 import { de } from "./de";
-import { portal, setPortal, t } from "./portal";
+import { msg, portal, setPortal, t } from "./portal";
 import "./client.css";
 
 /**
@@ -125,7 +126,8 @@ function DockerPage() {
                       <span className="dk-docker-name">{container.name}</span>
                       <span className="dk-docker-meta">{`${container.image} · ${container.status}`}</span>
                     </div>
-                    {container.state === "running" ? (
+                    {/* One Docker waits to start again is running to it, and a stop ends the wait; a start would do nothing. */}
+                    {container.state === "running" || container.state === "restarting" ? (
                       <button type="button" className={ui.classes.ghost} disabled={busy !== null} onClick={() => void act(`stop ${container.name}`, at(`/containers/${name(container.name)}/stop`), "POST")}>
                         {t("Stop")}
                       </button>
@@ -171,5 +173,5 @@ function DockerPage() {
 export default function docker(given: Portal) {
   setPortal(given);
   portal.locale.add("de", de);
-  portal.slots.register("settings.page", { id: "docker", component: DockerPage });
+  portal.slots.register("settings.page", { id: "docker", title: msg("Docker"), icon: LuContainer, component: DockerPage });
 }

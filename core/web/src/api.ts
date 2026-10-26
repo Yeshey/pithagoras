@@ -1,9 +1,6 @@
 import { t } from "./i18n";
 import { samplesWav } from "./voice";
-import type { Host, VoiceChoice } from "../../server/src/voice-engines";
 import type { OrbStyle } from "../../server/src/orb-style";
-import type { OutputFormat } from "../../server/src/image-settings";
-import type { ChatMessage } from "./memory-chat";
 export type SessionStatus = "idle" | "running" | "error" | "interrupted";
 
 export interface Session {
@@ -25,6 +22,25 @@ export interface Session {
   thinking_level: string | null;
   /** How the session came to exist. */
   kind?: "task" | "agent" | "routine" | "heartbeat";
+  /** The mode it was started in; null is Standard. */
+  mode: string | null;
+  /** For a child chat (a sub-chat, see sub-chats.ts): the id of its chat. */
+  parent?: string;
+  /** For a child chat: whether it is in the chat list. One that is not is opened by its id alone. */
+  listed?: boolean;
+  /** For a child chat: it waits on a person, with a dialog or a question of its agent's open. */
+  asking?: boolean;
+}
+
+/** A mode a chat can be put in, as the portal offers it to that chat. */
+export interface ChatMode {
+  id: string;
+  label: string;
+  description: string;
+  /** Asked, with a yes or no, before a chat is put in it. */
+  confirm?: string;
+  /** The package that offers it, whose translations its texts are shown through. */
+  extension?: string;
 }
 
 /** A set of instructions the agent pulls in when the description matches. */
@@ -90,10 +106,10 @@ export interface Routine {
   done: boolean;
   instructions: string;
   freshSession: boolean;
-  /** False lets this routine act on what it read — see the guard. */
+  /** False lets this routine act on what it read against at least one of the guard's rules — see `exempt`. */
   guard: boolean;
-  /** True lets this routine's runs drive the agent's browser. */
-  browser: boolean;
+  /** The guard's rules its runs are exempt from, by name: set in Settings → Guard. */
+  exempt: string[];
   /** Where its runs happen: null for Home, else a project's directory. */
   workspace: string | null;
   /** Why that place cannot be used now, such as a project that was deleted; null when it can. */
@@ -118,8 +134,9 @@ export interface AgentSetup {
   initialised: boolean;
   /** `mtime`: when the file last changed, 0 where there is none. A save sends it back, so the agent's own writes are not lost. `link`: it is a link, which is left alone: not shown, not written. */
   files: { name: string; exists: boolean; content: string; mtime: number; link?: boolean }[];
-  /** Where the agent's memory is kept: while it is Understory, MEMORY.md is not read. */
-  memory?: "file" | "understory";
+  /** Where the agent's memory is kept: while something holds it (`by` names it), MEMORY.md is not read. */
+  memory?: "file" | "extension";
+  by: string | null;
 }
 
 /** An agent: a home of its own, with its own SOUL.md, PrimaryUser.md and memory. */
@@ -139,7 +156,7 @@ export interface Agent {
   channels: { slug: string; name: string }[];
   /** Its avatar. */
   orb: OrbStyle;
-  /** The voice it speaks with: "design", a voice library id, or "" for the one in the voice settings. */
+  /** The voice it speaks with: an id from the voices voice mode's source offers, or "" for its own choice. */
   voice: string;
   /** How it looks around on its own. */
   heartbeat: {
@@ -205,8 +222,8 @@ export interface Project {
   hasTools?: boolean;
   /** The agent whose soul, user and memory its chats carry: its id. Left out for a blank slate, which has only the instructions. */
   agent?: string;
-  /** Set where the project does without Understory as its memory. */
-  understoryOff?: boolean;
+  /** Set where the project does without the memory an extension holds, and its chats read the agent's MEMORY.md. */
+  memoryOff?: boolean;
   /** How many chats work in it, and when one last moved. */
   sessions: number;
   lastActive: string | null;
@@ -215,8 +232,10 @@ export interface Project {
 /** Who a project's chats are with: see /api/projects/:name/agent. */
 export interface ProjectAgent {
   agent: string | null;
-  understory: boolean;
-  understoryAvailable: boolean;
+  /** The memory an extension holds is the project's (see GET /api/features/flags): not where it is off, nor for a blank slate. */
+  memory: boolean;
+  /** An extension holds the agent's memory now. */
+  memoryAvailable: boolean;
 }
 
 /** What a delete would lose that only the folder holds: nothing else has a copy of these. */
@@ -257,7 +276,9 @@ export interface PortalTool {
   enabled: boolean;
   /** Whether it is on by default, so a chat can show where it disagrees. */
   defaultOn?: boolean;
-  /** One of the portal's own, not an extension's of the same name: the list groups its picture tools. */
+  /** A chat's only: the code tool, on, in a chat whose mode switches it on. Its switch cannot turn it off. */
+  byMode?: true;
+  /** One of the portal's own, not an extension's of the same name: the list groups code mode by it. */
   inline?: true;
   /** An MCP server's tool listed from the adapter's cache: the server starts when one of its tools is first used. */
   cached?: true;
@@ -316,7 +337,9 @@ export interface PortalEvent {
 /**
  * Fired when what is installed changed (a package installed, removed, updated
  * or switched), so the page loads or drops an extension's interface at once:
- * see extensions/loader.ts.
+ * see extensions/loader.ts. By this page's own changes as they are made, and by
+ * the list of chats when it says that what is installed changed elsewhere, or
+ * where a server half stands: one may have crashed.
  */
 export const EXTENSIONS_CHANGED = "pithagoras:extensions-changed";
 const changesExtensions = <T>(request: Promise<T>): Promise<T> =>
@@ -325,18 +348,67 @@ const changesExtensions = <T>(request: Promise<T>): Promise<T> =>
     return result;
   });
 
+/** Fired when the person's own modes changed (Settings → Modes), so that a chat's picker lists them as they are now. */
+export const MODES_CHANGED = "pithagoras:modes-changed";
+const changesModes = <T>(request: Promise<T>): Promise<T> =>
+  request.then((result) => {
+    window.dispatchEvent(new Event(MODES_CHANGED));
+    return result;
+  });
+
+/** A mode the person made, as Settings → Modes edits it: `id` is what follows "custom/" on a chat in it. */
+export interface CustomMode {
+  id: string;
+  label: string;
+  description: string;
+  /** Its chats work through the code tool alone. */
+  codemode: boolean;
+  /** Said in its chats' system prompt. */
+  instructions: string;
+  /** What a chat is put on as it is put in the mode: none leaves it as the chat would have it. */
+  provider: string | null;
+  model: string | null;
+  thinkingLevel: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** How a server half crashed, with the lines it said last, as a log file has them: as GET /api/extension-ui gives it. */
+export interface ServerCrash {
+  name: string;
+  at: string;
+  rev: string;
+  error: string;
+  stack?: string;
+  lines: string[];
+}
+
 /** An installed extension's browser half: where its module is fetched from, and its stylesheet if it has one. */
 export interface ExtensionUi {
   name: string;
   version?: string;
   /** Absent for a package that has only a server half. */
   entry?: string;
+  /** The revision of its browser half, which `entry` and `style` carry: what a failure of it is told to the portal under. */
+  rev?: string;
   style?: string;
+  /** Why its browser half failed in a page, this one or another, while that revision is the one installed: to load, to draw, or in what it runs of its own. */
+  clientError?: string;
+  /** Where it failed, as that page had it: the error's stack, and the components it was drawn in. */
+  clientStack?: string;
   /** The files its module imports along with itself, to be asked for at once rather than one level at a time. */
   preload?: string[];
   /** Where its server half's own routes are, when it has one; why it is not running, when it could not be started. */
   server?: string;
   serverError?: string;
+  /**
+   * Its server half crashed (an error of its code reached the portal's process, or it called process.exit()), and is
+   * off until another revision of it is installed or it is switched off and on: when, which revision, the error, and
+   * the last lines it said, as a log file has them.
+   */
+  crash?: ServerCrash;
+  /** The extensions its server half cannot start without, each with the versions it takes. */
+  requires?: Record<string, string>;
   /** The themes its package.json names: colours in place of the portal's own, with no code. See extensions/themes.ts. */
   themes?: { id: string; name: string; light?: Record<string, string>; dark?: Record<string, string> }[];
 }
@@ -414,15 +486,25 @@ export interface VoiceConfig {
   // The model spoken turns run on, "provider/model"; empty means the chat's own.
   voiceModel?: string;
   pipelineMode?: "parallel" | "sequential";
-  // False with no speech synthesis (runtime "none"): the page can listen, but replies are not spoken.
-  speech?: boolean;
+  // The extension voice mode listens and speaks through, by its package's name; "" for none.
+  provider: string;
+  // Its label, while its server half runs.
+  label?: string;
+  // Whether it can be used now.
+  ready: boolean;
+  // False where it recognises speech alone: the page can listen, but replies are not spoken.
+  speech: boolean;
+  // The voices it offers now, which an agent's voice is chosen from.
+  voices: { id: string; name: string; builtIn?: boolean }[];
+  // Voice mode is on while it has a source.
+  enabled: boolean;
+  // Whether voice mode, the spoken conversation, is offered: off leaves dictation, which only listens.
+  conversation: boolean;
   vad?: typeof DEFAULT_VAD;
-  enabled: boolean; lazyLoad?: boolean; managed?: boolean; whisperUrl: string; breezeUrl: string; instruction: string; voice?: string; language?: string; cfgScale?: number; runtime?: "breeze" | "audio-cpp" | "chatterbox" | "kokoro" | "none"; sttModel?: string; dictationModel?: string; dictationUrl?: string; exaggeration?: number; kokoroVoice?: string; speed?: number;
 }
+/** What the page saves of voice mode: whether a spoken conversation is offered and how it goes, whatever listens and speaks for it. */
+export interface VoiceModeSave { vad: typeof DEFAULT_VAD; responseInstructions: string; skipThinkingProviders?: string[]; voiceModel: string; conversation: boolean }
 
-export interface VoiceInstallStatus { available: boolean; state: string; busy: boolean; progress: string; error: string; choice?: VoiceChoice; /** The saved settings point at the managed service, whether or not its container is there. */ connected?: boolean; }
-/** The GPUs the voice container can use, as nvidia-smi reports them, and the combination that fits the one it would take. */
-export interface VoiceHardware { gpus: { index: number; uuid?: string; name: string; totalMiB: number | null; freeMiB: number | null }[]; source: string; error: string; /** False while nothing could be asked yet, so that no GPU is not yet the same as none. */ checked: boolean; /** The check found there is no GPU: what is suggested is speech recognition alone, on the CPU. */ cpuOnly: boolean; /** Cards the host lists that Docker cannot hand to a container: for voice there are none. */ unusable?: string[]; /** What recognition on the CPU has to run on. */ host: Host; selected: number | null; /** The UUID of the GPU chosen on the page, empty where none is, or the one chosen is no longer there. */ chosen: string; reserveMiB: number; suggestion: VoiceChoice; }
 /** Who is signed in, and how one signs in. */
 export interface AuthStatus {
   authRequired: boolean;
@@ -466,13 +548,6 @@ export const api = {
    */
   uploadFile: (sessionId: string, dir: string, file: File, name = file.name): Promise<{ path: string; size: number }> =>
     uploadBytes(`/api/sessions/${sessionId}/upload?path=${encodeURIComponent(dir)}&name=${encodeURIComponent(name)}`, file, name),
-  voiceInstallStatus: () => json<VoiceInstallStatus>('/api/voice/install'),
-  // `choice` is for install: the engines to build for. Without it an install keeps what is installed, or picks for the GPU.
-  voiceAction: (action: 'install' | 'start' | 'stop', choice?: VoiceChoice) => json<{ok:boolean}>(`/api/voice/${action}`, {method:'POST', ...(choice ? {body: JSON.stringify(choice)} : {})}),
-  voiceHardware: () => json<VoiceHardware>('/api/voice/hardware'),
-  /** Removes the voice container and puts the settings back; `removeData` deletes the downloaded engines and models too. */
-  uninstallVoice: (removeData: boolean) => json<{ok:boolean}>('/api/voice/uninstall', {method:'POST', body: JSON.stringify({removeData})}),
-  connectVoice: () => json<VoiceConfig>('/api/voice/connect', {method:'POST'}),
   /** What was said in `samples` (16 kHz mono), in words, and how long the speech server says it took. Dictation may be set to use another model than voice mode. */
   transcribe: async (sessionId: string, samples: Float32Array, signal?: AbortSignal, purpose?: "dictation"): Promise<{ text: string; serverTiming: string }> => {
     const res = await send(`/api/sessions/${sessionId}/voice/transcribe${purpose ? `?purpose=${purpose}` : ""}`, { method: "POST", headers: { "Content-Type": "audio/wav" }, body: samplesWav(samples), signal });
@@ -480,9 +555,10 @@ export const api = {
     if (!res.ok) throw new ApiError(body.error || t("Transcription failed"), res.status, body);
     return { text: String(body.text ?? ""), serverTiming: res.headers.get("server-timing") ?? "" };
   },
-  setVoiceGpu: (gpu: string) => json<{ selected: string; restarting: boolean }>('/api/voice/gpu', { method: 'PUT', body: JSON.stringify({ gpu }) }),
   voice: () => json<VoiceConfig>("/api/voice"),
-  setVoice: (value: VoiceConfig) => json<VoiceConfig>("/api/voice", { method: "PUT", body: JSON.stringify(value) }),
+  setVoice: (value: VoiceModeSave) => json<VoiceConfig>("/api/voice", { method: "PUT", body: JSON.stringify(value) }),
+  /** Voice mode stops using its source: it is off until an extension's page chooses one again. */
+  stopVoiceSource: () => json<VoiceConfig>("/api/voice/provider", { method: "DELETE" }),
   /** `setup`: no password has been chosen yet, so the page asks for one. `oidc`: a single sign-on provider is offered too. */
   authStatus: () => json<AuthStatus>("/api/auth/status"),
   login: (password: string) =>
@@ -503,7 +579,8 @@ export const api = {
       body: JSON.stringify({ current, settings, only }),
     }),
   workspaces: () => json<{ root: string; workspaces: Workspace[] }>("/api/workspaces"),
-  sessions: () => json<{ sessions: Session[]; executor: string }>("/api/sessions"),
+  /** With what is installed and where its server halves stand, as a revision that changes whenever either does: see EXTENSIONS_CHANGED. */
+  sessions: () => json<{ sessions: Session[]; executor: string; extensions: string }>("/api/sessions"),
   /** Without a workspace the chat starts in the home of the agent New is set to. */
   createSession: (workspace?: string, title?: string) =>
     json<Session>("/api/sessions", {
@@ -518,17 +595,17 @@ export const api = {
     ),
   /**
    * `toolsOff`: the tools its chats start with off, as for setProjectTools. `toolsError` says the project was made without them.
-   * `link`: the agent it works with (none is a blank slate) and whether Understory is its memory (the default where the portal has it).
+   * `link`: the agent it works with (none is a blank slate) and whether the memory an extension holds is its memory (the default where one holds it).
    */
-  createProject: (name: string, instructions?: string, toolsOff?: string[], link?: { agent?: string; understory?: boolean }) =>
+  createProject: (name: string, instructions?: string, toolsOff?: string[], link?: { agent?: string; memory?: boolean }) =>
     json<Project & { toolsError?: string }>("/api/projects", {
       method: "POST",
       body: JSON.stringify({ name, instructions, toolsOff, ...link }),
     }),
-  /** The agent a project works with (null: none), whether Understory is its memory, and whether the portal has Understory at all. */
+  /** The agent a project works with (null: none), whether the memory an extension holds is its memory, and whether one holds it at all. */
   projectAgent: (name: string) => json<ProjectAgent>(`/api/projects/${encodeURIComponent(name)}/agent`),
   /** Either may be left out and then stays; `agent: null` makes the project a blank slate. */
-  setProjectAgent: (name: string, change: { agent?: string | null; understory?: boolean }) =>
+  setProjectAgent: (name: string, change: { agent?: string | null; memory?: boolean }) =>
     json<ProjectAgent>(`/api/projects/${encodeURIComponent(name)}/agent`, { method: "PUT", body: JSON.stringify(change) }),
   projectContents: (name: string) => json<ProjectContents>(`/api/projects/${encodeURIComponent(name)}`),
   projectInstructions: (name: string) =>
@@ -577,6 +654,24 @@ export const api = {
     }),
   renameSession: (id: string, title: string) =>
     json<Session>(`/api/sessions/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+  /** The modes the chat may be put in: none where it may not choose one. */
+  chatModes: (id: string) => json<{ modes: ChatMode[] }>(`/api/sessions/${id}/modes`),
+  /** Puts a chat that has said nothing yet in a mode; `confirmed`, for one that asks first, once the person said yes. */
+  setMode: (id: string, mode: string, confirmed?: boolean) =>
+    json<{ mode: string }>(`/api/sessions/${id}/modes`, { method: "PUT", body: JSON.stringify({ mode, ...(confirmed ? { confirmed: true } : {}) }) }),
+  /** The modes the person made, by their names. */
+  customModes: () => json<{ modes: CustomMode[] }>("/api/chat-modes"),
+  createMode: (fields: { label: string; description: string }) =>
+    changesModes(json<CustomMode>("/api/chat-modes", { method: "POST", body: JSON.stringify(fields) })),
+  /** Changes what a mode says: only what `patch` names. */
+  updateMode: (id: string, patch: Partial<Omit<CustomMode, "id" | "createdAt" | "updatedAt">>) =>
+    changesModes(json<CustomMode>(`/api/chat-modes/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(patch) })),
+  deleteMode: (id: string) => changesModes(json<{ ok: true }>(`/api/chat-modes/${encodeURIComponent(id)}`, { method: "DELETE" })),
+  /** What every chat in a mode starts with: its exceptions to Settings → Tools, `live` always false. */
+  modeTools: (id: string) =>
+    json<{ tools: PortalTool[]; live: boolean; off: string[]; names: Record<string, string> }>(`/api/chat-modes/${encodeURIComponent(id)}/tools`),
+  setModeTools: (id: string, off: string[]) =>
+    changesModes(json<{ off: string[]; applied: number }>(`/api/chat-modes/${encodeURIComponent(id)}/tools`, { method: "PUT", body: JSON.stringify({ off }) })),
   deleteSession: (id: string) => json<{ ok: true }>(`/api/sessions/${id}`, { method: "DELETE" }),
   prompt: (id: string, message: string, options?: PromptOptions) =>
     json<{ ok: true }>(`/api/sessions/${id}/prompt`, {
@@ -743,166 +838,22 @@ export const api = {
     json<{ ok: true }>(`/api/skills/${encodeURIComponent(name)}`, { method: "DELETE" }),
 
   people: () => json<{ people: Person[] }>("/api/people"),
-  browser: () => json<BrowserStatus>("/api/browser"),
-  installBrowser: () => json<{ ok: true }>("/api/browser/install", { method: "POST" }),
-  startBrowser: () => json<{ ok: true }>("/api/browser/start", { method: "POST" }),
-  stopBrowser: () => json<{ ok: true }>("/api/browser/stop", { method: "POST" }),
-  removeBrowser: (forgetProfile = false) =>
-    json<{ ok: true }>(`/api/browser/install${forgetProfile ? "?profile=forget" : ""}`, {
-      method: "DELETE",
-    }),
-  setBrowserConfig: (patch: { user?: string; password?: string }) =>
-    json<{ user: string; hasPassword: boolean }>("/api/browser/config", {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    }),
-  suggestBrowserPassword: () =>
-    json<{ password: string }>("/api/browser/suggest-password"),
-  features: () => json<Features>("/api/features"),
-  /** The subagent tool alone: nothing of Understory or Docker asked for. */
-  subagentFeature: () => json<{ subagent: SubagentFeature }>("/api/features/subagent"),
-  /** Image generation alone: nothing of Understory or Docker asked for. */
-  imagesFeature: () => json<{ images: ImagesFeature }>("/api/features/images"),
-  /** Video generation alone, as images are. */
-  videosFeature: () => json<{ videos: VideosFeature }>("/api/features/videos"),
-  /**
-   * Only whether each is on — cheap, for the sidebar and the chat's menus.
-   * `images`: image generation is on and has an address, which is when the Media page is in the sidebar; `videos` is the same for videos.
-   */
-  featureFlags: () => json<{ subagent: { enabled: boolean }; understory: { enabled: boolean }; images?: { enabled: boolean }; videos?: { enabled: boolean } }>("/api/features/flags"),
-  /** What a chat's subagents run on: its own choice (null follows `default`). */
-  subagentModel: (id: string) => json<{ model: string | null; default: string }>(`/api/sessions/${id}/subagent-model`),
-  setSubagentModel: (id: string, model: string | null) =>
-    json<{ model: string | null; default: string }>(`/api/sessions/${id}/subagent-model`, { method: "PUT", body: JSON.stringify({ model }) }),
-  memoryTree: () => json<MemoryNode>("/api/memory/tree"),
-  memoryConcept: (path: string) => json<MemoryConcept>(`/api/memory/concept?${new URLSearchParams({ path })}`),
-  memorySearch: (q: string) => json<MemoryHit[]>(`/api/memory/search?${new URLSearchParams({ q })}`),
-  memoryLog: () => json<MemoryChange[]>("/api/memory/log"),
-  memoryGraph: () => json<MemoryGraph>("/api/memory/graph"),
-  memoryTraces: () => json<MemoryTrace[]>("/api/memory/traces"),
-  /** One run with its steps, and the full paths of the notes each touched. */
-  memoryTrace: (id: string) => json<MemoryTraceRun>(`/api/memory/trace?${new URLSearchParams({ id })}`),
-  memoryValidate: () => json<MemoryValidation>("/api/memory/validate"),
-  /** Whether notes can be changed here: only in the Understory the portal runs. */
-  memoryHealth: () => json<{ writable: boolean; health?: MemoryHealth }>("/api/memory/health"),
-  saveMemoryNote: (path: string, frontmatter: Record<string, unknown>, body: string) =>
-    json<{ concept: MemoryConcept; health: MemoryHealth }>("/api/memory/concept", { method: "PUT", body: JSON.stringify({ path, frontmatter, body }) }),
-  deleteMemoryNote: (path: string) =>
-    json<{ health: MemoryHealth }>(`/api/memory/concept?${new URLSearchParams({ path })}`, { method: "DELETE" }),
-  reindexMemory: () => json<{ pruned: string[]; reindexed: number; health: MemoryHealth }>("/api/memory/reindex", { method: "POST" }),
-  /** The model mends links to nothing and wires in orphans; `ran` is false when there were none. */
-  repairMemory: () =>
-    json<{ ran: boolean; reason?: string; summary?: string; filesChanged?: string[]; health: MemoryHealth }>("/api/memory/repair", { method: "POST" }),
-  clearMemoryLog: () => json<{ health: MemoryHealth }>("/api/memory/clear-log", { method: "POST" }),
-  /** Every note gone, the index and log empty: the memory from nothing. */
-  wipeMemory: () => json<{ health: MemoryHealth }>("/api/memory/wipe", { method: "POST" }),
-  /** The librarian's answer to a conversation, as the stream it comes in: the caller reads the body. */
-  askLibrarian: async (messages: ChatMessage[], signal: AbortSignal): Promise<Response> => {
-    const res = await send("/api/memory/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages }), signal });
-    if (!res.ok || !res.body) {
-      const body = await res.json().catch(() => ({}));
-      throw new ApiError(body.error || `HTTP ${res.status}`, res.status, body);
-    }
-    return res;
-  },
-  setSubagentFeature: (patch: { enabled?: boolean; mode?: SubagentMode; maxParallel?: number; model?: string }) =>
-    json<{ subagent: SubagentFeature; reloaded: number; waiting: number }>("/api/features/subagent", {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    }),
-  /** `changed`: the agent got or lost a tool, which chats have from their next load. */
-  setImagesFeature: (patch: ImagesFeaturePatch) =>
-    json<{ images: ImagesFeature; changed: boolean; reloaded: number; waiting: number }>("/api/features/images", {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    }),
-  /** `changed`: the agent got or lost its video tools, which chats have from their next load. */
-  setVideosFeature: (patch: VideosFeaturePatch) =>
-    json<{ videos: VideosFeature; changed: boolean; reloaded: number; waiting: number }>("/api/features/videos", {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    }),
-  /** A page of the clips, newest first; `before` is the `next` of the page before. */
-  videoPage: (query: { origin?: VideoOrigin; kind?: VideoKind; before?: string; limit?: number; again?: boolean } = {}) => {
-    const params = new URLSearchParams();
-    for (const [name, value] of Object.entries(query)) if (value !== undefined && value !== false) params.set(name, value === true ? "1" : String(value));
-    return json<VideoPage>(`/api/videos${params.size ? `?${params}` : ""}`);
-  },
-  /** Some clips by their ids, as far as they are there. */
-  galleryVideos: (ids: string[]) => json<{ videos: GalleryVideo[] }>(`/api/videos?ids=${ids.join(",")}`),
-  /** What is being made, and what was, with the most that run at once. */
-  videoJobs: () => json<{ jobs: VideoJob[]; limit: number }>("/api/videos/jobs"),
-  /** Stops a clip that is being made, or clears one that is done. */
-  stopVideoJob: (id: string) => json<{ ok: true }>(`/api/videos/jobs/${id}`, { method: "DELETE" }),
-  /** One job for each clip; answers at once. */
-  makeVideos: (request: VideoRequest) => json<{ jobs: VideoJob[] }>("/api/videos/generate", { method: "POST", body: JSON.stringify(request) }),
-  /** The clip as the file it is, which a player asks for in parts. Its address never changes what it shows, unless it is in a chat's folder, which the browser then asks about. */
-  videoFileUrl: (id: string) => `/api/videos/${id}/file`,
-  /** The poster picture of a clip, for the clips the gallery says can have one (`GalleryVideo.poster`). */
-  videoPosterUrl: (id: string) => `/api/videos/${id}/poster`,
-  /** The playable copy of a clip a browser does not play, once it is made. */
-  videoCopyUrl: (id: string) => `/api/videos/${id}/copy`,
-  /** Makes it, when ffmpeg is there: answers when it is done, which takes a while for a long clip. */
-  makeVideoCopy: (id: string) => json<{ ok: true }>(`/api/videos/${id}/copy`, { method: "POST" }),
-  /** Each as asked, files and all: what could not be deleted is said for each. */
-  deleteVideos: (ids: string[]) => json<{ deleted: string[]; failed: { id: string; error: string }[] }>("/api/videos/delete", { method: "POST", body: JSON.stringify({ ids }) }),
-  /** A page of the gallery, newest first; `before` is the `next` of the page before. */
-  galleryPage: (query: { origin?: PictureOrigin; kind?: PictureKind; before?: string; limit?: number; again?: boolean } = {}) => {
-    const params = new URLSearchParams();
-    // `again` is a switch the server reads as 1: the page asks again for a list it has, and the files are not looked through again at once.
-    for (const [name, value] of Object.entries(query)) if (value !== undefined && value !== false) params.set(name, value === true ? "1" : String(value));
-    return json<GalleryPage>(`/api/images${params.size ? `?${params}` : ""}`);
-  },
-  /** Some pictures of the gallery by their ids, as far as they are there. */
-  galleryPictures: (ids: string[]) => json<{ pictures: GalleryPicture[] }>(`/api/images?ids=${ids.join(",")}`),
-  /** What is being made, and what was, with the most that run at once. */
-  pictureJobs: () => json<{ jobs: PictureJob[]; limit: number }>("/api/images/jobs"),
-  /** Stops a picture that is being made, or clears one that is done. */
-  stopPictureJob: (id: string) => json<{ ok: true }>(`/api/images/jobs/${id}`, { method: "DELETE" }),
-  /** One job for each picture; answers at once. */
-  makePictures: (request: PictureRequest) => json<{ jobs: PictureJob[] }>("/api/images/generate", { method: "POST", body: JSON.stringify(request) }),
-  /** One job for each change; answers at once. */
-  changePicture: (request: ChangeRequest) =>
-    json<{ jobs: PictureJob[] }>("/api/images/edit", { method: "POST", body: JSON.stringify(request) }),
-  /** A picture from this computer, into the gallery to be changed. */
-  uploadPicture: async (file: File): Promise<GalleryPicture> => (await uploadBytes(`/api/images/upload?name=${encodeURIComponent(file.name)}`, file, file.name)).picture,
-  /** The picture as the file it is. Its address never changes what it shows, unless it is in a chat's folder, which the browser then asks about. */
-  galleryFileUrl: (id: string) => `/api/images/${id}/file`,
-  /** The small copy of a picture, which the portal makes when it is asked for; for the pictures the gallery says have one (`GalleryPicture.thumb`). */
-  galleryThumbUrl: (id: string) => `/api/images/${id}/thumb`,
-  /** Each as asked, files and all: what could not be deleted is said for each. */
-  deletePictures: (ids: string[]) => json<{ deleted: string[]; failed: { id: string; error: string }[] }>("/api/images/delete", { method: "POST", body: JSON.stringify({ ids }) }),
-  setUnderstoryConfig: (config: { llm: UnderstoryLlmChoice; dreamInterval: string; dreamAt: string }) =>
-    json<{ understory: UnderstoryFeature }>("/api/features/understory/config", { method: "PUT", body: JSON.stringify(config) }),
-  dreamUnderstory: () => json<{ understory: UnderstoryFeature }>("/api/features/understory/dream", { method: "POST" }),
-  installUnderstory: () =>
-    json<{ understory: UnderstoryFeature; reloaded: number; waiting: number }>("/api/features/understory/install", { method: "POST" }),
-  understoryAction: (action: "start" | "stop") =>
-    json<{ understory: UnderstoryFeature }>(`/api/features/understory/${action}`, { method: "POST" }),
-  removeUnderstory: (forgetMemory = false) =>
-    json<{ understory: UnderstoryFeature; reloaded: number; waiting: number }>(
-      `/api/features/understory/install${forgetMemory ? "?memory=forget" : ""}`,
-      { method: "DELETE" },
-    ),
-  setUnderstoryFeature: (patch: { enabled: boolean; url?: string }) =>
-    json<{ understory: UnderstoryFeature; reloaded: number; waiting: number }>("/api/features/understory", {
-      method: "PUT",
-      body: JSON.stringify(patch),
-    }),
-  connectBrowser: () =>
-    json<{ connectedAs: string | null }>("/api/browser/connect", { method: "POST" }),
-  disconnectBrowser: () =>
-    json<{ connectedAs: string | null }>("/api/browser/connect", { method: "DELETE" }),
+  /** What holds the agent's memory, by its label, where something does — cheap, for the Projects page. */
+  featureFlags: () => json<{ memory: { held: boolean; by: string | null } }>("/api/features/flags"),
   sandbox: () => json<SandboxState>("/api/sandbox"),
+  guard: () => json<GuardState>("/api/guard"),
+  setGuardServer: (name: string, trusted: boolean) =>
+    json<{ name: string; trusted: boolean }>(`/api/guard/servers/${encodeURIComponent(name)}`, { method: "PUT", body: JSON.stringify({ trusted }) }),
+  setGuardRoutine: (id: string, exempt: string[]) =>
+    json<{ id: string; exempt: string[] }>(`/api/guard/routines/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ exempt }) }),
+  revokeApproval: (id: string) => json<{ ok: true }>(`/api/guard/approvals/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  /** The sites the agent's tools may reach: one domain per line, empty for any site. */
+  setGuardAllowlist: (domains: string) =>
+    json<{ allowlist: string }>("/api/guard/allowlist", { method: "PUT", body: JSON.stringify({ domains }) }),
+  untrustResult: (sessionId: string, id: string) =>
+    json<{ ok: true }>(`/api/guard/trusted/${encodeURIComponent(sessionId)}/${encodeURIComponent(id)}`, { method: "DELETE" }),
   setSandbox: (policy: SandboxPolicy) =>
     json<{ policy: SandboxPolicy; report: SandboxReport; chats: { reloaded: number; waiting: number } }>("/api/sandbox", { method: "PUT", body: JSON.stringify(policy) }),
-  setBrowserCursor: (on: boolean) =>
-    json<{ cursor: boolean }>("/api/browser/cursor", { method: "PUT", body: JSON.stringify({ on }) }),
-  setBrowserAllowlist: (domains: string) =>
-    json<{ allowlist: string }>("/api/browser/allowlist", {
-      method: "PUT",
-      body: JSON.stringify({ domains }),
-    }),
 
   audit: (limit = 200) => json<{ entries: AuditEntry[] }>(`/api/audit?limit=${limit}`),
   /** Up to and including `through`, the newest entry the caller has seen. */
@@ -980,7 +931,6 @@ export const api = {
       enabled?: boolean;
       freshSession?: boolean;
       guard?: boolean;
-      browser?: boolean;
       reportChannel?: string | null;
       reportTarget?: string | null;
       workspace?: string | null;
@@ -1017,8 +967,8 @@ export const api = {
   agentSkill: (agent: string, skill: string) =>
     json<{ content: string }>(`/api/agents/${encodeURIComponent(agent)}/skills/${encodeURIComponent(skill)}`),
   agentSetup: (agent: string) => json<AgentSetup>(`/api/agents/${encodeURIComponent(agent)}/setup`),
-  /** The avatar voice mode shows for a chat: its agent's. */
-  chatOrb: (session: string) => json<OrbStyle>(`/api/agent/orb?session=${encodeURIComponent(session)}`),
+  /** The agent a chat is with, and the avatar voice mode shows for it. */
+  chatAvatar: (session: string) => json<{ agent: { id: string; name: string }; orb: OrbStyle }>(`/api/agent/avatar?session=${encodeURIComponent(session)}`),
   /** An agent's avatar: the voice-mode orb's look and personality. */
   setAgentOrb: (agent: string, style: OrbStyle) =>
     json<OrbStyle>(`/api/agents/${encodeURIComponent(agent)}/orb`, { method: "PUT", body: JSON.stringify(style) }),
@@ -1062,15 +1012,6 @@ export const api = {
 
   /** Jobs the agent left running in the chat's folder, and what extensions show about themselves. */
   background: (id: string) => json<BackgroundState>(`/api/sessions/${id}/background`),
-  /** A message for a subagent that said it takes them (subagent protocol, input: true). */
-  subagentInput: (id: string, agent: string, text: string) =>
-    json<{ ok: true }>(`/api/sessions/${id}/subagents/${encodeURIComponent(agent)}/input`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    }),
-  subagentStop: (id: string, agent: string) =>
-    json<{ ok: true }>(`/api/sessions/${id}/subagents/${encodeURIComponent(agent)}/stop`, { method: "POST" }),
 
   /** Cheap: never starts pi. Stats are null when the session is not live. */
   config: (id: string) => json<PiConfig>(`/api/sessions/${id}/config`),
@@ -1106,7 +1047,7 @@ export const api = {
     json<{ ok: true }>(`/api/sessions/${id}/draft`, { method: "PUT", body: JSON.stringify({ text, caret }) }),
   piSettings: () => json<{ path: string; content: string }>("/api/pi-settings"),
   savePiSettings: (content: string) =>
-    json<{ ok: true; path: string; note: string }>("/api/pi-settings", {
+    json<{ ok: true; path: string }>("/api/pi-settings", {
       method: "PUT",
       body: JSON.stringify({ content }),
     }),
@@ -1185,6 +1126,8 @@ export const api = {
     json<{ extensions: ExtensionInfo[]; settingsPath: string }>("/api/extensions"),
   /** What comes with the portal and can be installed with a click. */
   shippedExtensions: () => json<{ extensions: ShippedExtension[] }>("/api/extensions/shipped"),
+  /** What installing `spec` brings with it: the extensions it requires that are not there as it needs them. */
+  installPlan: (spec: string) => json<InstallPlan>(`/api/extensions/plan?${new URLSearchParams({ spec })}`),
   setExtensionSetting: (key: string, value: unknown) =>
     json<{ ok: true }>("/api/extensions/settings", {
       method: "PUT",
@@ -1212,8 +1155,11 @@ export const api = {
     })),
   updatePackages: () =>
     changesExtensions(json<{ ok: true; output: string }>("/api/packages/update", { method: "POST" })),
-  /** The installed extensions that bring an interface: see extensions/loader.ts. */
-  extensionUi: () => json<{ extensions: ExtensionUi[] }>("/api/extension-ui"),
+  /** The installed extensions that bring an interface (see extensions/loader.ts), with what is installed as GET /api/sessions says it (`revision`), as it was when this list was made. */
+  extensionUi: () => json<{ extensions: ExtensionUi[]; revision: string }>("/api/extension-ui"),
+  /** Tells the portal that an extension's browser half, at revision `rev`, failed in this page, and where: its `clientError` and `clientStack` from then on. */
+  extensionFailed: (name: string, rev: string, error: string, stack?: string) =>
+    json<{ ok: true }>("/api/extension-ui/failures", { method: "POST", body: JSON.stringify({ name, rev, error, stack }) }),
   /** What an extension's server half would tell a page that opens the chat now: for a browser half that came into the page later. */
   extensionOpening: (id: string, extension: string) => json<{ pushes: unknown[] }>(`/api/sessions/${id}/extension-ui?extension=${encodeURIComponent(extension)}`),
   /** What an extension's browser half says to its own half in a chat: see extensions/channel.ts. */
@@ -1356,6 +1302,11 @@ export interface ExtensionInfo {
   filtered?: boolean;
   /** What it brings: something for pi (the agent), something the portal draws or runs, colours for the portal. */
   kinds?: PackageKind[];
+  /**
+   * The extension whose own data folder it is in, however it was installed; and the note that extension gave and when,
+   * where it installed it itself.
+   */
+  installedFrom?: { extension: string; note?: string; at?: string };
 }
 
 export type PackageKind = "pi" | "pithagoras" | "themes";
@@ -1367,6 +1318,33 @@ export interface ShippedExtension {
   description?: string;
   kinds: PackageKind[];
   spec: string;
+  /** The extensions it cannot work without, each with the versions it takes. */
+  requires?: Record<string, string>;
+}
+
+/**
+ * Something an extension being installed needs that is not there as it is needed (see install-plan.ts on the
+ * server): installed first by `spec`, from the portal's own folder or npm, or switched on; or said, where it is
+ * nowhere in a version taken (`missing`, with `error` where npm could not be asked) or is there in a `version` not
+ * taken (installed, or, with `from`, the one in the portal's own folder or the one installed from npm for another).
+ */
+export interface InstallNeed {
+  name: string;
+  range: string;
+  /** The extension that needs it. */
+  for: string;
+  action: "install" | "switch-on" | "missing" | "version";
+  spec?: string;
+  from?: "shipped" | "npm";
+  version?: string;
+  error?: string;
+}
+
+/** What installing a spec brings with it, each need before what needs it. Without a name, nothing could be known beforehand. */
+export interface InstallPlan {
+  name?: string;
+  version?: string;
+  needs: InstallNeed[];
 }
 
 export interface GlobalSettings {
@@ -1566,489 +1544,6 @@ export interface AuditEntry {
   session_id: string | null;
 }
 
-/** The agent's browser, and who may drive it. */
-export type SubagentMode = "interrupt" | "background";
-
-/** The subagent tool the portal ships, off until switched on. */
-export interface SubagentFeature {
-  /** This install carries it. */
-  available: boolean;
-  installed: boolean;
-  enabled: boolean;
-  /** How pi's packages list names it. */
-  source: string | null;
-  mode: SubagentMode;
-  /** How many may run at once, across every chat. */
-  maxParallel: number;
-  /** The most that may be set. */
-  maxParallelLimit?: number;
-  /** What they run on unless a chat says: "auto", the model the chat is on, or "provider/model". */
-  model: string;
-}
-
-/** Image generation as the page is told it: never the key, only whether one is set. */
-export interface ImagesFeature {
-  enabled: boolean;
-  /** The API's base, such as https://host/v1. */
-  baseUrl: string;
-  model: string;
-  /** "1024x1024" or empty for the endpoint's own. */
-  size: string;
-  keySet: boolean;
-  /** Editing a picture has a switch of its own: not every endpoint that makes pictures changes them. */
-  editEnabled: boolean;
-  /** Where edits go; empty is the address above. */
-  editBaseUrl: string;
-  /** Empty sends no model: the model above is not taken for editing. */
-  editModel: string;
-  /** The edit endpoint takes several pictures, so edit_image has a list; off until said, and off again when edits move to another server. */
-  editMultiple: boolean;
-  /** "2048x2048", the most pixels a picture sent to be edited may have, or empty for no limit. */
-  editMaxSize: string;
-  editKeySet: boolean;
-  /** How long a request for a picture, made or edited, may take, in whole seconds. */
-  timeoutSeconds: number;
-  /** Whether pictures can be made: switched on, and with an address to ask. The portal says it, so that the page does not work it out again. */
-  ready: boolean;
-  /** Whether the agent has an edit tool: switched on, and with an address to ask. */
-  editReady: boolean;
-  /** The endpoint is stable-diffusion.cpp's server: the page shows, and sends, the settings that only it reads. Off by default. */
-  sdExtras: boolean;
-}
-
-/** Made on the page, made by the agent in a chat, or found in a folder the agent's tools write into, with no chat to name. */
-export type PictureOrigin = "page" | "chat" | "folder";
-/** Made from a description, changed from another picture, put in by the person to be changed, or found with nothing to tell how it was made. */
-export type PictureKind = "generated" | "edited" | "uploaded" | "unknown";
-
-/** A picture of the gallery, as the portal tells of it. */
-export interface GalleryPicture {
-  id: string;
-  origin: PictureOrigin;
-  /** The chat whose agent made it, for the agent's pictures. */
-  chat: { id: string; title: string } | null;
-  /** The folder it was found in, for one that was found: Home, or the project's name or the way to the folder under the workspace root. */
-  folder: { name: string; home: boolean } | null;
-  kind: PictureKind;
-  prompt: string;
-  /** What it was asked for with, as far as that is known. */
-  params: {
-    model?: string;
-    size?: string;
-    outputFormat?: OutputFormat;
-    outputCompression?: number;
-    /** The ones that only stable-diffusion.cpp's server reads. */
-    negativePrompt?: string;
-    seed?: number;
-    sampleSteps?: number;
-    strength?: number;
-    fromNoise?: boolean;
-    /** Fields an older version of the page sent as typed; shown, not sent again. */
-    extra?: Record<string, string | number | boolean>;
-    sources?: string[];
-    masked?: boolean;
-  };
-  /** The picture an edit was made from, when that one is in the gallery. */
-  from: string | null;
-  createdAt: number;
-  bytes: number;
-  fileName: string;
-  /** The tiles load a small copy of it (see `galleryThumbUrl`), and not the file. */
-  thumb: boolean;
-}
-
-export interface GalleryPage {
-  pictures: GalleryPicture[];
-  /** Where the next page starts, or null at the end. */
-  next: string | null;
-  /** How many there are with the filters, and how much of the disk the page's own take. */
-  total: number;
-  pageBytes: number;
-}
-
-/** A picture that is being made, was, or was not. */
-export interface PictureJob {
-  id: string;
-  kind: "generate" | "edit";
-  state: "running" | "done" | "failed";
-  prompt: string;
-  size?: string;
-  /** An edit's first picture. */
-  from?: string;
-  startedAt: number;
-  finishedAt?: number;
-  pictureId?: string;
-  /** What was done to a picture to make it fit an edit (scaled down, compressed), when something was. */
-  notes?: string[];
-  error?: string;
-}
-
-/** The file formats of the OpenAI image format. */
-export type { OutputFormat };
-
-/**
- * What the page asks of the portal for one picture beyond its description, and
- * only what is set. Model, size, format and compression are fields of the
- * OpenAI image format; the rest are not, and reach only an endpoint that is
- * stable-diffusion.cpp's server, in the prompt (see image-settings.ts on the portal).
- */
-export interface PictureSettingsBody {
-  model?: string;
-  /** `1024x1024`. */
-  size?: string;
-  outputFormat?: OutputFormat;
-  /** With jpeg or webp. */
-  outputCompression?: number;
-  negativePrompt?: string;
-  seed?: number;
-  sampleSteps?: number;
-  /** For a change only. */
-  strength?: number;
-  /** For a change only: from noise, with the pictures as references; no strength and no mask then. */
-  fromNoise?: boolean;
-}
-
-/** What the page asks the portal to make. */
-export interface PictureRequest extends PictureSettingsBody {
-  prompt: string;
-  count?: number;
-}
-
-/** What the page asks the portal to change: `mask` is a PNG as base64, and the transparent part is what changes. */
-export interface ChangeRequest extends PictureSettingsBody {
-  prompt: string;
-  sources: string[];
-  mask?: string;
-  count?: number;
-}
-
-/** What the page may change of it. A key left out keeps the saved one; "" takes it away. */
-export interface ImagesFeaturePatch {
-  enabled?: boolean;
-  baseUrl?: string;
-  model?: string;
-  size?: string;
-  apiKey?: string;
-  editEnabled?: boolean;
-  editBaseUrl?: string;
-  editModel?: string;
-  editApiKey?: string;
-  editMultiple?: boolean;
-  editMaxSize?: string;
-  /** null takes a saved limit away: the default again. */
-  timeoutSeconds?: number | null;
-  sdExtras?: boolean;
-}
-
-/** Video generation as the page is told it: never the key, only whether one is set. */
-export interface VideosFeature {
-  enabled: boolean;
-  /** How the endpoint is spoken to: one of `backends`. */
-  backend: string;
-  backends: { id: string; label: string }[];
-  /** The API's base, such as http://host:1234. */
-  baseUrl: string;
-  model: string;
-  /** "832x480" or empty for the endpoint's own. */
-  size: string;
-  /** How many frames a clip has, and how fast they play, when the form says nothing; none for the endpoint's own. */
-  frames: number | null;
-  fps: number | null;
-  keySet: boolean;
-  /** How long a clip may take in all, in whole seconds. */
-  timeoutSeconds: number;
-  /** The most the page's own clips may take of the disk, in megabytes: 0 is no limit. */
-  storageLimitMb: number;
-  /** Whether clips can be made: switched on, and with an address to ask. The portal says it, so that the page does not work it out again. */
-  ready: boolean;
-}
-
-/** What the page may change of it. A key left out keeps the saved one; "" takes it away. */
-export interface VideosFeaturePatch {
-  enabled?: boolean;
-  backend?: string;
-  baseUrl?: string;
-  model?: string;
-  size?: string;
-  frames?: number | null;
-  fps?: number | null;
-  apiKey?: string;
-  /** null takes a saved limit away: the default again. */
-  timeoutSeconds?: number | null;
-  /** null takes the limit away. */
-  storageLimitMb?: number | null;
-}
-
-/** Made on the page, made by the agent in a chat, or found in a folder the agent's tool writes into, with no chat to name. */
-export type VideoOrigin = "page" | "chat" | "folder";
-/** Made from a description, made from a picture as its first frame, or found with nothing to tell how it was made. */
-export type VideoKind = "generated" | "animated" | "unknown";
-
-/** A clip of the gallery, as the portal tells of it. */
-export interface GalleryVideo {
-  id: string;
-  origin: VideoOrigin;
-  /** The chat whose agent made it, for the agent's clips. */
-  chat: { id: string; title: string } | null;
-  /** The folder it was found in, for one that was found: Home, or the project's name or the way to the folder under the workspace root. */
-  folder: { name: string; home: boolean } | null;
-  kind: VideoKind;
-  prompt: string;
-  /** What it was asked for with, as far as that is known; `madeFrames` and `madeFps` are what the server says it made. */
-  params: {
-    model?: string;
-    size?: string;
-    frames?: number;
-    fps?: number;
-    seed?: number;
-    sampleSteps?: number;
-    negativePrompt?: string;
-    strength?: number;
-    madeFrames?: number;
-    madeFps?: number;
-    /** A clip made from a picture: the picture of the gallery, or its path in the chat's folder. */
-    firstFrame?: { picture?: string; path?: string };
-    /** A clip made to end on a picture: named as the first frame is. */
-    lastFrame?: { picture?: string; path?: string };
-  };
-  createdAt: number;
-  bytes: number;
-  fileName: string;
-  /** The portal can make a poster picture of it (see `videoPosterUrl`). Only for a clip a browser plays. */
-  poster: boolean;
-  /** What the file is by its first bytes, and whether a browser plays it here: only a WebM and an MP4 are; any other is a file to download. */
-  format: VideoFormat;
-  /** For a clip that is not played as it is: a playable WebM copy of it is `ready`, or ffmpeg is there to make one on request (`available`). */
-  copy?: "ready" | "available";
-  /** Why the file could not be opened when the list was made, when it could not: out of reach (its folder or the file), or over the size a clip may have. Its format is then what is known of it without opening it. */
-  unavailable?: "unreachable" | "too_large";
-}
-
-export interface VideoFormat {
-  /** The kind, as a file extension: webm, mp4, mov, avi, webp, gif, mkv, ogg, or bin for one that is not known. */
-  id: string;
-  /** What a person is told it is: "AVI", "WebP", "EBML (foo)", "Unknown". */
-  label: string;
-  mimeType: string;
-  playable: boolean;
-}
-
-export interface VideoPage {
-  videos: GalleryVideo[];
-  /** Where the next page starts, or null at the end. */
-  next: string | null;
-  /** How many there are with the filters, and how much of the disk the page's own take. */
-  total: number;
-  pageBytes: number;
-}
-
-/** A clip that is being made, was, or was not. */
-export interface VideoJob {
-  id: string;
-  kind: "generate" | "animate";
-  state: "running" | "done" | "failed";
-  /** While it runs, and the server says: waiting its turn there, or being made. */
-  stage?: "waiting" | "making";
-  /** Which place in the server's queue, while it waits. */
-  queuePosition?: number;
-  prompt: string;
-  size?: string;
-  /** A clip made from a picture: the picture's id in the gallery. */
-  from?: string;
-  startedAt: number;
-  finishedAt?: number;
-  videoId?: string;
-  error?: string;
-}
-
-/** What the page asks the portal to make, and only what is set. */
-export interface VideoRequest {
-  prompt: string;
-  model?: string;
-  /** `832x480`. */
-  size?: string;
-  frames?: number;
-  fps?: number;
-  seed?: number;
-  sampleSteps?: number;
-  negativePrompt?: string;
-  strength?: number;
-  /** The picture of the gallery to start from. */
-  firstFrame?: string;
-  /** The picture of the gallery to end on, for a server that says it takes one. */
-  lastFrame?: string;
-  count?: number;
-}
-
-/** The model that keeps Understory's memory, as the page is told it: never the key. */
-export type UnderstoryLlm =
-  | { source: "auto" }
-  | { source: "provider"; provider: string; model: string }
-  | { source: "custom"; baseUrl: string; model: string; format: "openai" | "anthropic"; hasKey?: boolean };
-
-/** What the page sends for it: a custom key only when it is being changed. */
-export type UnderstoryLlmChoice =
-  | { source: "auto" }
-  | { source: "provider"; provider: string; model: string }
-  | { source: "custom"; baseUrl: string; model: string; format: "openai" | "anthropic"; apiKey?: string };
-
-/** The Understory the portal runs itself, in a container of its own. */
-export interface ManagedUnderstory {
-  /** The portal can reach Docker. */
-  available: boolean;
-  image: boolean;
-  /** "foreign": a container by that name the portal did not make, which it leaves alone. */
-  container: "absent" | "stopped" | "running" | "foreign";
-  pulling: { active: boolean; line: string; error?: string };
-  url: string;
-  /** `dreamAt`: once a day at this time ("03:00"), started by the portal; wins over the interval. */
-  config: { llm: UnderstoryLlm; dreamInterval: string; dreamAt: string };
-  /** "The chat's model" can be offered: not while the portal serves its own TLS. */
-  autoPossible: boolean;
-  /** Providers set up here that Understory can be pointed at. */
-  providers: { id: string; models: string[] }[];
-  /** A pass the portal started is running now. */
-  dreaming: boolean;
-  lastDream: { at: string; ok: boolean; ran?: boolean; said: string } | null;
-  nextDream: string | null;
-  /** The portal's time zone, which a set time is in. */
-  timeZone: string;
-}
-
-/** Understory as the agent's memory, over MCP. */
-export interface UnderstoryFeature {
-  enabled: boolean;
-  url: string;
-  /** MEMORY_UNDERSTORY_AUTH_TOKEN is set for the portal. */
-  tokenSet: boolean;
-  adapterInstalled: boolean;
-  /** Something answers at the address. */
-  reachable: boolean;
-  managed: ManagedUnderstory;
-  configError?: string;
-}
-
-/** A folder or a note in Understory's memory bundle. `reserved` are its own index and log. */
-export interface MemoryNode {
-  name: string;
-  path: string;
-  kind: "directory" | "concept" | "reserved";
-  type?: string;
-  title?: string;
-  description?: string;
-  children?: MemoryNode[];
-}
-
-export interface MemoryConcept {
-  path: string;
-  frontmatter: { type?: string; title?: string; description?: string; tags?: string[]; timestamp?: string; [key: string]: unknown };
-  body: string;
-}
-
-export interface MemoryHit {
-  path: string;
-  type?: string;
-  title?: string;
-  description?: string;
-  snippet?: string;
-}
-
-export interface MemoryChange {
-  date: string;
-  action: string;
-  summary: string;
-}
-
-export interface MemoryGraph {
-  nodes: { path: string; title?: string; type?: string; description?: string; links: number }[];
-  edges: { source: string; target: string }[];
-}
-
-/** A run of Understory's own agent over the memory: a question, a change it was asked for, or a chat. */
-export interface MemoryTrace {
-  id: string;
-  kind: string;
-  input: string;
-  startedAt: string;
-  durationMs?: number;
-  notation?: string;
-  usage?: { inputTokens?: number; outputTokens?: number };
-}
-
-/** One tool the agent used in a run: what it was (`search_knowledge`, `read_concept`, `write_concept`, …), and the full paths of the notes it found, read or wrote. */
-export interface MemoryTraceStep {
-  seq: number;
-  tool: string;
-  summary: string;
-  paths: string[];
-  /** A step that changed the memory. */
-  write?: boolean;
-}
-
-/** A run with its steps, which the list of runs leaves out. */
-export interface MemoryTraceRun extends MemoryTrace {
-  steps: MemoryTraceStep[];
-  outcome?: string;
-}
-
-/** What a change may have left behind in the memory: links to nowhere, notes nothing links to, what the format says. */
-export interface MemoryHealth {
-  healthy: boolean;
-  orphans: { path: string; title?: string }[];
-  brokenLinks: { path: string; target: string }[];
-  issues: { path: string; severity: string; message: string }[];
-}
-
-export interface MemoryValidation {
-  conformant: boolean;
-  conceptCount?: number;
-  directoryCount?: number;
-  issues: { path: string; severity: "error" | "warning"; message: string }[];
-}
-
-export interface Features {
-  subagent: SubagentFeature;
-  understory: UnderstoryFeature;
-  images: ImagesFeature;
-}
-
-export interface BrowserStatus {
-  running: boolean;
-  /** Running with no password on its web UI. */
-  unprotected: boolean;
-  /** The MCP server wiring the agent to this browser, if any. */
-  connectedAs: string | null;
-  /** How and whether a browser can run here at all. */
-  install: {
-    available: boolean;
-    /** "external": a browser the deployment runs itself, which the portal only looks at. */
-    mode?: "docker" | "local" | "external";
-    image: boolean;
-    container: "absent" | "stopped" | "running" | "unavailable";
-    binary?: string | null;
-    headless?: boolean;
-    pulling: { active: boolean; line: string; error?: string };
-  };
-  config: { user: string; hasPassword: boolean };
-  version: string | null;
-  pages: { title: string; url: string }[];
-  uiPort: string;
-  /** Does that port answer other machines? The page links to it only then. */
-  uiExposed: boolean;
-  /** A container made before the port was kept to one address: it answers every machine until it is installed again. */
-  uiOutdated: boolean;
-  allowlist: string;
-  /** Whether the browser tools glide a cursor to what they act on. */
-  cursor: boolean;
-  /** Is the browser wired up at all, whether or not it is running right now? */
-  configured: boolean;
-  /** Does a conversation that has never said anything about it get the browser? */
-  byDefault: boolean;
-  /** Only the conversations that disagree with that — see "Who may drive it". */
-  sessions: { id: string; title: string; kind: string; allowed: boolean }[];
-  routines: { slug: string; name: string }[];
-}
-
 /** A skill an agent wrote for itself, in its home's skills folder. */
 export interface AgentSkill {
   id: string;
@@ -2079,6 +1574,25 @@ export interface SandboxState {
   trustedDir: string;
   secretsDir: string;
   lastReport: SandboxReport | null;
+}
+
+/** Settings → Guard: what the guard holds the agent to, and what of it can be changed there. */
+export interface GuardState {
+  /** Whether pi runs with the guard here: not under the container executor. */
+  running: boolean;
+  sandbox: "on" | "off" | "unavailable";
+  /** Whether a primary user is named. */
+  primary: boolean;
+  /** Whether the routine reports' chat is set, which is where approvals are asked for. */
+  approvalsTo: boolean;
+  rules: { name: string; why: string }[];
+  /** The MCP servers, and whether each is counted as the person's own; the browser's never is. */
+  servers: { name: string; trusted: boolean; browser: boolean }[];
+  routines: { id: string; name: string; exempt: string[] }[];
+  /** The sites the agent's tools may reach, one domain per line; empty for any site. */
+  allowlist: string;
+  approvals: { id: string; sessionId: string; chat: string | null; tool: string; subject: string; expiresAt: string }[];
+  trusted: { sessionId: string; chat: string | null; results: { id: string; tool?: string; signals?: string[]; excerpt?: string }[] }[];
 }
 
 export type ProviderKind = "llama-cpp" | "llama-swap" | "ollama" | "openrouter" | "hosted" | "custom";

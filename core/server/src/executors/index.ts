@@ -32,10 +32,10 @@ export interface LaunchOptions {
   role?: string;
   /** Whoever is speaking, read at each tool call. */
   whoNow?: () => { role: string; key?: string };
-  /** False turns off the guard's taint rules for this session. */
-  enforceTaint?: boolean;
-  /** Read at each tool call, so a change takes effect without a restart. */
-  browserNow?: () => { allowed: boolean; allowlist: string[] };
+  /** The guard's taint rules this session is exempt from, by name, read at each tool call. */
+  exemptNow?: () => ReadonlySet<string>;
+  /** The sites the agent's tools may reach, read at each tool call, so a change takes effect without a restart. */
+  allowlistNow?: () => string[];
   /** Tools this conversation has switched off, by name. */
   toolsOff?: string[];
   /** The tools the portal has seen, for one that says it is off until switched on. */
@@ -44,12 +44,16 @@ export interface LaunchOptions {
   toolsLazy?: string[];
   /** What those tools are called as sets, for the hint to the model. */
   lazySets?: string[];
-  /** What its subagents run on, when it says: asked each time one starts. */
-  subagentModel?: () => string | undefined;
+  /** The code tool's presentation in a chat whose mode works through it: see codemode.ts. */
+  codemode?: "only";
+  /** Said after the portal's rules each time the prompt is built: the chat's mode's instructions. */
+  modeLines?: () => string[];
   /** The agent whose heartbeat this session is, when it is one: gives it the note tool. */
   heartbeatAgent?: string;
   /** Told the chat's model when a spoken turn is about to run on another. */
   rememberChatModel?: (provider: string, modelId: string) => void;
+  /** Whether a reload that is due may happen now, between two requests of a run: nothing goes on beside the run that it would cut off. */
+  canReloadNow?: () => boolean;
 }
 
 export interface Executor {
@@ -103,15 +107,17 @@ export class HostExecutor implements Executor {
       role: opts.role,
       sessionId: opts.sessionId,
       whoNow: opts.whoNow,
-      enforceTaint: opts.enforceTaint,
-      browserNow: opts.browserNow,
+      exemptNow: opts.exemptNow,
+      allowlistNow: opts.allowlistNow,
       toolsOff: opts.toolsOff,
       toolsSeen: opts.toolsSeen,
       toolsLazy: opts.toolsLazy,
       lazySets: opts.lazySets,
-      subagentModel: opts.subagentModel,
+      codemode: opts.codemode,
+      modeLines: opts.modeLines,
       heartbeatAgent: opts.heartbeatAgent,
       rememberChatModel: opts.rememberChatModel,
+      canReloadNow: opts.canReloadNow,
       provider: opts.provider,
       modelId: opts.model,
       thinkingLevel: opts.thinkingLevel,

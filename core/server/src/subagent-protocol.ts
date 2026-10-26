@@ -8,7 +8,7 @@
  *
  * Extension → portal:
  *
- *   subagent:v1:start  { id, label, toolCallId?, input?: boolean, stop?: boolean, detail?, detached?: boolean }
+ *   subagent:v1:start  { id, label, toolCallId?, input?: boolean, stop?: boolean, detail?, detached?: boolean, chat? }
  *   subagent:v1:event  { id, event }       one of the child's pi events, as
  *                                          `pi --mode json` or `--mode rpc` print them
  *   subagent:v1:end    { id, status: "done" | "error" | "stopped", error? }
@@ -20,11 +20,17 @@
  *
  * Asked by the extension, answered at once (the bus is synchronous):
  *
- *   subagent:v1:config { reply(config) }   config: { model?: "provider/model" | "auto" },
- *                                          what the chat says its subagents run on
+ *   subagent:v1:config { reply(config) }   config: { model?: "provider/model" | "auto" }. The portal
+ *                                          answers {}: what a chat's subagents run on is the
+ *                                          extension's to keep (extensions/subagent keeps it per
+ *                                          chat), so an extension that asks goes by its own default.
  *
  * `detached`: it runs on after the tool call that started it has returned (a
  * subagent in the background), so the end of that call is not its end.
+ *
+ * `chat`: it works in a chat of the portal's (a child chat, by its id), whose
+ * own transcript is its run: a page draws it from that chat, and nothing of
+ * it comes as `subagent:v1:event`.
  *
  * The child's events are drawn exactly like the main conversation's: text,
  * thinking, tool calls and their output.
@@ -127,7 +133,7 @@ export function slimEvent(event: any): Record<string, unknown> | undefined {
  * subagents, as session events: `portal_subagent` (stored) and
  * `portal_subagent_live` (streamed, not stored). Returns the unsubscribe.
  */
-export function bridgeSubagents(bus: Bus, emit: Emit, config: () => { model?: string } = () => ({})): Bridge {
+export function bridgeSubagents(bus: Bus, emit: Emit): Bridge {
   // With the tool call that runs each, and whether it outlives that call:
   // carried on all its events, so a page that has not loaded the start still
   // knows whose they are.
@@ -140,9 +146,9 @@ export function bridgeSubagents(bus: Bus, emit: Emit, config: () => { model?: st
   // its tokens are never stored, so the times ride on its message_end.
   const thinking = new Map<string, { thinkingSince: number; thinkingUntil: number }>();
   const off = [
-    // Answered only with what the chat says: nothing said leaves the extension to its own default.
+    // Nothing said: the extension goes by its own default. Answered all the same, so one that asks is not left waiting.
     bus.on(SUBAGENT_CONFIG, (data: any) => {
-      if (typeof data?.reply === "function") data.reply(config());
+      if (typeof data?.reply === "function") data.reply({});
     }),
     bus.on(SUBAGENT_START, (data: any) => {
       const id = str(data?.id, 120);
@@ -158,6 +164,7 @@ export function bridgeSubagents(bus: Bus, emit: Emit, config: () => { model?: st
         input: data.input === true,
         stop: data.stop === true,
         ...(data.detached === true ? { detached: true } : {}),
+        ...(str(data.chat, 120) ? { chat: str(data.chat, 120) } : {}),
       });
     }),
     bus.on(SUBAGENT_EVENT, (data: any) => {

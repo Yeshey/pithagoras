@@ -43,10 +43,14 @@ export interface PiTool {
   cached?: true;
   /** Registered with `offByDefault: true`: off in every chat until somebody switches it on. */
   offByDefault?: true;
+  /** The parameters that hold the files it is approved for, as its definition declares them (see declaredFiles in guard.ts). */
+  approvalFiles?: string[];
   /** False when this conversation has it switched off. */
   enabled: boolean;
   /** Whether it is on by default, so the page can say where a chat disagrees. */
   defaultOn?: boolean;
+  /** The code tool, on in a chat whose mode switches it on: the chat's own switch cannot turn it off (see setTools). */
+  byMode?: true;
   /** Not offered one by one but found through the `tools` tool: a tool marked lazy. It is on, and switched like any other. */
   lazy?: true;
 }
@@ -61,6 +65,12 @@ export type PromptTaken =
   | { outcome: "queued"; lane: "steering" | "followUp"; text: string }
   | { outcome: "started" }
   | { outcome: "handled" };
+
+/** Where a load failed, the file or the inline extension (`<inline:name>`), and why. */
+export interface LoadError {
+  path: string;
+  error: string;
+}
 
 export interface PiCommand {
   name: string;
@@ -78,6 +88,23 @@ export interface PiCommand {
  */
 export interface PiClient extends EventEmitter {
   readonly running: boolean;
+  /** Its chat works through the code tool alone, in pi's "only" presentation, fixed as pi starts: see codemode.ts. */
+  readonly codemodeOnly?: boolean;
+  /**
+   * Set where the open chats were reloaded while this one was working (see
+   * reloadIdle): it is loaded again at its next step, where the executor can
+   * do that between two requests of a run, or else once the run is over or
+   * before the next message starts one. Cleared by a reload, and set again
+   * where that fails, which may have let go of what was loaded: tried again at
+   * the next of those, once at each.
+   */
+  reloadDue?: boolean;
+  /**
+   * What the chat's last load could not load, or loaded only in part: an
+   * extension that threw, a tool of a name another had first. Optional: only
+   * the in-process client sees them.
+   */
+  loadErrors?(): LoadError[];
   /**
    * Speak to a subagent an extension announced over the subagent protocol
    * (see subagent-protocol.ts). False when this executor cannot reach the

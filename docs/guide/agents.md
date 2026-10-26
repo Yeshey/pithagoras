@@ -28,10 +28,13 @@ agent of another name is left alone: the new one gets the next free name,
 A card opens that agent (`/agents?agent=research-bot`), with **New
 conversation** to start a chat with it, the same as the **+** on its folder in the
 sidebar, and six tabs: **Conversations** (every chat in its home, however it was
-started, and the number above it counts them all),
+started, and the number above it counts them all; the [sub-chats](/guide/sessions#sub-chats) of a
+conversation are under it, not counted),
 **Activity** (what its heartbeat noticed, with the number unread),
 **Heartbeat**, **Tools** (see [below](#tools)), **Skills** and **Files** to edit. The tab is kept in the link (`&tab=files`). Its avatar is at
-the top beside its name; the palette on it opens the avatar customizer. Each
+the top beside its name; the palette on it opens the avatar customizer, which
+also chooses what the avatar is drawn as: the orb, or an avatar an extension
+offers (see [Voice](/guide/voice)). Each
 agent's avatar is its own, and voice mode shows the avatar of the agent the
 chat is with (the agent a project works with for a chat in it, the first agent's if it
 works with none, see [Projects](/guide/projects#an-agent-for-a-project)). Its
@@ -49,20 +52,32 @@ The **Files** tab edits `SOUL.md`, `PrimaryUser.md`, `MEMORY.md` and `WATCH.md`.
 The agent writes these files too, `MEMORY.md` above all, so a save made from a
 copy the agent has changed since is not applied. The tab says "This file changed
 after you opened it" and offers **Load the new version** or **Save mine anyway**.
-A file that is a link is left alone: it is neither shown nor written through, and the tab says so instead of offering an editor. It counts as there, so an agent whose `SOUL.md` is a link that leads nowhere (by a path that only the container knows) is not asked to be set up again. When a new agent's folder already has such a link, the note on its page says the answers were not written to it and that it is left as it is.
+A file that is a link is left alone: it is neither shown nor written through, nor handed to the agent as its own, and the tab says so instead of offering an editor. It counts as there, so an agent whose `SOUL.md` is a link that leads nowhere (by a path that only the container knows) is not asked to be set up again. When a new agent's folder already has such a link, the note on its page says the answers were not written to it and that it is left as it is.
 
 ## Its voice
 
-With the voice add-on installed, the avatar customizer (the palette on the
-agent's avatar) has a **Voice** menu under the preview: the voice the agent
-speaks with in voice mode, saved with **Save avatar**. **As in the voice settings** follows the
-voice chosen in Settings; a designed voice or one from the voice library is the
-agent's own. **Add voice** at the end of the menu adds a voice to the library,
-a clone from a recording or one designed from a description, and gives it to
-the agent. A chat in a project shows the avatar of the agent the project works with and
-speaks with its voice, the first agent's where the project works with none.
-A library voice that is deleted is no longer any agent's, and those
-that had it speak as the voice settings say again.
+While voice mode has a source that speaks (see
+[Where voice mode listens and speaks](/guide/voice#where-voice-mode-listens-and-speaks)),
+the avatar customizer (the palette on the agent's avatar) has a **Voice** menu
+under the preview: the voice the agent speaks with in voice mode, saved with
+**Save avatar**. It lists the voices the source offers now: with
+[the voice service](/guide/voice-service#your-voice), the designed voice and
+your voices, or Kokoro's own voices while Kokoro speaks; with
+[Voice servers](/guide/voice-servers), the voices listed on its page, or your
+voices there while its [custom voices](/guide/voice-servers#custom-voices) are on
+for Breeze or Chatterbox. **As Voice
+service chooses** (named after the source) is the source's own choice, the
+voice set on its page. Under the menu, **Add a voice in Voice service** opens
+the source's page in Settings, where voices are added, and asks first whether
+to discard what you changed in the avatar and did not save. Closing Settings
+brings you back to the Agents page, and opening the avatar again lists the new
+voice. A chat in a project shows the avatar of the agent the project
+works with and speaks with its voice, the first agent's where the project works
+with none.
+
+An agent's voice that the source does not offer now, one that was deleted or
+one of another engine's, is kept and shown as **Not offered now**, and the
+agent speaks with the source's own choice until it is offered again.
 
 ## Its heartbeat
 
@@ -87,7 +102,11 @@ and no browser. To let it run a command, add it under **Commands it may run**,
 for example `gh pr list*`. A command runs only as written there, with `*` where
 it varies, and a pipe, a redirect or a second command makes it something else.
 Those commands are for every agent's heartbeat, and show in **People** as
-rules for every agent's heartbeat. A rule for all roles applies to it too.
+rules for every agent's heartbeat. A rule for all roles applies to it too. A
+look runs on its own, on what it reads, which can be anybody's words, so what is
+allowed for it never reaches a place secrets are kept, a write to what is loaded
+as the agent's own (its context files, `WATCH.md`, `AGENTS.md`, `.pi/`,
+`.mcp.json`), or a subagent or a routine, which would run with your rights.
 
 What it notices lands in **Activity** as notes; the tab and the agent's card
 show how many are unread. A note marked urgent also goes to the
@@ -114,7 +133,7 @@ agent that should never run shell commands switches `bash` off here, without
 touching any other agent.
 
 A project and a routine come after the agent and can switch a tool again for their
-own; a chat's own switch has the last word. Chats in a project are not in any agent's
+own, and so does a chat's [mode](/guide/sessions#modes); a chat's own switch has the last word, except that it cannot turn the code tool off where the mode switches it on. Chats in a project are not in any agent's
 home, and follow the project, also where it works with an agent: that agent's soul, user
 and memory are used, but not its tool switches. See [Routines](/guide/routines#tools) for the order of
 all the layers.

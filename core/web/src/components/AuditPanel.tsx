@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { LuBan, LuCircleCheck, LuGlobe, LuKeyRound, LuRefreshCw, LuShield, LuShieldAlert, LuShieldCheck, LuTrash2, LuUserX } from "react-icons/lu";
+import { LuBan, LuCircleCheck, LuGlobe, LuKeyRound, LuPuzzle, LuRefreshCw, LuShield, LuShieldAlert, LuShieldCheck, LuTrash2, LuUserX } from "react-icons/lu";
 import { confirmDialog } from "./ConfirmDialog";
 import { PageHeader, Stat } from "./PageHeader";
 import { ErrorBanner, LoadFailed, Segments } from "./SettingsUi";
 import { api, type AuditEntry } from "../api";
 import { pollWhileVisible } from "../poll";
-import { msg, t, tp } from "../i18n";
+import { msg, t, tp, useLanguage } from "../i18n";
+import { translate } from "../extensions/strings";
 import { serverTime, sinceThen } from "../time";
 
 /** What each kind means at a glance, without reading the reason. */
@@ -23,10 +24,17 @@ const KIND: Record<string, { label: string; icon: JSX.Element; tone: string }> =
   },
   stranger: { label: msg("Turned away"), icon: <LuUserX className="h-3.5 w-3.5" />, tone: "text-warn" },
   answered: { label: msg("You answered"), icon: <LuShield className="h-3.5 w-3.5" />, tone: "text-accent" },
-  browsed: { label: msg("Page opened"), icon: <LuGlobe className="h-3.5 w-3.5" />, tone: "text-fg-muted" },
+  browsed: { label: msg("Address reached"), icon: <LuGlobe className="h-3.5 w-3.5" />, tone: "text-fg-muted" },
   cleared: { label: msg("Log cleared"), icon: <LuTrash2 className="h-3.5 w-3.5" />, tone: "text-fg-muted" },
   flagged: { label: msg("Suspected injection"), icon: <LuShieldAlert className="h-3.5 w-3.5" />, tone: "text-warn" },
   trusted: { label: msg("You trusted"), icon: <LuShieldCheck className="h-3.5 w-3.5" />, tone: "text-ok" },
+  "allowed-by-exemption": { label: msg("Allowed: routine exempt"), icon: <LuShield className="h-3.5 w-3.5" />, tone: "text-warn" },
+  untrusted: { label: msg("You took trust back"), icon: <LuShieldAlert className="h-3.5 w-3.5" />, tone: "text-fg-muted" },
+  revoked: { label: msg("Approval taken back"), icon: <LuKeyRound className="h-3.5 w-3.5" />, tone: "text-fg-muted" },
+  // A chat put in a mode that asks first, after a yes to its warning (see ModePicker.tsx).
+  mode: { label: msg("Mode chosen"), icon: <LuShieldAlert className="h-3.5 w-3.5" />, tone: "text-warn" },
+  // What an extension recorded it did (portal.audit.record), under its name.
+  extension: { label: msg("Extension"), icon: <LuPuzzle className="h-3.5 w-3.5" />, tone: "text-accent" },
 };
 
 const FILTERS = [
@@ -76,6 +84,8 @@ function Subject({ text }: { text: string }) {
 }
 
 function AuditPanel({ onError }: { onError: (e: string | null) => void }) {
+  // An extension's row is in its own words, which its browser half can bring after the rows are drawn.
+  useLanguage();
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [filter, setFilter] = useState("all");
   const [loading, setLoading] = useState(true);
@@ -83,8 +93,8 @@ function AuditPanel({ onError }: { onError: (e: string | null) => void }) {
   const [failed, setFailed] = useState<string | null>(null);
   const had = useRef(false);
   const [clearing, setClearing] = useState(false);
-  // Shown by the button, as MemoryPage's log does, so a poll that works does
-  // not take it off the page banner before it is read.
+  // Shown by the button, so a poll that works does not take it off the page
+  // banner before it is read.
   const [clearFailed, setClearFailed] = useState<string | null>(null);
   // Counts clears: an answer asked for before one must not bring the cleared
   // entries back when it arrives after it. Only clears, not every poll — on a
@@ -237,7 +247,8 @@ function AuditPanel({ onError }: { onError: (e: string | null) => void }) {
                     {tp(Number(e.reason), "One entry was deleted.", "{n} entries were deleted.")}
                   </p>
                 ) : (
-                  e.reason && <p className="mt-0.5 text-[11px] text-fg-faint">{e.reason}</p>
+                  // An extension's reason is its own English text, shown in its own words in the page's language.
+                  e.reason && <p className="mt-0.5 text-[11px] text-fg-faint">{e.kind === "extension" ? translate(e.tool, e.reason) : e.reason}</p>
                 )}
               </li>
             );

@@ -230,7 +230,7 @@ user of the realm can sign in, so use a realm that holds your people only.
 ## HTTPS
 
 Browsers offer notifications and installing the portal as an app only over
-HTTPS or on `localhost`, and the embedded browser needs it. Either put a proxy
+HTTPS or on `localhost`, and the [Browser](/guide/browser) extension's embedded browser needs it. Either put a proxy
 in front (`tailscale serve` is the shortest), or give the portal the
 certificate itself: mount the folder with `PORTAL_TLS_DIR` (it appears at
 `/certs`) and set `PORTAL_TLS_CERT` and `PORTAL_TLS_KEY` to the files in it.
@@ -246,14 +246,20 @@ With the supplied Compose files, `WORKSPACES_DIR` selects the **host** directory
 mounted at `/workspaces`, and has to be set. Keep the portal's
 `WORKSPACE_ROOT=/workspaces` so it uses the path visible inside its container.
 
-## Installing add-ons
+## Installing the voice service and the agent's browser
 
-To install Browser or Voice from Settings:
+To install the voice service through the Voice and Docker extensions, or the
+agent's browser through the Browser and Docker extensions (Voice servers, for
+speech servers you run yourself, needs neither):
 
 - Keep the **Docker socket mount** and **host networking**.
-- For Voice, configure **NVIDIA Container Toolkit** on the host.
+- For voice service engines on an NVIDIA GPU, configure **NVIDIA Container
+  Toolkit** on the host. Kokoro and speech recognition run on the CPU without a
+  GPU or the toolkit ([GPU access for Voice](/guide/voice-service#gpu-access-for-voice)).
 
-Follow [Docker add-ons](/guide/add-ons) for installation, controls, storage and cleanup.
+Follow [The voice service](/guide/voice-service) for its installation, controls,
+storage and cleanup, [Voice servers](/guide/voice-servers) for your own speech
+servers, and [The agent's browser](/guide/browser) for the browser's.
 
 ## The runner image
 
@@ -360,12 +366,12 @@ into place by hand without them is sent as it is.
 | --- | --- |
 | `/data` | Everything stateful — see below |
 | `/workspaces` | The directories pi works in, mounted from `WORKSPACES_DIR` |
-| `/var/run/docker.sock` | Managed Browser/Voice add-ons and `EXECUTOR=container` |
+| `/var/run/docker.sock` | The [Docker](/guide/docker) extension (which runs the containers of the [Browser](/guide/browser), [Voice](/guide/voice-service) and [Understory](/guide/features#memory-understory) extensions) and `EXECUTOR=container` |
 
 The portal closes `/data` to every account but the one it runs as (mode `0700`)
 each time it starts, a folder made by hand or by an older version too:
-`portal.db` holds the channels' bot tokens, the add-ons' passwords and every
-conversation. A data folder on the host, mounted as `/data`, is closed the same way.
+`portal.db` holds the channels' bot tokens and every conversation. A data
+folder on the host, mounted as `/data`, is closed the same way.
 
 Inside `/data`:
 
@@ -373,17 +379,18 @@ Inside `/data`:
 | --- | --- |
 | `/data/portal.db` | Sessions, event log, channels, agents, routines, settings |
 | `/data/portal.sock` | Held while the portal runs, so a second one cannot start on this data |
-| `/data/backups` | The copies of the database made before an [upgrade](/guide/upgrading) |
+| `/data/backups` | The copies of the database made before an [upgrade](/guide/upgrading), and Media's and Browser's folders where they were set aside to go back to a version before each was an extension (see [Upgrading](/guide/upgrading#going-back)) |
 | `/data/sessions/<id>` | Per-session working area, and pi's file of the chat's conversation: it is what the agent remembers. Do not clear it |
 | `/data/home` | `HOME` for pi — `~/.pi/agent`, its settings, skills and packages |
 | `/data/channels` | Installed third-party channel packages |
 | `/data/channel-state` | What a channel keeps between its starts, such as where Signal's stream was |
 | `/data/agent-home` | The first agent's home: its `SOUL.md`, `PrimaryUser.md`, `MEMORY.md` |
 | `/data/agents/<id>` | The home of every other [agent](/guide/agents) |
-| `/data/images` | The pictures the [Media page](/guide/media) made itself, and the pictures sent with each chat's messages, in a folder per chat. What the agent makes is in the chat's folder, under `generated-images` |
-| `/data/videos` | The videos the [Media page](/guide/media) made itself, kept until you delete them. What the agent makes is in the chat's folder, under `generated-videos` |
-| `/data/video-posters` | The small first-frame pictures the portal makes of videos when there is an `ffmpeg` (see [Media](/guide/media#the-gallery)); they can be deleted at any time and are made again |
-| `/data/video-copies` | The playable WebM copies the portal makes, on request and with an `ffmpeg`, of clips a browser cannot play (see [Media](/guide/media#clips-a-browser-cannot-play)); the originals are in `videos`, and a copy can be deleted at any time |
+| `/data/images` | The pictures sent with each chat's messages, in a folder per chat. What the agent makes is in the chat's folder, under `generated-images`, and what the [Media page](/guide/media) makes is in Media's folder (below) |
+| `/data/extension-data/<package>` | What an extension keeps for itself, out of the agents' reach (see [where it keeps things](/guide/extension-ui#where-it-keeps-things)) |
+| `/data/extension-data/pithagoras-media` | [Media](/guide/media)'s: `media.db`, its galleries' lists and the settings of its endpoints, keys included; `images` and `videos`, the pictures and videos the Media page made itself, kept until you delete them; `image-thumbs` and `video-posters`, the small copies of pictures and the first-frame pictures of videos (those only when there is an `ffmpeg`), which can be deleted at any time and are made again; `video-copies`, the playable WebM copies made on request, with an `ffmpeg`, of clips a browser cannot play (see [Media](/guide/media#clips-a-browser-cannot-play)), each of which can be deleted at any time |
+| `/data/extension-data/pithagoras-browser` | [Browser](/guide/browser)'s: `settings.json`, its settings with the password of the browser's web UI; `profile`, the profile of the machine's own Chrome where Browser runs one (the container's is the volume `pithagoras_browser-profile`) |
+| `/data/handoff` | What an upgrade left for an extension to take up, such as `handoff/media` until Media has taken it up and `handoff/browser` until Browser has (see [Upgrading](/guide/upgrading#media-is-an-extension)) |
 | `/data/bin` | CLIs you add yourself — on `PATH`, survives rebuilds |
 
 `HOME` deliberately points at the volume. Otherwise every image rebuild would
@@ -404,7 +411,7 @@ your work:
   file declares (`<project>_portal-data`, and `<stack>_pithagoras-data` in
   Portainer: Docker puts the project's or the stack's name in front). The
   database, the chats' files, pi's settings and packages, the agents, the pictures.
-- **The memory of the Understory the portal runs**, if you use it: the volume
+- **The memory of the Understory run here**, if you use it: the volume
   `pithagoras_understory-memory` (`UNDERSTORY_VOLUME`), plain markdown files.
 - **The browser's logins**, if you want to keep them: the volume
   `pithagoras_browser-profile`. The voice models are downloads and can be fetched again.
@@ -437,8 +444,8 @@ folder, but take the database from `portal-backup.db` and leave `portal.db`,
 `portal-backup.db` afterwards: it is as large as the database.
 
 The memory of Understory is files, so it can be archived like any volume. Stop
-Understory first (**Settings → Add-ons → Memory → Stop**) if you want to be sure no
-tidy-up pass is writing:
+Understory first (**Settings → Extension settings → Memory → Stop**) if you want to
+be sure no tidy-up pass is writing:
 
 ```sh
 docker run --rm -v pithagoras_understory-memory:/memory:ro -v "$PWD:/backup" alpine tar czf /backup/understory-memory.tgz -C /memory .
@@ -494,18 +501,18 @@ Everything here is optional except, with the Compose files, `WORKSPACES_DIR`.
 | `PORTAL_UPDATE_RESTART` | — | From source: how the **Update** button in Settings → About restarts the portal after it has built the new version, and whether the **Restart** button may start a copy of it itself (`self`) or only stop it (`exit`, see [Restarting](#restarting)). `exit` only stops it, with status 75, for a portal that something else starts again (pm2, a restart policy); `self` starts the new one itself. Unset, a portal that is a systemd service's own process exits; one that only is in a service's control group (`npm start` under dash, a wrapper script, a cron job) starts its own copy and exits with status 75 as well; any other starts its own. A systemd unit needs `Restart=on-failure` or `Restart=always`. See [Settings](/guide/settings#update). |
 | `TZ` | UTC | The time zone of the portal's clock, such as `Europe/Berlin`. A container keeps UTC unless it is told one. The quiet hours of an [agent's heartbeat](/guide/agents#its-heartbeat) and the schedule of a repeating [routine](/guide/routines) are read on this clock. Both Compose files pass it from `.env` or the shell. |
 | `PORTAL_UPGRADE_BACKUP` | — | `skip` upgrades the database without the backup it is otherwise made first, for a volume with no room for the copy. Both Compose files pass it; see [Upgrading](/guide/upgrading#no-room-for-the-backup). |
-| `PORTAL_DEFAULT_EXTENSIONS` | — | `off` keeps the portal from installing the extensions it starts with (the terminal, the theme pack) on its first start: you choose every extension yourself, in Settings → Extensions. See [What a portal starts with](/guide/extensions#what-a-portal-starts-with). |
+| `PORTAL_DEFAULT_EXTENSIONS` | — | `off` keeps the portal from installing the extensions it starts with (the terminal, Git, Files, Canvases, Media and the theme pack) on its first start: you choose every extension yourself, in Settings → Extensions. See [What a portal starts with](/guide/extensions#what-a-portal-starts-with). |
 | `PORTAL_UPDATE_CHECK` | — | From source: `off` stops the portal from fetching `origin/main` by itself at the start and every six hours to see whether there is something new. The **Update** button in Settings → About still asks when it is pressed. See [Settings](/guide/settings#update). |
 | `EXECUTOR` | `host` | `host` or `container` — see [Architecture](/reference/architecture#executors). |
 | `WORKSPACE_ROOT` | `/workspaces` | Where workspaces live inside the container. |
 | `WORKSPACES_DIR` | — (required) | Compose only: the host folder mounted at `/workspaces`. |
 | `PORTAL_DATA_DIR` | `portal-data` volume (`pithagoras-data` in the Portainer stack) | Compose only: an absolute host path to mount at `/data` instead of the volume. |
 | `PORTAL_TLS_CERT` / `PORTAL_TLS_KEY` | — | Serve over HTTPS when both name a file; both Compose files mount `PORTAL_TLS_DIR` at `/certs`, so name the files there (`/certs/portal.crt`). |
-| `PORTAL_CONTAINER_NAME` | `pithagoras` (Compose) | The portal's own container name, for managed add-ons and container mounts. Unset natively. |
+| `PORTAL_CONTAINER_NAME` | `pithagoras` (Compose) | The portal's own container name, for the containers extensions run on its network (the voice service's, Understory's) and container mounts. Unset natively. |
 | `PI_IMAGE` | `pithagoras-runner:latest` | Container executor's image. |
 | `TASK_MEMORY_MB` / `TASK_CPUS` / `TASK_PIDS_LIMIT` | `2048` / `2` / `512` | Container executor limits. |
-| `DOCKER_SOCKET` | `/var/run/docker.sock` | The Docker socket the add-ons and container executor talk to. |
-| `VOICE_GPU` / `VOICE_VRAM_RESERVE_MIB` | — | Managed voice: the GPU it uses where none is chosen on the voice page, and memory in MiB to keep free on it. Both Compose files pass them from `.env`; see [Docker add-ons](/guide/add-ons#engines-devices-and-memory). |
+| `DOCKER_SOCKET` | `/var/run/docker.sock` | The Docker socket the [Docker](/guide/docker) extension and the container executor talk to. The portal also reads its own container's restart policy through it, for Settings → About → Restart. |
+| `VOICE_GPU` / `VOICE_VRAM_RESERVE_MIB` | — | The voice service: the GPU it uses where none is chosen on its page, and memory in MiB to keep free on it. Read by the Voice extension; both Compose files pass them from `.env`; see [The voice service](/guide/voice-service#engines-devices-and-memory). |
 | `NPM_REGISTRY_URL` | `https://registry.npmjs.org` | Registry the package catalogue searches. |
 | `CHANNELS_DIR` | `/data/channels` (from source: `$DATA_DIR/channels`) | Where third-party channel packages install. |
 | `AGENT_HOME` | `/data/agent-home` (from source: `$DATA_DIR/agent-home`) | The first agent's directory. Other agents are made in `agents/` beside it. |

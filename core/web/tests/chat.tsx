@@ -1,5 +1,5 @@
 // Development-only fixture: the chat's activity, thinking, tools and compaction, without a server.
-// Open /tests/chat.html?phase=model|prefill|thinking|reasoning|compacting|tools|agents|interrupted|turns to see each state,
+// Open /tests/chat.html?phase=model|prefill|thinking|reasoning|compacting|tools|agents|child-agent|interrupted|turns to see each state,
 // and add &loading=1 for the conversation still arriving.
 import React from 'react';
 import { createRoot } from 'react-dom/client';
@@ -14,7 +14,7 @@ import { installTooltips } from '../src/tooltips';
 import { installMotion } from '../src/motion';
 import { mockFetch } from './mock-fetch';
 import { setLanguage } from '../src/i18n';
-import { startExtensions } from '../src/extensions/loader';
+import { setNavigate, startExtensions } from '../src/extensions/loader';
 // Offers the languages, as the app does: `setLang('de')` fetches German.
 import '../src/locales';
 installTooltips();
@@ -23,6 +23,9 @@ installMotion();
 // The installed extensions, loaded as the app loads them: those the browser test says are installed (`installed` in
 // tests/browser/portal-mock.ts).
 startExtensions();
+// Where an extension takes the page (`portal.navigate`): kept for a test to read, as this page has no others.
+(window as any).navigated = [];
+setNavigate((path) => (window as any).navigated.push(path));
 
 const phase = new URLSearchParams(location.search).get('phase') ?? 'tools';
 const now = Date.now();
@@ -174,6 +177,12 @@ if (phase === 'agents') {
     ev('portal_subagent', { op: 'event', id: 'sub1', event: { type: 'tool_execution_end', toolCallId: 'x1', toolName: 'read', result: { content: [{ type: 'text', text: '#!/bin/sh…' }] } } }, 37),
     ev('portal_subagent', { op: 'event', id: 'sub1', event: { type: 'message_end', message: { role: 'assistant', content: [{ type: 'thinking', thinking: 'rm -rf on the old dir runs before the copy is verified.' }, { type: 'text', text: 'The script deletes `/opt/pithagoras.old` **before** checking that the new build started. I will look at the restart step next.' }] } } }, 20),
     ev('portal_subagent_live', { op: 'event', id: 'sub1', event: { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'Now the systemd restart: does it wait for health?' } } }, 2),
+    // Another extension's agent, over the same protocol, from a tool of its own: done already.
+    ev('tool_execution_start', { toolCallId: 'dl', toolName: 'delegate', args: { task: 'Write the changelog' } }, 35),
+    ev('portal_subagent', { op: 'start', id: 'other1', label: 'Changelog', toolCallId: 'dl' }, 35),
+    ev('portal_subagent', { op: 'event', id: 'other1', event: { type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'The changelog lists three fixes.' }] } } }, 31),
+    ev('portal_subagent', { op: 'end', id: 'other1', status: 'done' }, 30),
+    ev('tool_execution_end', { toolCallId: 'dl', toolName: 'delegate', result: { content: [{ type: 'text', text: 'The changelog lists three fixes.' }] } }, 30),
   );
   const jobs = { supported: true, statuses: [{ key: 'background-tasks', text: 'bg 1 running' }, { key: 'bg-update', text: 'bg ⬆ v2.6.5 /bg-update' }, { key: 'paths', text: 'logs in /tmp/bg' }], widgets: [], jobs: [
     { key: 'j1', sid: 4242, pids: [4242, 4250], command: 'npm run dev -- --port 5173', startedAt: now - 754_000, state: 'running', hasOutput: true, attached: false },
@@ -184,6 +193,14 @@ if (phase === 'agents') {
     if (u.includes('/commands')) return { commands: [{ name: 'bg-update', description: 'Update pi-background', source: 'extension' }] };
     if (u.includes('/background/') && u.includes('/output')) return { text: u.includes('from=') ? '' : '> vite\n\n  VITE v5.4  ready in 312 ms\n\n  ➜  Local:   http://localhost:5173/\n  ➜  Network: use --host to expose\n', from: 0, size: 120 };
   });
+}
+// A subagent that works in a child chat, as the subagent extension's do: its run is that chat's own transcript, which
+// the test serves at /api/sessions/kid1/events, and not on the protocol.
+if (phase === 'child-agent') {
+  events.push(
+    ev('tool_execution_start', { toolCallId: 'sc', toolName: 'subagent', args: { task: 'Check the backups', label: 'Backup check' } }, 30),
+    ev('portal_subagent', { op: 'start', id: 'kid1', label: 'Backup check', toolCallId: 'sc', input: true, stop: true, detail: 'Starting on local/model-a', chat: 'kid1' }, 30),
+  );
 }
 
 // An extension fills the chat box twice at once, the way pi's RPC mode names it and then as a paste: delivered as the page does, on arrival.
@@ -244,10 +261,6 @@ if (phase === 'files') {
       { name: 'web_search', source: 'pi-web-access', description: 'Search the web', enabled: !off.includes('web_search'), defaultOn: true },
       { name: 'web_fetch', source: 'pi-web-access', enabled: !off.includes('web_fetch'), defaultOn: true },
       { name: 'bash', source: 'builtin', enabled: true, defaultOn: true },
-      // The portal's picture tools, each registered by an extension of its own.
-      { name: 'show_image', source: 'pictures', inline: true, enabled: !off.includes('show_image'), defaultOn: true },
-      { name: 'generate_image', source: 'image-generation', inline: true, enabled: true, defaultOn: true },
-      { name: 'edit_image', source: 'image-editing', inline: true, enabled: true, defaultOn: true },
     ] };
   });
 }
@@ -310,7 +323,7 @@ function Fixture() {
   const shown = which === session.id ? session : { ...session, id: which, title: which === 'first' ? 'First chat' : 'Second chat', status: 'idle' as const };
   return <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
     <div style={{ padding: 8, display: 'flex', gap: 8 }}><Select aria-label="Preview select" size="sm" className="w-64" value={v} onChange={setV} options={[{ value: 'a', label: 'Project notes' }, { value: 'b', label: 'Release plan', hint: 'Temporary — not stored' }, { value: 'c', label: 'Meeting summary' }]} /><label className="flex items-center gap-2 text-xs"><input type="checkbox" defaultChecked />Checkbox</label><input type="range" defaultValue={40} />{phase === 'switch' && <button onClick={() => setWhich('second')}>Open the second chat</button>}{phase === 'switch' && <button onClick={() => setWhich('first')}>Open the first chat</button>}{phase === 'paste' && <button onClick={paste}>Paste from the extension</button>}</div>
-    <div style={{ flex: 1, minHeight: 0 }}><Chat session={shown} events={shownEvents} onSend={async (message) => { (window as any).sent = [...((window as any).sent ?? []), message]; }} onEditMessage={noop} onDeleteMessage={async (seq: number) => { (window as any).deleted = [...((window as any).deleted ?? []), seq]; }} onTakeBackQueued={noop} onSendQueuedNow={noop} onAbort={noop} onClientCommand={noop} onRename={noop} loading={new URLSearchParams(location.search).has('loading')} /></div>
+    <div style={{ flex: 1, minHeight: 0 }}><Chat session={shown} events={shownEvents} onSend={async (message) => { (window as any).sent = [...((window as any).sent ?? []), message]; }} onEditMessage={noop} onDeleteMessage={async (seq: number) => { (window as any).deleted = [...((window as any).deleted ?? []), seq]; }} onTakeBackQueued={noop} onSendQueuedNow={noop} onAbort={noop} onClientCommand={noop} onRename={noop} onSetMode={noop} loading={new URLSearchParams(location.search).has('loading')} /></div>
   </div>;
 }
 // The language, as Settings changes it: `window.setLang('de')`.

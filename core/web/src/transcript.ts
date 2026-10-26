@@ -3,9 +3,7 @@ import { unwrapCall } from "./tool-activity";
 import { argsSummary } from "./tool-args";
 import { toolArgsOf, toolNameOf } from "./tool-payload";
 import { msg, t } from "./i18n";
-import { GENERATED_PICTURE_MARK } from "../../server/src/generated-picture";
-import { GENERATED_VIDEO_MARK } from "../../server/src/generated-video";
-import { shownFiles, type FileKind, type ShownFile } from "../../server/src/file-outputs";
+import { shownFiles, type ShownFile } from "../../server/src/file-outputs";
 import type { AgentQuestion } from "./components/QuestionCard";
 
 /** A picture that went with a message, by the name the server keeps it under. */
@@ -21,9 +19,6 @@ const sentImages = (raw: unknown): SentImage[] | undefined => {
 };
 
 export type { ShownFile } from "../../server/src/file-outputs";
-
-/** The first file of a kind a call gave the person, if it gave one. */
-export const fileOf = (item: { files?: ShownFile[] }, kind: FileKind): ShownFile | undefined => item.files?.find((file) => file.kind === kind);
 
 /**
  * What answering took, for the line under a reply: the prompt it read and the
@@ -115,20 +110,14 @@ export type Item =
       detail?: string;
       /** The files the call gave the person, as its end says (see file-outputs.ts). */
       files?: ShownFile[];
-      /** The seq of the end that gave `files`: what versions their URLs, so that every place that draws one asks for the same one (see PictureCall). */
+      /** The seq of the end that gave `files`: what versions their URLs, so that every place that draws one asks for the same one (see CallFiles). */
       filesSeq?: number;
-      /** A call of the portal's own generate_image or edit_image, as its start says (see generated-picture.ts), not of a tool of that name an extension brings. */
-      portalPicture?: true;
-      /** A call of the portal's own generate_video, as its start says (see generated-video.ts), not of a tool of that name an extension brings. */
-      portalVideo?: true;
       args?: unknown;
       output?: string;
       /** How many lines `output` had before it was cut to its end. */
       outputLines?: number;
       /** What the tool reported about itself beside its text — an extension's progress, its subagent's steps. */
       details?: unknown;
-      /** How many updates it streamed while it ran: a tool that reports as it goes is doing something worth watching. */
-      updates?: number;
       /** The guard flagged what it returned as a suspected prompt injection: its envelope's id, the signs, and the message of the turn it is in. */
       flagged?: { id: string; signals: string[]; turnSeq?: number };
       /** The run ended with this call still open: it never said how it came out. */
@@ -523,8 +512,6 @@ export function buildTranscript(events: PortalEvent[], options: { ended?: boolea
           name: toolNameOf(p, "tool"),
           status: "running",
           detail: summarizeToolInput(p),
-          ...(p[GENERATED_PICTURE_MARK] === true ? { portalPicture: true as const } : {}),
-          ...(p[GENERATED_VIDEO_MARK] === true ? { portalVideo: true as const } : {}),
           ...(args !== undefined ? { args } : {}),
           ...(ev.at !== undefined ? { since: ev.at } : {}),
         });
@@ -536,10 +523,7 @@ export function buildTranscript(events: PortalEvent[], options: { ended?: boolea
         const partial = p.partialResult ?? p.result;
         const text = toolOutputText(partial);
         if (tool && typeof text === "string") setToolOutput(tool, text);
-        if (tool) {
-          tool.updates = (tool.updates ?? 0) + 1;
-          if (partial?.details !== undefined) tool.details = partial.details;
-        }
+        if (tool && partial?.details !== undefined) tool.details = partial.details;
         break;
       }
 
@@ -583,8 +567,6 @@ export function buildTranscript(events: PortalEvent[], options: { ended?: boolea
               it.flagged = { ...flag, ...(turn ? { turnSeq: turn.seq } : {}) };
             }
             if (p.result?.details !== undefined) it.details = p.result.details;
-            // Its updates were live only; how many there were is kept on its end.
-            if (typeof p.updates === "number") it.updates = Math.max(it.updates ?? 0, p.updates);
             const files = shownFiles(p);
             if (files.length) {
               it.files = files;

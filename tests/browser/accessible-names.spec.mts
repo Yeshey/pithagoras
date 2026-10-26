@@ -19,7 +19,7 @@ const skill = { name: 'review', description: 'Reviews', path: '/s/review', scope
 const person = (key: string, name: string, role: string) => ({ key, name, role, notes: '', first_seen: '', last_seen: null, announced_at: null, renamed: 0 });
 const mcp = { path: '/a/mcp.json', exists: true, adapterInstalled: true, adapterSpec: 'npm:pi-mcp-adapter', settings: {}, raw: '{}', parseError: null, servers: [{ name: 'notes', entry: { command: 'notes-mcp' }, transport: 'stdio', disabled: false }] };
 const extension = { spec: 'npm:ext', name: 'Ext', version: '1', description: '', enabled: true, settings: [{ key: 'apiKey', value: '', configured: false }], skills: [], tools: [] };
-const routine = { id: 'r1', slug: 'morning', name: 'Morning', enabled: true, schedule: '0 9 * * *', runAt: null, mode: 'repeats', done: false, instructions: 'Say hello', freshSession: true, guard: true, browser: false, workspace: null, reportChannel: null, reportTarget: null, lastReportAt: null, lastRun: null, lastStatus: null, lastOutput: null, lastMs: null, nextRun: null, createdAt: '' };
+const routine = { id: 'r1', slug: 'morning', name: 'Morning', enabled: true, schedule: '0 9 * * *', runAt: null, mode: 'repeats', done: false, instructions: 'Say hello', freshSession: true, guard: true, exempt: [], workspace: null, reportChannel: null, reportTarget: null, lastReportAt: null, lastRun: null, lastStatus: null, lastOutput: null, lastMs: null, nextRun: null, createdAt: '' };
 
 async function portal(page: Page) {
   await mockPortal(page, ({ path: p, method }) => {
@@ -32,6 +32,7 @@ async function portal(page: Page) {
     if (p === '/api/mcp') return mcp;
     if (p === '/api/extensions') return { settingsPath: '/a/settings.json', extensions: [extension] };
     if (p === '/api/routines') return { routines: [routine] };
+    if (p === '/api/guard') return { running: true, sandbox: 'on', primary: true, approvalsTo: true, rules: [], servers: [], routines: [], allowlist: 'github.com', approvals: [], trusted: [] };
     if (p === '/api/routines/preview') return { runs: [] };
     // A routine's and an agent's own tool switches: the list of checkboxes the page draws, which have to be named too.
     if (p === '/api/routines/r1/tools' || p === '/api/agents/home/tools') {
@@ -70,7 +71,7 @@ const scenes: Scene[] = [
   { name: 'routines', url: '/routines', shows: (page) => page.getByText('Morning').first() },
   { name: 'a routine', url: '/routines', open: (page) => page.getByRole('button', { name: /Morning/ }).first().click(), shows: field('Routine name') },
   { name: 'a new routine', url: '/routines', open: (page) => page.getByRole('button', { name: 'New routine' }).click(), shows: field('Schedule') },
-  { name: 'browser', url: '/browser', shows: field('Where it may go') },
+  { name: 'the guard', url: '/settings/guard', shows: field("Sites the agent's tools may reach") },
 ];
 for (const { name, url, open, shows } of scenes) {
   test(`every field and button on ${name} has a name`, async ({ page }) => {

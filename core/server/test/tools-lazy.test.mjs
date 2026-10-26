@@ -285,21 +285,23 @@ test("pi's built-in tools stay out of reach of lazy when the sandbox registers t
 });
 
 test("a tool the portal registers itself can be lazy, on its own and with the rest of its set", async () => {
+  // The portal's own routine tools: an inline extension's tool under any other name is a server half's, listed only
+  // while its package is switched on (extension-tools-switched.test.mjs).
   db.rememberTools([
-    { name: "board_list", source: "boards", package: null, inline: true },
-    { name: "board_write", source: "boards", package: null, inline: true },
+    { name: "routines_list", source: "routines", package: null, inline: true },
+    { name: "routine_run", source: "routines", package: null, inline: true },
   ]);
-  assert.equal(db.lazyAllowed({ name: "board_write", source: "boards", package: null, inline: true }), true);
+  assert.equal(db.lazyAllowed({ name: "routine_run", source: "routines", package: null, inline: true }), true);
   // On its own, and with its set: the mark is taken.
-  assert.deepEqual((await json("/api/tools/lazy", "PUT", { lazy: [lazyToolEntry("board_write")] })).lazy, ["<tool>board_write"]);
-  assert.deepEqual([...db.lazyToolNames()], ["board_write"]);
-  assert.deepEqual((await json("/api/tools/lazy", "PUT", { lazy: ["boards"] })).lazy, ["boards"]);
-  assert.deepEqual([...db.lazyToolNames()].sort(), ["board_list", "board_write"]);
+  assert.deepEqual((await json("/api/tools/lazy", "PUT", { lazy: [lazyToolEntry("routine_run")] })).lazy, ["<tool>routine_run"]);
+  assert.deepEqual([...db.lazyToolNames()], ["routine_run"]);
+  assert.deepEqual((await json("/api/tools/lazy", "PUT", { lazy: ["routines"] })).lazy, ["routines"]);
+  assert.deepEqual([...db.lazyToolNames()].sort(), ["routine_run", "routines_list"]);
   const page = await json("/api/tools");
-  assert.deepEqual(lazyOf(page), ["board_list", "board_write"]);
+  assert.deepEqual(lazyOf(page), ["routine_run", "routines_list"]);
   assert.deepEqual(page.tools.filter((t) => t.noLazy).map((t) => t.name), []);
   const chat = await json("/api/sessions", "POST", {});
-  assert.deepEqual(sessions.piLazy(sessions.piOff(chat.id)).tools, ["board_list", "board_write"]);
+  assert.deepEqual(sessions.piLazy(sessions.piOff(chat.id)).tools, ["routine_run", "routines_list"]);
 });
 
 const adapter = (...names) => names.map((name) => ({ name, source: "pi-mcp-adapter", package: null }));
@@ -307,16 +309,16 @@ const adapter = (...names) => names.map((name) => ({ name, source: "pi-mcp-adapt
 const mcpFileOf = () => JSON.parse(readFileSync(path.join(process.env.PI_CODING_AGENT_DIR, "mcp.json"), "utf8"));
 
 test("an MCP server's tools are lazy unless the server registers them directly: the setting is the server's, and a mark cannot name it", async () => {
-  const { understoryEntry } = await import("../dist/features.js");
   writeMcp({
     notes: { command: "n" },
-    understory: understoryEntry("http://localhost:3800/mcp"),
+    // As Understory's extension writes it: its tools registered directly.
+    understory: { url: "http://localhost:3800/mcp", lifecycle: "lazy", directTools: true },
     wiki: { command: "w", directTools: ["page"] },
     legacy: { command: "l", directTools: false },
   });
   db.rememberTools(adapter("notes_read", "understory_memory_recall", "wiki_page", "wiki_edit", "legacy_ping"));
   const page = await json("/api/tools");
-  // The adapter's default is the proxy: lazy. Understory, which the portal writes with its tools registered, stays as it was.
+  // The adapter's default is the proxy: lazy. Understory, written with its tools registered, stays as it was.
   assert.deepEqual(lazyOf(page), ["legacy_ping", "notes_read", "wiki_edit"]);
   assert.deepEqual(Object.fromEntries(page.tools.filter((t) => t.mcp).map((t) => [t.name, t.mcp])), {
     notes_read: "notes", understory_memory_recall: "understory", wiki_page: "wiki", wiki_edit: "wiki", legacy_ping: "legacy",
@@ -369,7 +371,7 @@ test("the page is told which tools cannot be lazy, so it offers no mark for them
   db.rememberTools([
     { name: "notes_read", source: "pi-mcp-adapter", package: null },
     { name: "bash", source: "built in", package: null },
-    { name: "browser_navigate", source: "browser", package: null, inline: true },
+    { name: "browser_navigate", source: "pithagoras-browser", package: null, inline: true },
   ]);
   const page = await json("/api/tools");
   // Only pi's own: an MCP server's tool has a lazy state, set on its server.
@@ -391,22 +393,20 @@ test("without the mark a new tool is on and not lazy, as before", async () => {
   assert.deepEqual(db.toolDefaultsOff(), []);
 });
 
-test("the browser's and the media tools are not lazy until marked, and are sets that can be", async () => {
+test("a server half's tools are not lazy until marked, and are sets that can be", async () => {
   db.rememberTools([
-    { name: "show_image", source: "pictures", package: null, inline: true },
-    { name: "generate_image", source: "image-generation", package: null, inline: true },
-    { name: "show_video", source: "videos", package: null, inline: true },
-    { name: "browser_navigate", source: "browser", package: null, inline: true },
-    { name: "browser_click", source: "browser", package: null, inline: true },
+    // Two server halves', filed under their packages' names as the portal files an inline extension's.
+    { name: "paint", source: "painter", package: null, inline: true },
+    { name: "sketch", source: "painter", package: null, inline: true },
+    { name: "browser_navigate", source: "pithagoras-browser", package: null, inline: true },
+    { name: "browser_click", source: "pithagoras-browser", package: null, inline: true },
   ]);
   // Nobody has marked them: on and offered one by one, as they always were.
   assert.deepEqual([...db.lazyToolNames()], []);
   assert.deepEqual(sessions.piLazy([]), { tools: [], sets: [] });
-  // Not taken for an MCP server's, though the portal also attaches its browser as an MCP server of that name.
-  writeMcp({ browser: {} });
-  await json("/api/tools/lazy", "PUT", { lazy: ["<portal:media>", "browser"] });
-  assert.deepEqual([...db.lazyToolNames()].sort(), ["browser_click", "browser_navigate", "generate_image", "show_image", "show_video"]);
-  assert.deepEqual(db.lazySetLabels(db.lazyToolNames()), ["browser", "media"]);
+  await json("/api/tools/lazy", "PUT", { lazy: ["painter", "pithagoras-browser"] });
+  assert.deepEqual([...db.lazyToolNames()].sort(), ["browser_click", "browser_navigate", "paint", "sketch"]);
+  assert.deepEqual(db.lazySetLabels(db.lazyToolNames()), ["painter", "pithagoras-browser"]);
   assert.deepEqual(db.toolDefaultsOff(), []);
 });
 

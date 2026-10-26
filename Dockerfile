@@ -23,6 +23,8 @@ COPY scripts scripts
 COPY extensions extensions
 # The web build copies it next to the voice files it covers (core/web/scripts/copy-vad-assets.mjs).
 COPY THIRD_PARTY_NOTICES.md ./
+# Creator mode's build copies the extension guide into its skill's reference (extensions/creator/build.mjs).
+COPY docs/guide/extension-ui.md docs/guide/extension-ui.md
 RUN npm run build
 
 FROM node:22-slim
@@ -85,16 +87,14 @@ COPY channels channels
 COPY skills skills
 # The extensions the portal ships, as the build left them: each built in its own
 # folder, where nothing of it is kept in git. Nothing loads one until it is
-# installed as a local pi package pointing here (Settings → Extensions, or
-# Settings → Add-ons for the subagent tool). One with packages of its own gets
-# what it needs to run and not what only its build did, so a new container does
-# not reach for the registry.
+# installed as a local pi package pointing here (Settings → Extensions). One
+# with packages of its own gets what it needs to run and not what only its build
+# did, so a new container does not reach for the registry.
 COPY --from=build /app/extensions extensions
 RUN for dir in extensions/*/; do \
       if [ -f "${dir}package-lock.json" ]; then npm ci --omit=dev --ignore-scripts --no-audit --no-fund --prefix "$dir" || exit 1; fi; \
     done \
     && npm cache clean --force
-COPY deploy/voice deploy/voice
 
 # HOME lives on the data volume so pi packages and settings (~/.pi/agent)
 # survive image rebuilds instead of being silently wiped.

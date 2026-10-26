@@ -6,10 +6,8 @@ import { copyText } from "../clipboard";
 import { sentPictureId } from "../chat-pictures";
 import { splitContext } from "../context-blocks";
 import { msg, t, tp, useLanguage } from "../i18n";
-import { isPictureCall } from "../picture-call";
 import { ToolView } from "../extensions/ToolView";
 import type { Chat } from "../extensions/slots";
-import { isVideoCall } from "../video-call";
 import { isEnter, isEscape } from "../shortcuts";
 import type { Item, SentImage } from "../transcript";
 import { assistantText } from "../voice";
@@ -17,8 +15,6 @@ import { CommandLine } from "./CommandLine";
 import { PictureButton } from "./ChatPictures";
 import { CompactionMarker, ThinkingBlock, ToolCall } from "./ChatActivity";
 import { Markdown, type MarkdownProps } from "./Markdown";
-import { PictureCall } from "./PictureCall";
-import { VideoCall } from "./VideoCall";
 import { CallFiles } from "./CallFiles";
 import { QuestionRecord } from "./QuestionCard";
 import { ReplyStatsLine } from "./ReplyStats";
@@ -51,7 +47,6 @@ function ContextChip({ label, body }: { label: string; body: string }) {
 /** What a row can do, for the chat to answer: one object that stays the same, so that a row is not told it has changed (see useStableActions). */
 export type RowActions = {
   openPicture: (id: string) => void;
-  openAgent: (id: string) => void;
   edit: (seq: number) => void;
   cancelEdit: () => void;
   saveEdit: (seq: number, text: string) => Promise<void>;
@@ -70,7 +65,11 @@ export type RowActions = {
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
 
-/** What each sign the guard found means, said to the person (server/src/pi/injection.ts). */
+/**
+ * What each sign the guard found means, said to the person (server/src/pi/injection.ts), and the one the subagent
+ * extension gives the words of a subagent that read outside content (extensions/subagent/src/flagged.ts), which is its
+ * own text.
+ */
 const SIGNS: Record<string, string> = {
   override: msg("tells the reader to ignore its instructions"),
   addressed: msg("speaks to an AI reading it"),
@@ -78,6 +77,7 @@ const SIGNS: Record<string, string> = {
   "role-markup": msg("contains chat-format markers that pretend to be another speaker"),
   hidden: msg("hides text in invisible characters"),
   "secret-request": msg("asks for keys, passwords or private files to be sent somewhere"),
+  "came from a subagent that read outside content": msg("came from a subagent that read outside content"),
 };
 
 /**
@@ -93,7 +93,7 @@ function FlaggedNotice({ flag, act }: { flag: NonNullable<ToolItem["flagged"]>; 
   return (
     <div role="alert" className="mt-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-xs">
       <p className="flex items-center gap-1.5 font-medium text-warn"><LuShieldAlert className="h-3.5 w-3.5 shrink-0" />{t("This result looks like a prompt injection")}</p>
-      <p className="mt-1 text-fg-muted">{t("It {signs}. Until you trust it or remove the turn it came in, this chat will not push, upload, read keys, start subagents or set up anything that runs later.", { signs })}</p>
+      <p className="mt-1 text-fg-muted">{t("It {signs}. Until you trust it or remove the turn it came in, this chat does not push, upload, read keys, start subagents or set up anything that runs later unless you say yes when it asks.", { signs })}</p>
       <div className="mt-2 flex flex-wrap gap-2">
         <button type="button" disabled={busy} className="rounded-lg border border-line px-2.5 py-1 text-xs hover:bg-raised disabled:opacity-50"
           onClick={async () => { setBusy(true); if (await act.trustFlagged(flag.id)) setTrusted(true); setBusy(false); }}>
@@ -130,11 +130,9 @@ export const TranscriptRow = memo(function TranscriptRow({
   seqs,
   switching,
   sessionId,
-  folder,
   chat,
   mermaid,
   mermaidOptions,
-  agent,
   act,
 }: {
   item: Item;
@@ -154,11 +152,8 @@ export const TranscriptRow = memo(function TranscriptRow({
   sessionId: string;
   /** The chat the row is in, for what an extension draws in it. */
   chat?: Chat;
-  folder: string;
   mermaid: DiagramPlugin | null;
   mermaidOptions: MarkdownProps["mermaid"];
-  /** The subagent this tool call started, if it did. */
-  agent?: string;
   act: RowActions;
 }) {
   // What it says is in the language chosen: a row that is not drawn for the chat's draws is drawn for that.
@@ -397,27 +392,11 @@ export const TranscriptRow = memo(function TranscriptRow({
     );
   }
   if (item.kind === "tool") {
-    // The portal's picture tools are a preview of the picture, not a tool card.
-    if (isPictureCall(item)) {
-      return (
-        <div data-key={item.id} className={`tool-row${enter}`}>
-          <PictureCall item={item} sessionId={sessionId} folder={folder} onOpen={act.openPicture} />
-        </div>
-      );
-    }
-    // The portal's generate_video is the clip itself, in its player.
-    if (isVideoCall(item)) {
-      return (
-        <div data-key={item.id} className={`tool-row${enter}`}>
-          <VideoCall item={item} sessionId={sessionId} />
-        </div>
-      );
-    }
     return (
       <div data-key={item.id} className={`tool-row${enter}`}>
       {/* The card for it with the files the call gave, or what an extension draws for its own tool: see extensions/ToolView.tsx. */}
-      <ToolView item={item} chat={chat}>
-        <ToolCall item={item} chat={chat} onOpenAgent={agent ? () => act.openAgent(agent) : undefined} />
+      <ToolView item={item} chat={chat} openPicture={act.openPicture}>
+        <ToolCall item={item} chat={chat} />
         <CallFiles item={item} sessionId={sessionId} onOpenPicture={act.openPicture} />
       </ToolView>
       {item.flagged && <FlaggedNotice flag={item.flagged} act={act} />}

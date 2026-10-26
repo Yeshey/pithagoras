@@ -2,7 +2,6 @@ import { bindHost, loginThrottle, portalSecurityHeaders, tlsFiles } from "./http
 import { eventsRouter } from "./api/events.js";
 import { serveWeb } from "./web-static.js";
 import { clampLevel } from "./pi/model-runtime.js";
-import { ASK_QUESTION_TOOL } from "./pi/ask-question.js";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
@@ -43,8 +42,6 @@ import {
   clearAgentTools,
   routineTools,
   setRoutineTools,
-  setRoutineBrowserSwitch,
-  seenBrowserTools,
   toolDefaultsFor,
   setContextLimit,
   setDefaultContextLimit,
@@ -62,12 +59,13 @@ import {
   lazyMarks,
   lazyRefused,
   lazyToolSets,
+  noticeMcpEdits,
   setLazyToolSets,
   toolGroupNames,
   updateSession,
 } from "./db.js";
 import { checkWorkspace, workspaceRoot } from "./workspaces.js";
-import { insideReal, isWithinText } from "./within.js";
+import { insideReal, isWithinText, realPath } from "./within.js";
 import { agentHome, agentHomePath } from "./agent-home.js";
 import { dataFolder } from "./data-dir.js";
 import { resolveChannelSession } from "./agent.js";
@@ -75,13 +73,13 @@ import { AgentError, agentsRoot, chatsOf, defaultAgent, deletable, deleteAgent, 
 import { sweepRemoved } from "./folder-removal.js";
 import { agentsRouter } from "./api/agents.js";
 import { agentFor, linkedAgent } from "./project-agent.js";
-import { understoryOn } from "./features.js";
+import { memoryHolder } from "./memory-holder.js";
 import { heartbeat } from "./heartbeat.js";
 import { deleteNotesOf } from "./activity.js";
 import { EXECUTOR_KIND } from "./executor-kind.js";
-import { sessions, CommandFailed, IMAGE_ROOT } from "./session-manager.js";
+import { sessions, CodemodeHeld, CommandFailed, IMAGE_ROOT } from "./session-manager.js";
 import { ImageError, MAX_IMAGE_BYTES, MAX_IMAGES, imagePath, mimeOf, parseImages, saveImages } from "./prompt-images.js";
-import { defaultsFor, exceptionsFor, heldOffUnshown, toolEnabled, toolSource } from "./tool-policy.js";
+import { defaultsFor, toolSource } from "./tool-policy.js";
 import { mcpRouter, mcpServerNames, onMcpWritten } from "./api/mcp.js";
 import { authMode, changePassword, checkPassword, isAuthed, issueCookie, passwordRefused, requireAuth, setUpPassword, shortPassword, signOut } from "./auth.js";
 import { activeSso, endSessionUrl, oidcRouter, providerFor, rememberProvider } from "./oidc-login.js";
@@ -89,40 +87,34 @@ import { CALLBACK_PATH, OidcConfigError, discover, parseOidcConfig, shownForm } 
 import { removeSso, saveSso, ssoConfig } from "./sso-settings.js";
 import { sweep } from "./login-streams.js";
 import { packagesRouter } from "./api/packages.js";
-import { extensionsRouter, noteLoadedExtensions, syncExtensionServers } from "./api/extensions.js";
+import { extensionsRevision, extensionsRouter, noteLoadedExtensions, syncExtensionServers } from "./api/extensions.js";
 import { installDefaultExtensions, stopInstallingDefaults } from "./default-extensions.js";
-import { extensionRoutes, openingFor, stopServerHalves } from "./extension-host.js";
+import { catchExtensionCrashes, extensionRoutes, folderRemoved, openingFor, stopServerHalves } from "./extension-host.js";
 import { channelsRouter } from "./api/channels.js";
 import { removeRoutines, routinesIn, routinesRouter, switchOffRoutines } from "./api/routines.js";
 import { filesRouter } from "./api/files.js";
 import { holdsWork, unsavedRefusal, unsavedWork } from "./git.js";
 import { skillsRouter } from "./api/skills.js";
 import { featuresRouter } from "./api/features.js";
-import { imagesRouter } from "./api/images.js";
-import { forgetPicturesIn } from "./image-gallery.js";
-import { videosRouter } from "./api/videos.js";
-import { forgetVideosIn } from "./video-gallery.js";
-import { memoryRouter } from "./api/memory.js";
-import { memoryLlmRouter } from "./memory-llm.js";
+import { modesRouter } from "./api/modes.js";
+import { isToolList, layerExceptions, layerTools, toolsUnsupported } from "./tool-layers.js";
 import { modelLevels, modelRuntime, providersRouter } from "./api/providers.js";
 import { peopleRouter } from "./api/people.js";
 import { voiceRouter } from "./api/voice.js";
-import { adoptPortalBrowser, browserRouter, pinConnection } from "./api/browser.js";
 import { BACKGROUND_SUPPORTED, MARKER, clearFinished, listJobs, readOutput, stopJob, stopJobsIn } from "./background.js";
-import { attachBrowserUpgrade, mountBrowserProxy } from "./browser-proxy.js";
-import { watchBrowserFrames } from "./extensions/browser-frames.js";
+import { attachUpgrades } from "./upgrades.js";
 import { startLlamaProxy } from "./llama-progress.js";
 import { applyOnStart } from "./sandbox/apply.js";
 import { trustFlagged } from "./pi/guard.js";
 import { sandboxPolicy, sandboxSupport } from "./sandbox/policy.js";
 import { sandboxRouter } from "./api/sandbox.js";
+import { guardRouter } from "./api/guard.js";
 import { logsRouter } from "./api/logs.js";
 import { restartRouter } from "./api/restart.js";
 import { startUpdateChecks, updateRouter } from "./api/update.js";
 import { requestedExit } from "./restart.js";
 import { LOG_BOOT } from "./logs.js";
 import { closeConnections } from "./close-connections.js";
-import { scheduleDreams } from "./extensions/understory-service.js";
 import { routineSupervisor } from "./routines/supervisor.js";
 import { channelSupervisor } from "./channels/supervisor.js";
 import {
@@ -135,6 +127,7 @@ import { getBuiltinCommands, picturesRefused } from "./pi/builtins.js";
 import { SessionEditError } from "./pi/session-edit.js";
 import {
   NEW_CHAT_TITLE,
+  cleanTitle,
   ProjectError,
   createProject,
   deleteProjectFolder,
@@ -167,13 +160,10 @@ const promptJson = express.json({ limit: `${Math.ceil((MAX_IMAGES * MAX_IMAGE_BY
 // An upload is the file itself, streamed to disk by its route, whatever type
 // the browser gave it — a .json file must not be read as a request.
 const UPLOAD_ROUTE = /^\/api\/sessions\/[^/]+\/upload$/;
-// An edit on the Media page may carry a mask, a picture: its route reads its own, after the login too.
-const IMAGE_EDIT_ROUTE = "/api/images/edit";
 const smallJson = express.json({ limit: "2mb" });
 app.use((req, res, next) => {
-  // Understory's requests for a model carry whole conversations: its route reads its own.
-  // An extension's routes read their own as well, each as it needs: see extension-host.ts.
-  if (UPLOAD_ROUTE.test(req.path) || PROMPT_ROUTE.test(req.path) || req.path === IMAGE_EDIT_ROUTE || req.path.startsWith("/understory-llm/") || req.path.startsWith("/api/x/")) return next();
+  // An extension's routes read their own, each as it needs: see extension-host.ts.
+  if (UPLOAD_ROUTE.test(req.path) || PROMPT_ROUTE.test(req.path) || req.path.startsWith("/api/x/")) return next();
   smallJson(req, res, next);
 });
 app.use(cookieParser());
@@ -302,8 +292,6 @@ app.put("/api/auth/sso", requireAuth, loginThrottle(), async (req, res) => {
   res.json({ settings: shownForm(config), only: config.only, ...(config.endSession && !provider.endSessionEndpoint ? { noEndSession: true } : {}) });
 });
 
-// Understory's model server, in "the chat's" mode: its own token, not a portal login.
-app.use(memoryLlmRouter((id) => sessions.currentModel(id)));
 app.use("/api", requireAuth);
 
 // --- global settings (defaults for every new session) ---
@@ -429,6 +417,15 @@ const chatsIn = (dir: string, all = listSessions()) =>
   all.filter((s) => isWithinText(dir, s.workspace));
 
 /**
+ * Without the child chats whose parent is among them: each goes with its parent, which stands for it (see
+ * SessionManager.discard), and a chat's children are no chats of the project's own to count.
+ */
+const withoutChildren = <T extends { id: string; parent_id: string | null }>(rows: T[]): T[] => {
+  const ids = new Set(rows.map((row) => row.id));
+  return rows.filter((row) => !row.parent_id || !ids.has(row.parent_id));
+};
+
+/**
  * The same, and those that reach the folder through a link too: what deleting
  * it would take from under them. Each place is looked at once, since many
  * chats share one, and only this one project's are followed.
@@ -469,11 +466,11 @@ app.get("/api/projects", (req, res) => {
     const all = listSessions();
     const withTools = projectsWithTools();
     const projects = listProjects(WORKSPACE_ROOT).map((p) => {
-      const chats = chatsIn(p.path, all);
+      const chats = withoutChildren(chatsIn(p.path, all));
       return {
         ...p,
         ...linkOf(p.name),
-        ...(links.get(p.name)?.understoryOff ? { understoryOff: true } : {}),
+        ...(links.get(p.name)?.memoryOff ? { memoryOff: true } : {}),
         hasTools: withTools.has(p.name),
         sessions: chats.length,
         lastActive: chats.reduce((latest, s) => (s.updated_at > latest ? s.updated_at : latest), "") || null,
@@ -484,9 +481,6 @@ app.get("/api/projects", (req, res) => {
     projectFailure(res, e);
   }
 });
-
-/** Whether a request's list of tools to switch off is one: a list of names. */
-const isToolList = (value: unknown): value is string[] => Array.isArray(value) && value.every((name) => typeof name === "string");
 
 /**
  * Stores what a project's chats start with, given the tools it wants off: the
@@ -531,8 +525,8 @@ app.post("/api/projects", (req, res) => {
     }
     // The same for the agent: a folder of this name left behind by an earlier project does not give its link to this one.
     clearProjectAgent(project.name);
-    if (wanted.agent !== undefined || wanted.understory !== undefined) {
-      setProjectAgent(project.name, { agent: wanted.agent ?? "", understoryOff: wanted.understory === false });
+    if (wanted.agent !== undefined || wanted.memory !== undefined) {
+      setProjectAgent(project.name, { agent: wanted.agent ?? "", memoryOff: wanted.memory === false });
     }
     res.json(project);
   } catch (e) {
@@ -542,29 +536,29 @@ app.post("/api/projects", (req, res) => {
 
 /**
  * What a request says about the agent a project works with: `agent`, an
- * agent's id or null (or "") for none, and `understory`, whether Understory is
- * the project's memory. Either may be left out. An agent that does not exist
- * is refused rather than stored: the project would be a blank slate and the
- * page would not know why.
+ * agent's id or null (or "") for none, and `memory`, whether the project has
+ * the agent's memory where an extension holds it. Either may be left out. An
+ * agent that does not exist is refused rather than stored: the project would
+ * be a blank slate and the page would not know why.
  */
-function agentLinkOf(body: unknown): { agent?: string; understory?: boolean } | { error: string; status: number } {
-  const { agent, understory } = (body ?? {}) as { agent?: unknown; understory?: unknown };
+function agentLinkOf(body: unknown): { agent?: string; memory?: boolean } | { error: string; status: number } {
+  const { agent, memory } = (body ?? {}) as { agent?: unknown; memory?: unknown };
   if (agent !== undefined && agent !== null && typeof agent !== "string") return { error: "agent must be an agent's id, or null", status: 400 };
-  if (understory !== undefined && typeof understory !== "boolean") return { error: "understory must be true or false", status: 400 };
+  if (memory !== undefined && typeof memory !== "boolean") return { error: "memory must be true or false", status: 400 };
   if (agent && !getAgent(agent)) return { error: "No such agent", status: 404 };
-  return { ...(agent !== undefined ? { agent: agent ?? "" } : {}), ...(understory !== undefined ? { understory } : {}) };
+  return { ...(agent !== undefined ? { agent: agent ?? "" } : {}), ...(memory !== undefined ? { memory } : {}) };
 }
 
-/** The agent a project works with and whether Understory is its memory, as its page shows them. */
+/** The agent a project works with and whether it has the agent's memory, as its page shows them. */
 function agentOfProject(name: string) {
   const link = projectAgent(name);
   const agent = linkedAgent(name)?.id ?? null;
   return {
     agent,
-    // What the chats get (see understoryAt): a blank slate has no agent whose memory it would be, whatever the stored switch says.
-    understory: !!agent && !link.understoryOff,
-    // Whether the portal has Understory at all: without it there is nothing for the project to do without.
-    understoryAvailable: understoryOn(),
+    // What the chats get (see memoryHeldAt): a blank slate has no agent whose memory it would be, whatever the stored switch says.
+    memory: !!agent && !link.memoryOff,
+    // Whether something holds the agent's memory at all: without it there is nothing for the project to do without.
+    memoryAvailable: memoryHolder() !== undefined,
   };
 }
 
@@ -583,20 +577,20 @@ app.get("/api/projects/:name/agent", (req, res) => {
 });
 
 /**
- * Change the agent a project works with, or whether Understory is its memory;
+ * Change the agent a project works with, or whether it has the agent's memory;
  * what is left out stays. Chats already open pick it up after /reload, like
  * the project's instructions.
  */
 app.put("/api/projects/:name/agent", (req, res) => {
   const wanted = agentLinkOf(req.body);
   if ("error" in wanted) return res.status(wanted.status).json({ error: wanted.error });
-  if (wanted.agent === undefined && wanted.understory === undefined) return res.status(400).json({ error: "agent or understory required" });
+  if (wanted.agent === undefined && wanted.memory === undefined) return res.status(400).json({ error: "agent or memory required" });
   try {
     const project = getProject(WORKSPACE_ROOT, req.params.name);
     const held = projectAgent(project.name);
     setProjectAgent(project.name, {
       agent: wanted.agent ?? held.agent,
-      understoryOff: wanted.understory === undefined ? held.understoryOff : !wanted.understory,
+      memoryOff: wanted.memory === undefined ? held.memoryOff : !wanted.memory,
     });
     res.json(agentOfProject(project.name));
   } catch (e) {
@@ -612,7 +606,7 @@ app.get("/api/projects/:name", async (req, res) => {
     res.json({
       ...project,
       ...(unsaved ? { unsaved } : {}),
-      sessions: workingIn(project.path, listSessions()).length,
+      sessions: withoutChildren(workingIn(project.path, listSessions())).length,
       // The ones a delete would switch off: one already off is not changed by it.
       routines: routinesIn(project.path).filter((r) => r.enabled).map((r) => r.name),
       ...describeProject(WORKSPACE_ROOT, project.name),
@@ -680,38 +674,6 @@ app.put("/api/projects/:name/tools", async (req, res) => {
 });
 
 /**
- * A layer's tools as its page shows them: what the portal has seen registered
- * where the layer's chats and runs work (`folder`), on or off by `below` — every
- * layer under this one — bent by what this one says. `defaultOn` is what the
- * layers under it say, which is what this one disagrees with. Shaped like a
- * project's and a chat's, so the page draws them all the same way.
- */
-function layerTools(folder: string, below: string[], exceptions: { off: string[]; on: string[] }, unwatched = false) {
-  const servers = mcpServerNames();
-  const lazy = lazyMarks();
-  return {
-    // A routine's runs have nobody to ask (see asksQuestions), so its page does not offer the tool.
-    tools: shownTools(folder).filter((tool) => !(unwatched && tool.name === ASK_QUESTION_TOOL && tool.inline)).map((tool) => ({
-      ...tool,
-      source: toolSource(tool.name, tool.source, servers),
-      enabled: toolEnabled(tool.name, below, exceptions),
-      defaultOn: !below.includes(tool.name),
-      ...lazy(tool),
-    })),
-    live: false,
-    names: toolGroupNames(),
-    off: defaultsFor(below, exceptions),
-  };
-}
-
-/** The exceptions to store for a layer, given what it wants off: as for a project. */
-function layerExceptions(folder: string, below: string[], held: { off: string[]; on: string[] }, off: string[]) {
-  const shown = shownTools(folder).map((t) => t.name);
-  const answered = [...shown, ...held.off, ...held.on];
-  return exceptionsFor(heldOffUnshown(off, shown, held), below, answered, held);
-}
-
-/**
  * An agent's tools: its exceptions to the portal-wide default, for every chat in
  * its home and every run it does on its own (its heartbeat, the routines that
  * run in its home). Its chats in a project are not in its home, and follow the
@@ -770,19 +732,7 @@ app.put("/api/routines/:id/tools", async (req, res) => {
   if ("error" in routine) return res.status(409).json({ error: routine.error });
   try {
     const below = toolDefaultsFor(routine.folder, null, "routine");
-    const browser = seenBrowserTools();
-    const wanted = layerExceptions(routine.folder, below, routineTools(routine.slug, browser), off);
-    // The browser's tools its lists do not name follow its old switch (routineTools). So what the page said of each
-    // is written down, even where the layers under it agree: left out, a browser switched on here would go back to
-    // what the switch says.
-    const shown = new Set(shownTools(routine.folder).map((t) => t.name));
-    for (const name of browser) {
-      if (!shown.has(name) || wanted.off.includes(name) || wanted.on.includes(name)) continue;
-      (off.includes(name) ? wanted.off : wanted.on).push(name);
-    }
-    const stored = setRoutineTools(routine.slug, wanted);
-    // And the switch says what a browser tool that turns up later starts with: what the browser has here now.
-    if (browser.length) setRoutineBrowserSwitch(routine.slug, browser.some((name) => toolEnabled(name, below, stored)));
+    const stored = setRoutineTools(routine.slug, layerExceptions(routine.folder, below, routineTools(routine.slug), off));
     const applied = await sessions.applyToolDefaults({ routine: routine.slug });
     res.json({ off: defaultsFor(below, stored), applied });
   } catch (e) {
@@ -812,7 +762,7 @@ app.delete("/api/projects/:name", async (req, res) => {
       const unsaved = await unsavedWork(project.path);
       if (unsaved && holdsWork(unsaved)) return res.status(409).json(unsavedRefusal(unsaved));
     }
-    const chats = workingIn(project.path, listSessions());
+    const chats = withoutChildren(workingIn(project.path, listSessions()));
     if (chats.some((s) => sessions.isBusy(s.id) || sessions.backgroundWork(s.id))) {
       return res.status(409).json({ error: "A chat in this project is still working. Stop it first." });
     }
@@ -844,10 +794,10 @@ app.delete("/api/projects/:name", async (req, res) => {
       if (late.some((r) => routineSupervisor.isRunning(r.slug))) {
         return res.status(409).json({ error: "A routine started running in this project meanwhile. Wait for it to finish, or stop it." });
       }
+      // Where it really is, while it is there to say: what the server halves were told of it is that.
+      const gone = realPath(project.path) ?? project.path;
       deleteProjectFolder(WORKSPACE_ROOT, project.name);
-      // The pictures of every chat that worked there, the routine runs the folder's removal leaves behind too: no file of them is left to show.
-      forgetPicturesIn(project.path);
-      forgetVideosIn(project.path);
+      folderRemoved(gone);
       clearProjectTools(project.name);
       clearProjectAgent(project.name);
       const switchedOff = switchOffRoutines([...routines, ...late]);
@@ -882,7 +832,7 @@ app.delete("/api/agents/:id", async (req, res) => {
     const agent = deletable(req.params.id);
     // Its chats and its conversations — those started on the Agent page and
     // through channels — and the one its heartbeat looks around in.
-    const chats = workingIn(agent.home, [...listSessions(), ...listAgentSessions(), ...listHeartbeatSessions()]);
+    const chats = withoutChildren(workingIn(agent.home, [...listSessions(), ...listAgentSessions(), ...listHeartbeatSessions()]));
     if (chats.some((s) => sessions.isBusy(s.id) || sessions.backgroundWork(s.id))) {
       return res.status(409).json({ error: "A chat with this agent is still working. Stop it first." });
     }
@@ -900,16 +850,14 @@ app.delete("/api/agents/:id", async (req, res) => {
       for (const chat of chats) await sessions.discard(chat.id);
       // The jobs they started go with them, in a folder that is kept as well: nothing would be left to list or stop them.
       const jobsStopped = await stopJobsIn(agent.home);
+      const home = realPath(agent.home) ?? agent.home;
       deleteAgent(agent.id, { deleteFolder: req.query.folder === "delete" });
       // What it said about tools: an agent made later under the same name starts from the default.
       clearAgentTools(agent.id);
       // The projects that worked with it are blank slates again.
       releaseProjectsOf(agent.id);
-      // The pictures of every chat that worked there, the routine runs the folder's removal leaves behind too: no file of them is left to show.
-      if (req.query.folder === "delete") {
-        forgetPicturesIn(agent.home);
-        forgetVideosIn(agent.home);
-      }
+      // Its folder, where it went with it: the server halves are told, as of a project's.
+      if (req.query.folder === "delete") folderRemoved(home);
       deleteNotesOf(agent.id);
       // With its folder they have nowhere left to run, and an agent made under the
       // same name must not take them over. Kept with the folder, they stay, switched off.
@@ -932,23 +880,15 @@ app.delete("/api/agents/:id", async (req, res) => {
 
 // --- sessions ---
 
-/** The longest name a chat can be given: what the rename field takes. */
-const MAX_TITLE = 120;
-
 /**
- * A name as it is kept: on one line and no longer than the field allows, however
- * it came in — the rename field, /name, or a chat made through the API. By
- * character, so an emoji at the cut is not left in halves. Empty when there is
- * no name in it.
+ * SQLite stores pinned as 0/1; the API speaks booleans. A child chat names its parent, and says whether it is listed;
+ * which package made it is the portal's to know. It also says when it waits on a person (`asking`), so that its
+ * parent's row can say so: a child's dialogs are shown on its own page, which nobody may have open. Only a child's,
+ * since asking every chat in the list for its questions would cost a query each, on every poll.
  */
-const cleanTitle = (raw: unknown): string =>
-  typeof raw === "string"
-    ? Array.from(raw.replace(/\s+/g, " ").trim()).slice(0, MAX_TITLE).join("").trimEnd()
-    : "";
-
-/** SQLite stores pinned as 0/1; the API speaks booleans. */
-const toApi = (s: ReturnType<typeof getSession> & {}) => ({
+const toApi = ({ parent_id, listed, creator: _creator, ...s }: ReturnType<typeof getSession> & {}) => ({
   ...s,
+  ...(parent_id ? { parent: parent_id, listed: listed === 1, ...(sessions.waitsOnPerson(s.id) ? { asking: true } : {}) } : {}),
   pinned: Boolean(s.pinned),
   live: sessions.isRunning(s.id),
   // The results flagged as a suspected prompt injection that the person trusted, for the chat to say so.
@@ -956,7 +896,8 @@ const toApi = (s: ReturnType<typeof getSession> & {}) => ({
 });
 
 app.get("/api/sessions", (_req, res) => {
-  res.json({ sessions: listChatSessions().map(toApi), executor: EXECUTOR_KIND });
+  // With what is installed, for every page to follow a change made elsewhere: see extensionsRevision.
+  res.json({ sessions: listChatSessions().map(toApi), executor: EXECUTOR_KIND, extensions: extensionsRevision() });
 });
 
 /**
@@ -1032,6 +973,17 @@ app.get("/api/agent/orb", (req, res) => {
   res.json(orbOf(agentFor(session?.workspace)));
 });
 
+/**
+ * The agent a chat (`?session=`) is with and its avatar, which voice mode
+ * shows: the agent whose home the chat is in, the one a chat in a project is
+ * linked to, and else the first.
+ */
+app.get("/api/agent/avatar", (req, res) => {
+  const session = typeof req.query.session === "string" ? getSession(req.query.session) : undefined;
+  const agent = agentFor(session?.workspace);
+  res.json({ agent: { id: agent.id, name: agent.name }, orb: orbOf(agent) });
+});
+
 app.post("/api/sessions", (req, res) => {
   const { workspace, agent: agentId } = req.body ?? {};
   const title = cleanTitle(req.body?.title);
@@ -1083,15 +1035,8 @@ app.patch("/api/sessions/:id", (req, res) => {
 app.delete("/api/sessions/:id", async (req, res) => {
   const session = getSession(req.params.id);
   if (!session) return res.status(404).json({ error: "Not found" });
-  try {
-    await sessions.discard(session.id);
-    deleteSession(session.id);
-  } catch (e) {
-    // The chat stays: it takes messages again.
-    sessions.reopen([session.id]);
-    throw e;
-  }
-  sessions.removeFiles(session.id);
+  // Its child chats with it. One that fails leaves the chat, which takes messages again.
+  await sessions.deleteChat(session.id);
   res.json({ ok: true });
 });
 
@@ -1261,16 +1206,6 @@ app.put("/api/sessions/:id/draft", (req, res) => {
 });
 
 /**
- * A container session reaches pi over RPC, which has no tool registry to ask
- * and nothing to tell. Said plainly rather than answered with an empty list
- * and a switch that does nothing.
- */
-const TOOLS_UNSUPPORTED =
-  "Tools cannot be switched with EXECUTOR=container: pi runs inside the container and the portal never sees what it registered";
-/** With a `code`, so that the page tells this answer from any other failure of the same request by it, not by the sentence. */
-const toolsUnsupported = { error: TOOLS_UNSUPPORTED, code: "tools-unsupported" };
-
-/**
  * The tools this conversation could use, and which of them are on.
  *
  * A running session answers from pi's registry. One that is not running —
@@ -1296,7 +1231,12 @@ app.put("/api/sessions/:id/tools", async (req, res) => {
   if (EXECUTOR_KIND === "container") return res.status(400).json(toolsUnsupported);
   const off = req.body?.off;
   if (!isToolList(off)) return res.status(400).json({ error: "off must be a list of tool names" });
-  res.json({ off: await sessions.setTools(session.id, off) });
+  try {
+    res.json({ off: await sessions.setTools(session.id, off) });
+  } catch (e) {
+    if (e instanceof CodemodeHeld) return res.status(409).json({ error: e.message, code: e.code });
+    throw e;
+  }
 });
 
 /**
@@ -1454,12 +1394,12 @@ app.post("/api/sessions/:id/subagents/:agent/stop", (req, res) => {
 
 // What an extension's server half tells a page that opens this chat, asked for by a browser half that came into the
 // page after the chat's stream had opened: see extension-host.ts.
-app.get("/api/sessions/:id/extension-ui", (req, res) => {
+app.get("/api/sessions/:id/extension-ui", async (req, res) => {
   const session = getSession(req.params.id);
   if (!session) return res.status(404).json({ error: "Not found" });
   const extension = typeof req.query.extension === "string" ? req.query.extension : "";
   if (!extension) return res.status(400).json({ error: "Which extension it is for is missing" });
-  res.json({ pushes: openingFor(session.id, extension) });
+  res.json({ pushes: await openingFor(session.id, extension) });
 });
 
 // What an extension's browser half says to its own half in this chat: see extension-ui.ts.
@@ -1755,36 +1695,29 @@ app.get("/api/sessions/:id/commands", async (req, res) => {
 app.use("/api", packagesRouter());
 app.use("/api", extensionsRouter());
 app.use("/api", featuresRouter());
-app.use("/api", imagesRouter());
-app.use("/api", videosRouter());
-app.use("/api", memoryRouter());
+app.use("/api", modesRouter());
 app.use("/api", channelsRouter());
 app.use("/api", agentsRouter());
-app.use(
-  "/api",
-  routinesRouter((routine) => {
-    sessions.applyToolDefaults({ routine }).catch((e) => console.error(`[portal] could not apply a routine's tools to its runs: ${(e as Error).message}`));
-  })
-);
+app.use("/api", routinesRouter());
 app.use("/api", skillsRouter());
 app.use("/api", filesRouter());
 // What the configuration offers is what a running chat may use: told at once, as a default is.
 onMcpWritten(() => {
   sessions.applyToolDefaults().catch((e) => console.error(`[portal] could not apply the MCP configuration to running chats: ${(e as Error).message}`));
 });
+// An edit made to mcp.json while the portal was not running, taken in before anything lists the tools or starts a chat.
+noticeMcpEdits();
 app.use("/api", mcpRouter());
 app.use("/api", providersRouter());
 app.use("/api", peopleRouter());
-app.use("/api", browserRouter());
 app.use("/api", sandboxRouter(sessions));
+app.use("/api", guardRouter());
 app.use("/api", logsRouter());
 app.use("/api", updateRouter());
 app.use("/api", restartRouter());
 app.use("/api", voiceRouter());
 // The routes of the installed extensions' server halves, each under its package's name.
 app.use("/api/x", extensionRoutes);
-// Before the SPA fallback, which answers everything that is not /api.
-mountBrowserProxy(app);
 
 // --- event stream ---
 
@@ -1841,8 +1774,9 @@ mkdirSync(BIN_DIR, { recursive: true });
  * TLS when a certificate is supplied, plain HTTP otherwise.
  *
  * Optional because most deployments sit on a LAN or a tailnet and do not want
- * to think about certificates. Needed for the embedded browser, which refuses
- * to run unless every page above it is a secure context.
+ * to think about certificates. Needed for a page that needs a secure context,
+ * such as a remote browser's client in a frame, which refuses to run unless
+ * every page above it is one.
  */
 const tlsAt = tlsFiles();
 const tls =
@@ -1905,9 +1839,8 @@ const cannotListen = (e: Error) => {
 };
 server.once("error", cannotListen);
 server.once("listening", () => server.off("error", cannotListen));
-attachBrowserUpgrade(server);
-// Keeps the agent's browser rendering when nobody has the panel open.
-watchBrowserFrames();
+// Every WebSocket upgrade, each an extension's under its routes.
+attachUpgrades(server);
 // Reports how far llama.cpp has got through a prompt, which is otherwise a
 // silent minute or two before the first token.
 startLlamaProxy(
@@ -1919,7 +1852,9 @@ sessions.startReaper();
 // Folders put aside for removal that a stop cut short: see folder-removal.ts.
 sweepRemoved(WORKSPACE_ROOT);
 sweepRemoved(agentsRoot());
-// The server halves of the installed extensions: see extension-host.ts.
+// The server halves of the installed extensions: see extension-host.ts. One that crashes is stopped and held off, and the
+// portal goes on.
+catchExtensionCrashes();
 void syncExtensionServers().catch((e) => console.error("[extensions] could not start the server halves:", e));
 // What a portal starts with is installed once (extensions/defaults.json), and then loaded like anything installed by
 // hand: an install brings the server halves in line again. What the portal runs with is noted once that is done.
@@ -1928,14 +1863,10 @@ void syncExtensionServers().catch((e) => console.error("[extensions] could not s
 const startingWith = installDefaultExtensions()
   .catch((e) => console.error("[extensions] could not install what a portal starts with:", e))
   .finally(() => void noteLoadedExtensions());
-pinConnection();
-adoptPortalBrowser();
 // The sandbox's sudo rules live outside the data volume, so a new container needs them put back.
 void applyOnStart(sandboxPolicy(), sandboxSupport()).then((r) => {
   if (sandboxPolicy().enabled) console.log(`[sandbox] ${r.ok ? "on" : "not applied"}${r.warnings.length ? `: ${r.warnings.join("; ")}` : ""}`);
 });
-// The memory tidied up at its set time, when the portal runs Understory.
-scheduleDreams();
 
 /**
  * The stop is one, however many signals ask for it: a second Ctrl-C does, and so

@@ -29,7 +29,7 @@ export const switchIs = (here: boolean | null, stored: string | null): boolean =
 /** Whether the switch is on. */
 export const animationsChosen = (): boolean => switchIs(kept, local.get(KEY));
 /** Whether the system asks for less motion. */
-export const reducedMotion = (): boolean => typeof matchMedia === "function" && matchMedia(REDUCED).matches;
+const reducedMotion = (): boolean => typeof matchMedia === "function" && matchMedia(REDUCED).matches;
 /** What plays: the switch, unless the system asks against it. */
 export const plays = (chosen: boolean, reduced: boolean): boolean => chosen && !reduced;
 /** Whether the extra animations play right now, as the page says. */
@@ -226,6 +226,10 @@ export function picture(source: HTMLElement | null, clip?: HTMLElement | null): 
   frame.setAttribute("aria-hidden", "true");
   frame.setAttribute("data-ghost", "");
   frame.setAttribute("inert", "");
+  // A copy of what an extension drew is marked as the extension's too: its
+  // stylesheet reaches only what is inside an element marked with its name.
+  const extension = source.closest("[data-extension]")?.getAttribute("data-extension");
+  if (extension) frame.setAttribute("data-extension", extension);
   Object.assign(frame.style, {
     position: "fixed", left: `${bounds.left}px`, top: `${bounds.top}px`, width: `${bounds.width}px`, height: `${bounds.height}px`,
     overflow: clip ? "hidden" : "visible", pointerEvents: "none",

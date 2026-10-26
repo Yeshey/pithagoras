@@ -20,12 +20,15 @@ const REACHED = {
   volumes: [{ name: 'pithagoras_browser-profile', owner: 'pithagoras-browser' }],
 };
 
-/** Settings, on Docker's page, with `overview` as how things stand; what the page asked of the server half is in `asked`. */
-async function open(page: Page, overview: unknown) {
+/**
+ * Settings, on Docker's page, with `overview` as how things stand and `extensions` installed; what the page asked of the
+ * server half is in `asked`.
+ */
+async function open(page: Page, overview: unknown, extensions: unknown[] = [DOCKER]) {
   const asked: string[] = [];
   const state = { overview };
   await mockPortal(page, ({ path, method }) => {
-    if (path === '/api/extensions' && method === 'GET') return { settingsPath: '/a/settings.json', extensions: [DOCKER] };
+    if (path === '/api/extensions' && method === 'GET') return { settingsPath: '/a/settings.json', extensions };
     if (path === `${BASE}/overview`) return state.overview;
     if (path === `${BASE}/containers/pithagoras-browser/logs`) return { text: 'started\nlistening on 9222\n' };
     if (path.startsWith(`${BASE}/`)) {
@@ -80,6 +83,14 @@ test('each extension\'s containers are listed under it, and are stopped, started
   await expect.poll(() => asked.at(-1)).toBe('DELETE /containers/voice-tts');
 });
 
+test('one Docker is waiting to start again is stopped from here, which ends the wait: a start would do nothing', async ({ page }) => {
+  const { dialog, asked } = await open(page, { ...REACHED, containers: [container({ name: 'pithagoras-voice', owner: 'pithagoras-voice', state: 'restarting', status: 'Restarting (1) 4 seconds ago' })] });
+  const voice = dialog.getByRole('listitem').filter({ hasText: 'pithagoras-voice' }).filter({ hasText: 'Restarting' });
+  await expect(voice.getByRole('button', { name: 'Start' })).toHaveCount(0);
+  await voice.getByRole('button', { name: 'Stop' }).click();
+  await expect.poll(() => asked).toEqual(['POST /containers/pithagoras-voice/stop']);
+});
+
 test('a volume is deleted only once the person says so, being what an extension keeps', async ({ page }) => {
   const { dialog, asked } = await open(page, REACHED);
   const volume = dialog.getByRole('listitem').filter({ hasText: 'pithagoras_browser-profile' });
@@ -91,4 +102,15 @@ test('a volume is deleted only once the person says so, being what an extension 
   await volume.getByRole('button', { name: 'Delete' }).click();
   await page.getByRole('alertdialog').getByRole('button', { name: 'Delete' }).click();
   await expect.poll(() => asked).toEqual(['DELETE /volumes/pithagoras_browser-profile']);
+});
+
+test("in Settings' list it is Docker, with its own icon, not the package's name and the mark every extension has", async ({ page }) => {
+  // A package with settings the portal found and no page of its own is drawn with that mark.
+  const plain = { spec: 'npm:plain', name: 'plain', version: '1.0.0', kinds: ['pi'], settings: [{ key: 'token', value: '', configured: false }], enabled: true, scope: 'user' };
+  const { dialog } = await open(page, REACHED, [DOCKER, plain]);
+  const entry = dialog.locator('.rail-item').filter({ hasText: /^Docker$/ });
+  await expect(entry).toBeVisible();
+  await expect(dialog.locator('.rail-item').filter({ hasText: 'pithagoras-docker' })).toHaveCount(0);
+  const mark = await dialog.locator('.rail-item').filter({ hasText: /^plain$/ }).locator('svg').innerHTML();
+  expect(await entry.locator('svg').innerHTML()).not.toBe(mark);
 });

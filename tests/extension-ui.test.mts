@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { bridgeExtensionUi, clientHalf, staticImports, packageKinds, packageThemes, serverHalf, validName, UI_RECEIVE, UI_SEND } from '../core/server/src/extension-ui.ts';
@@ -52,7 +52,8 @@ test('a package that declares a browser half has its web folder, its module and 
   assert.equal(half.dir, path.join(dir, 'web'));
   assert.equal(half.entry, 'client.js');
   assert.equal(half.style, 'look/client.css');
-  assert.match(half.rev, /^[0-9a-z]+-[0-9a-z]+$/);
+  // Of the files of its folder, as a digest that goes in an address.
+  assert.match(half.rev, /^[\w-]{16}$/);
 });
 
 test('what a browser half imports along with itself is found by what each module says, down to the last, and not what it imports when called', () => {
@@ -91,11 +92,65 @@ test('what a browser half imports is found in time in step with the size of its 
   assert.deepEqual(staticImports(clientHalf(dir)!), []);
 });
 
-test('a module changed is a module under another revision', () => {
-  const dir = pkg({ client: './web/client.js' }, ['web/client.js']);
+test('a module changed, or only its stylesheet, is a module under another revision', () => {
+  const dir = pkg({ client: './web/client.js', style: './web/client.css' }, ['web/client.js', 'web/client.css']);
   const before = clientHalf(dir)!.rev;
   writeFileSync(path.join(dir, 'web', 'client.js'), '// here, and longer than it was');
-  assert.notEqual(clientHalf(dir)!.rev, before);
+  const changed = clientHalf(dir)!.rev;
+  assert.notEqual(changed, before);
+  writeFileSync(path.join(dir, 'web', 'client.css'), '/* here, and longer than it was */');
+  assert.notEqual(clientHalf(dir)!.rev, changed);
+});
+
+test("any file of a half's folder changed, one added or one removed, is another revision of it, and not what is in node_modules or under a dot", () => {
+  const dir = pkg({ client: './web/client.js', server: './server.js' }, ['server.js', 'lib/said.js', 'web/client.js', 'web/parts/part.js', 'web/node_modules/dep/index.js', 'web/.cache/x.js', 'web/.notes']);
+  const revs = () => [clientHalf(dir)!.rev, serverHalf(dir)!.rev];
+  let [client, server] = revs();
+  const step = (file: string, change: () => void, what: string, counts: { client: boolean; server: boolean }) => {
+    change();
+    const [nextClient, nextServer] = revs();
+    assert.equal(nextClient !== client, counts.client, `${what} (${file}): the browser half's`);
+    assert.equal(nextServer !== server, counts.server, `${what} (${file}): the server half's`);
+    [client, server] = [nextClient, nextServer];
+  };
+  const edit = (file: string) => () => writeFileSync(path.join(dir, file), `// changed ${file}, and longer`);
+  step('web/parts/part.js', edit('web/parts/part.js'), 'a file the module imports', { client: true, server: true });
+  step('lib/said.js', edit('lib/said.js'), "a file of the server half's folder, outside the web folder", { client: false, server: true });
+  step('web/parts/more.js', edit('web/parts/more.js'), 'a file added', { client: true, server: true });
+  step('web/parts/more.js', () => rmSync(path.join(dir, 'web/parts/more.js')), 'a file removed', { client: true, server: true });
+  step('web/parts/part.js', () => renameSync(path.join(dir, 'web/parts/part.js'), path.join(dir, 'web/parts/moved.js')), 'a file renamed', { client: true, server: true });
+  for (const file of ['web/node_modules/dep/index.js', 'web/.cache/x.js', 'web/.notes']) step(file, edit(file), 'not looked at', { client: false, server: false });
+  // Nothing changed: the same.
+  assert.deepEqual(revs(), [client, server]);
+});
+
+test("a folder of more files than a revision looks at: the first by their path count, and the module and its stylesheet always", () => {
+  const files = Array.from({ length: 1000 }, (_, i) => `web/a/${String(i).padStart(4, '0')}.js`);
+  const dir = pkg({ client: './web/z/client.js', style: './web/z/client.css' }, [...files.map((file) => file.replace('web/', 'web/z/')), 'web/z/client.js', 'web/z/client.css', 'web/z/past.js']);
+  const rev = () => clientHalf(dir)!.rev;
+  let before = rev();
+  writeFileSync(path.join(dir, 'web/z/past.js'), '// past the thousandth file, and longer');
+  assert.equal(rev(), before, 'a file past them');
+  writeFileSync(path.join(dir, 'web/z/a/0999.js'), '// the thousandth, and longer');
+  assert.notEqual(rev(), before, 'the last that counts');
+  before = rev();
+  writeFileSync(path.join(dir, 'web/z/client.js'), '// the module, past them by its path, and longer');
+  assert.notEqual(rev(), before, 'the module');
+  before = rev();
+  writeFileSync(path.join(dir, 'web/z/client.css'), '/* the stylesheet, and longer */');
+  assert.notEqual(rev(), before, 'the stylesheet');
+});
+
+test("a half whose module or stylesheet is gone by the time its revision is read has another revision, and reading it does not throw", () => {
+  const dir = pkg({ client: './web/client.js', style: './web/client.css', server: './server.js' }, ['server.js', 'web/client.js', 'web/client.css']);
+  const client = clientHalf(dir)!, server = serverHalf(dir)!;
+  const before = [clientHalf(dir)!.rev, serverHalf(dir)!.rev];
+  // Found before, read after: as a sync that waits for the one before it reads them.
+  rmSync(path.join(dir, 'web/client.css'));
+  rmSync(path.join(dir, 'server.js'));
+  assert.notEqual(client.rev, before[0], 'the stylesheet gone');
+  assert.notEqual(server.rev, before[1], 'the module gone');
+  assert.equal(serverHalf(dir), undefined, 'and looked for again, the half is not there');
 });
 
 test('a package with no browser half, or one it cannot have, has none', () => {
@@ -258,7 +313,7 @@ test('a package may name a server half anywhere in itself, and has none where th
   const dir = pkg({ client: './web/client.js', server: './server.js' }, ['web/client.js', 'server.js']);
   const half = serverHalf(dir)!;
   assert.deepEqual({ name: half.name, version: half.version, file: half.file }, { name: 'my-extension', version: '1.2.3', file: path.join(dir, 'server.js') });
-  assert.match(half.rev, /^[0-9a-z]+-[0-9a-z]+$/);
+  assert.match(half.rev, /^[\w-]{16}$/);
   assert.equal(serverHalf(pkg({ client: './web/client.js' }, ['web/client.js'])), undefined, 'declares none');
   assert.equal(serverHalf(pkg({ server: './server.js' }, [])), undefined, 'names a file that is not there');
   assert.equal(serverHalf(pkg({ server: '../server.js' }, [])), undefined, 'names a file above it');
@@ -400,7 +455,7 @@ test('a chat is said as the page has it, to whoever listens to that chat', () =>
 test('a window an extension brought to voice mode is placed as the pictures are: at the side, or in the middle when the side is taken', () => {
   assert.deepEqual(placeWindows({ 'x:notes/notes': true }), { main: undefined, side: 'x:notes/notes' });
   assert.deepEqual(placeWindows({ conversation: true, 'x:notes/notes': true }), { main: 'x:notes/notes', side: 'conversation' });
-  assert.deepEqual(placeWindows({ browser: true, 'x:notes/notes': true }), { main: 'browser', side: 'x:notes/notes' });
+  assert.deepEqual(placeWindows({ 'x:b/b': true, 'x:notes/notes': true }, { 'x:b/b': 'middle' }), { main: 'x:b/b', side: 'x:notes/notes' });
   assert.deepEqual(placeWindows({ pictures: true, 'x:notes/notes': true }), { main: 'x:notes/notes', side: 'pictures' }, 'after the portal\'s own');
   assert.deepEqual(placeWindows({ pictures: true, 'x:notes/notes': false }), { main: undefined, side: 'pictures' });
 });
@@ -599,7 +654,8 @@ test('a package may name themes in its package.json and bring nothing else', () 
 test('a package is told apart by what it brings: something for pi, something for the portal, colours', () => {
   assert.deepEqual(packageKinds(path.resolve('tests/fixtures/extensions/notes')), ['pi', 'pithagoras']);
   assert.deepEqual(packageKinds(path.resolve('extensions/themes')), ['themes'], 'no code, so nothing for pi');
-  assert.deepEqual(packageKinds(path.resolve('extensions/subagent')), ['pi']);
+  // Its tool comes through its server half: it gives pi nothing of its own.
+  assert.deepEqual(packageKinds(path.resolve('extensions/subagent')), ['pithagoras']);
   assert.deepEqual(packageKinds(pkg({ server: './server.js', themes: [{ id: 'a', name: 'A' }] }, ['server.js'])), ['pi', 'pithagoras', 'themes']);
   // A half it names and does not have is not one it brings.
   assert.deepEqual(packageKinds(pkg({ client: './web/client.js' }, [])), ['pi']);
@@ -684,8 +740,8 @@ test('a window an extension brought that asks for a place has it before those th
   assert.deepEqual(placeWindows({ 'x:a/w': true }, { 'x:a/w': 'middle' }), { main: 'x:a/w', side: undefined });
   assert.deepEqual(placeWindows({ 'x:a/w': true, pictures: true }, { 'x:a/w': 'middle' }), { main: 'x:a/w', side: 'pictures' });
   assert.deepEqual(placeWindows({ conversation: true, 'x:a/w': true }, { 'x:a/w': 'side' }), { main: 'conversation', side: 'x:a/w' });
-  // The browser has the middle, another that asked first the side: it is given the other.
-  assert.deepEqual(placeWindows({ browser: true, 'x:a/w': true }, { 'x:a/w': 'middle' }), { main: 'browser', side: 'x:a/w' });
+  // One that asked for the middle before it has it: it is given the other.
+  assert.deepEqual(placeWindows({ 'x:b/b': true, 'x:a/w': true }, { 'x:b/b': 'middle', 'x:a/w': 'middle' }), { main: 'x:b/b', side: 'x:a/w' });
   assert.deepEqual(placeWindows({ 'x:t/t': true, 'x:a/w': true }, { 'x:t/t': 'side', 'x:a/w': 'side' }), { main: 'x:a/w', side: 'x:t/t' });
   // Without a place it is placed as before, after the portal's own.
   assert.deepEqual(placeWindows({ conversation: true, 'x:a/w': true }), { main: 'x:a/w', side: 'conversation' });

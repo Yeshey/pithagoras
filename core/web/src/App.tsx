@@ -1,7 +1,7 @@
 import { LuMenu, LuX } from "react-icons/lu";
 import { appendLiveEvents, resetLiveEvents } from "./live-events";
 import { fillFrom } from "./editor-fills";
-import { Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { api, ApiError, SIGNED_OUT, type PortalEvent, type Session, type SessionStatus, type SingleSignOn } from "./api";
 import { DialogFailed, ErrorBoundary } from "./components/ErrorBoundary";
@@ -16,6 +16,7 @@ import { lazyComponent } from "./lazy";
 import { ThemeSwitcher } from "./components/ThemeSwitcher";
 import { ConfirmHost } from "./components/ConfirmDialog";
 import { UpdateNotice } from "./components/UpdateNotice";
+import { ExtensionsLeftBehind } from "./components/ExtensionsLeftBehind";
 import { ErrorBanner, ghostCls } from "./components/SettingsUi";
 import { pollWhileVisible, reconnectDelay } from "./poll";
 import { APP_NAME, finishedRuns, tabTitle } from "./attention";
@@ -25,12 +26,13 @@ import { usePlaces } from "./use-session-folders";
 import { fancy, keep, swapPages, type Leave } from "./motion";
 import { reconcile } from "./reconcile";
 import { useStable } from "./use-stable";
+import { splitSubChats } from "./sub-chats";
 import { useDialogFocus } from "./dialog-focus";
 import { t, useLanguage } from "./i18n";
-import { setNavigate, startExtensions } from "./extensions/loader";
+import { followInstalled, Here, setNavigate, startExtensions } from "./extensions/loader";
 import { extensionMessage } from "./extensions/channel";
 import { serverPush, setChatOnScreen } from "./extensions/server-feed";
-import { useSlot } from "./extensions/slots";
+import { titleOf, useSlot } from "./extensions/slots";
 
 // What the first draw needs is the shell, the chat and the sign-in page. The other pages, and the dialogs that
 // open over them, are fetched when they are first opened, so that they are not in the file everyone waits for.
@@ -39,15 +41,12 @@ const ProjectsPage = lazyComponent(() => import("./components/ProjectsPage"), "P
 const AgentPage = lazyComponent(() => import("./components/AgentPage"), "AgentPage");
 const RoutinesPage = lazyComponent(() => import("./components/RoutinesPage"), "RoutinesPage");
 const AuditPage = lazyComponent(() => import("./components/AuditPanel"), "AuditPage");
-const BrowserPage = lazyComponent(() => import("./components/BrowserPage"), "BrowserPage");
-const MemoryPage = lazyComponent(() => import("./components/MemoryPage"), "MemoryPage");
-const MediaPage = lazyComponent(() => import("./components/MediaPage"), "MediaPage");
 const ExtensionPage = lazyComponent(() => import("./components/ExtensionPage"), "ExtensionPage");
 const ConfigModal = lazyComponent(() => import("./components/ConfigModal"), "ConfigModal");
 const SetupAssistant = lazyComponent(() => import("./components/SetupAssistant"), "SetupAssistant");
 
-// Legacy routes still resolve — old links stay valid: "session" and "global" were the defaults, "password" and "sso" had a tab each before they were both on Authentication, and so did the pictures and the videos before there was one tab for both.
-const LEGACY_TABS: Record<string, Tab> = { session: "general", global: "general", password: "authentication", sso: "authentication", images: "media", videos: "media" };
+// Legacy routes still resolve — old links stay valid: "session" and "global" were the defaults, and "password" and "sso" had a tab each before they were both on Authentication.
+const LEGACY_TABS: Record<string, Tab> = { session: "general", global: "general", password: "authentication", sso: "authentication" };
 
 export default function App() {
   // Everything under here is drawn again in a language chosen (see i18n.ts).
@@ -135,32 +134,21 @@ export default function App() {
       {/* Where the page was while there was one agent: old links and bookmarks. */}
       <Route path="/agent" element={<Navigate to={{ pathname: "/agents", search: window.location.search }} replace />} />
       <Route path="/routines" element={<Shell view="routines" />} />
-      <Route path="/browser" element={<Shell view="browser" />} />
-      <Route path="/memory" element={<Shell view="memory" />} />
-      <Route path="/media" element={<Shell view="media" />} />
-      {/* Where the pictures and the videos were while each had a page: old links and bookmarks. */}
-      <Route path="/images" element={<MediaRedirect show="images" />} />
-      <Route path="/videos" element={<MediaRedirect show="videos" />} />
       <Route path="/audit" element={<Shell view="audit" />} />
       {/* A page an extension brought: /x/<extension>/<page id>, and an extension's name may have a slash in it. */}
       <Route path="/x/*" element={<Shell view="extension" />} />
       <Route path="/s/:sessionId" element={<Shell />} />
       <Route path="/s/:sessionId/settings" element={<Shell settings />} />
       <Route path="/s/:sessionId/settings/:tab" element={<Shell settings />} />
+      {/* An extension's page in Settings, over a chat or not: settings/x/<extension>. */}
+      <Route path="/s/:sessionId/settings/x/*" element={<Shell settings />} />
       <Route path="/settings" element={<Shell settings />} />
       <Route path="/settings/:tab" element={<Shell settings />} />
+      <Route path="/settings/x/*" element={<Shell settings />} />
       <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </>
   );
-}
-
-/** The gallery of one kind that was a page of its own, as one of the two kinds of the Media page, with the filters it had. */
-function MediaRedirect({ show }: { show: "images" | "videos" }) {
-  const { search } = useLocation();
-  const params = new URLSearchParams(search);
-  params.set("show", show);
-  return <Navigate to={{ pathname: "/media", search: `?${params}` }} replace />;
 }
 
 /** Once per page load, not once per page: the Shell is drawn again on every route. */
@@ -171,16 +159,22 @@ function Shell({
   view = "chat",
 }: {
   settings?: boolean;
-  view?: "chat" | "sessions" | "projects" | "agents" | "routines" | "browser" | "memory" | "media" | "audit" | "extension";
+  view?: "chat" | "sessions" | "projects" | "agents" | "routines" | "audit" | "extension";
 }) {
-  const { sessionId, tab, "*": extensionPage = "" } = useParams<{ sessionId?: string; tab?: string; "*"?: string }>();
+  // What follows /x/ in the address: `<extension>/<page id>` of a page an extension brought, or `<extension>` of its page in Settings.
+  const { sessionId, tab, "*": extensionPart = "" } = useParams<{ sessionId?: string; tab?: string; "*"?: string }>();
   const navigate = useNavigate();
+  const { pathname, search, state } = useLocation();
   // What the installed extensions draw in the portal: see extensions/loader.ts.
   useEffect(() => {
     setNavigate(navigate);
     startExtensions();
   }, [navigate]);
+  // What a page of an extension's that keeps what it shows in its address reads it from (portal.useLocation).
+  const here = useMemo(() => ({ path: pathname, search }), [pathname, search]);
   const pages = useSlot("nav.page");
+  // The extension's page shown, which the phone's top bar names as the sidebar does: in the language in effect.
+  const extensionPage = view === "extension" ? pages.find((p) => p.key === extensionPart) : undefined;
   const [mobileNav, setMobileNav] = useState(false);
   useEffect(() => { setMobileNav(false); }, [sessionId, view, settings]);
   // The drawer covers the page and keeps the keyboard; widened to a window with the sidebar in place, it is only the sidebar.
@@ -220,27 +214,6 @@ function Shell({
   // them, and without this those links landed on the empty state.
   const [other, setOther] = useState<Session | null>(null);
   const [executor, setExecutor] = useState("host");
-  // Asked once: the browser is optional, and the answer only changes when
-  // somebody starts or stops a container.
-  const [hasBrowser, setHasBrowser] = useState(false);
-  // Whether Understory is the agent's memory, which is when its page is in the sidebar.
-  const [hasMemory, setHasMemory] = useState(false);
-  // Likewise whether image generation or video generation is on and has an address, which is when the Media page is.
-  const [hasMedia, setHasMedia] = useState(false);
-  useEffect(() => {
-    const ask = () =>
-      api
-        .featureFlags()
-        .then((f) => {
-          setHasMemory(f.understory?.enabled === true);
-          setHasMedia(f.images?.enabled === true || f.videos?.enabled === true);
-        })
-        .catch(() => {});
-    ask();
-    // Said by Settings when it switches Understory (Add-ons), the images or the videos (Agent → Media), so the sidebar follows at once.
-    window.addEventListener("features-changed", ask);
-    return () => window.removeEventListener("features-changed", ask);
-  }, []);
   const [events, setEvents] = useState<PortalEvent[]>([]);
   /** The versions of the chat's messages, as its stream says: see messageVersions on the server. */
   const [versions, setVersions] = useState<Record<number, number[]>>({});
@@ -273,6 +246,8 @@ function Shell({
 
   const refreshSessions = useCallback(async () => {
     const r = await api.sessions();
+    // What is installed changed since the page last went through it, wherever it was changed: it goes through it again.
+    followInstalled(r.extensions);
     // Kept as it was when it says the same: a list asked for every few seconds is
     // mostly unchanged, and a new array is a draw of the portal for nothing.
     setSessions((prev) => reconcile(prev, r.sessions));
@@ -291,17 +266,6 @@ function Shell({
     navigate(`/s/${s.id}`);
   });
 
-  useEffect(() => {
-    api
-      .browser()
-      // Whether one is wired up, not whether anyone has been given it: the
-      // browser is on by default now, so "somebody has it" is not a sign that
-      // the add-on is there, and a tool name lingering in the catalogue would
-      // keep the nav after the add-on was removed.
-      .then((b) => setHasBrowser(b.running || b.configured || b.routines.length > 0))
-      .catch(() => setHasBrowser(false));
-  }, []);
-
   // Not tied to where the page is: going from chat to chat is no reason to ask
   // for the list again, nor to start its poll over.
   useEffect(() => {
@@ -319,7 +283,8 @@ function Shell({
   latestSessions.current = sessions;
   useEffect(() => {
     if (!sessionsAsked || sessionId || settings || view !== "chat") return;
-    const first = latestSessions.current[0];
+    // A chat of its own, not a sub-chat, which is listed under its chat.
+    const first = splitSubChats(latestSessions.current).top[0];
     if (first) navigate(`/s/${first.id}`, { replace: true });
   }, [sessionsAsked, sessionId, settings, view]);
 
@@ -674,9 +639,16 @@ function Shell({
     navigate(`/s/${id}`);
   });
   const onDeleteChat = useStable(async (id: string) => {
+    const gone = sessions.find((s) => s.id === id);
+    // The chat open is this one, or one of its sub-chats, which go with it.
+    // It need not be listed: a sub-chat an extension keeps out of the list is fetched by its id (`active`).
+    const open = sessionId === id || active?.parent === id;
     await api.deleteSession(id);
     const list = await refreshSessions();
-    if (sessionId === id) navigate(list[0] ? `/s/${list[0].id}` : "/", { replace: true });
+    // A sub-chat gone takes its page back to its chat, if that is listed; a chat gone, to the latest chat of its own.
+    const parent = gone?.parent;
+    const next = parent && sessions.some((s) => s.id === parent) ? parent : splitSubChats(list).top[0]?.id;
+    if (open) navigate(next ? `/s/${next}` : "/", { replace: true });
   });
   const onRenameChat = useStable(async (id: string, title: string) => {
     await api.renameSession(id, title);
@@ -688,7 +660,8 @@ function Shell({
   });
   const onOpenSettings = useStable(() => navigate(sessionId ? `/s/${sessionId}/settings/general` : "/settings/general"));
   const openUpdate = useStable(() => navigate(sessionId ? `/s/${sessionId}/settings/about` : "/settings/about"));
-  const closeSettings = useStable(() => navigate(active ? `/s/${active.id}` : "/"));
+  // Back to the page that opened Settings where it said which (`state.from`), else to the chat.
+  const closeSettings = useStable(() => navigate((state as { from?: string } | null)?.from ?? (active ? `/s/${active.id}` : "/")));
   const setUpModel = useStable(() => {
     navigate(active ? `/s/${active.id}` : "/");
     setSetup(true);
@@ -708,6 +681,7 @@ function Shell({
   });
 
   return (
+    <Here.Provider value={here}>
     <div data-fits-keyboard className="flex h-[calc(100dvh-var(--keyboard,0px))] min-h-0 overflow-hidden bg-canvas">
       {mobileNav && <button aria-label={t("Dismiss navigation")} onClick={() => setMobileNav(false)} className="ui-backdrop fixed inset-0 z-40 bg-black/50 md:hidden" />}
       <div
@@ -724,10 +698,7 @@ function Shell({
         sessions={sessions}
         executor={executor}
         activeId={sessionId ?? null}
-        view={view === "extension" ? `x/${extensionPage}` : view}
-        hasBrowser={hasBrowser}
-        hasMemory={hasMemory}
-        hasMedia={hasMedia}
+        view={view === "extension" ? `x/${extensionPart}` : view}
         places={places}
         onNavigate={onNavigate}
         onOpenFolder={onOpenFolder}
@@ -745,9 +716,10 @@ function Shell({
             would only repeat its title; in voice mode that header is gone. */}
         <header className="app-mobile-bar flex shrink-0 items-center gap-3 border-b border-line px-3 py-2 md:hidden">
           <button type="button" aria-label={t("Open navigation")} aria-expanded={mobileNav} aria-controls="mobile-navigation" onClick={() => setMobileNav(true)} className="rounded-lg p-2 text-fg hover:bg-fg/10"><LuMenu size={20}/></button>
-          <span className="truncate text-sm text-fg">{(view === "extension" && pages.find((p) => p.key === extensionPage)?.title) || active?.title || "Pithagoras"}</span>
+          <span className="truncate text-sm text-fg">{(extensionPage && titleOf(extensionPage)) || active?.title || "Pithagoras"}</span>
         </header>
         <UpdateNotice onDetails={openUpdate} />
+        <ExtensionsLeftBehind />
         {error && <ErrorBanner className="mx-4 mt-2" onClose={() => setError(null)}>{error}</ErrorBanner>}
         {/* Not for the first miss: a server restarting, or a wifi that blinked,
             is back before it can be read. Two in a row is an outage. */}
@@ -787,16 +759,10 @@ function Shell({
           <AgentPage onSelect={(id) => navigate(`/s/${id}`)} onNewChat={startChat} reloadPlaces={reloadPlaces} />
         ) : view === "routines" ? (
           <RoutinesPage onOpenSession={(id) => navigate(`/s/${id}`)} />
-        ) : view === "browser" ? (
-          <BrowserPage onOpenSession={(id) => navigate(`/s/${id}`)} />
-        ) : view === "memory" ? (
-          <MemoryPage />
-        ) : view === "media" ? (
-          <MediaPage />
         ) : view === "audit" ? (
           <AuditPage />
         ) : view === "extension" ? (
-          <ExtensionPage entryKey={extensionPage} />
+          <ExtensionPage entryKey={extensionPart} />
         ) : active ? (
           <Chat
             session={active}
@@ -849,7 +815,12 @@ function Shell({
               await api.renameSession(active.id, title);
               await refreshSessions();
             }}
+            onSetMode={async (mode, confirmed) => {
+              await api.setMode(active.id, mode, confirmed);
+              await refreshSessions();
+            }}
             onOpenNavigation={() => setMobileNav(true)}
+            parentTitle={active.parent ? sessions.find((s) => s.id === active.parent)?.title : undefined}
             onClientCommand={async (name, args) => {
               if (name === "settings") {
                 navigate(`/s/${active.id}/settings/general`);
@@ -890,6 +861,7 @@ function Shell({
         {settings && (
           <ConfigModal
             initialTab={LEGACY_TABS[tab ?? ""] ?? (tab && isTab(tab) ? tab : "general")}
+            extension={extensionPart || undefined}
             onClose={closeSettings}
             onSetup={setUpModel}
           />
@@ -908,6 +880,7 @@ function Shell({
       </Suspense>
       </ErrorBoundary>
     </div>
+    </Here.Provider>
   );
 }
 

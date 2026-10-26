@@ -5,8 +5,10 @@ import { readFileSync } from 'node:fs';
 // An extension's window at the side: the portal's tests' stand-in for one, opening on each command the agent runs.
 test.use({ installed: ['tests/fixtures/extensions/console'] });
 const sample = readFileSync(new URL('../fixtures/jfk.wav', import.meta.url));
+// What the portal answers a phrase with: 24 kHz PCM, here the fixture's samples.
+const pcm = sample.subarray(sample.indexOf('data') + 8);
+const speech = { body: pcm, headers: { 'content-type': 'audio/pcm', 'x-sample-rate': '24000' } };
 test.beforeEach(async ({ page }) => {
-  await page.route('**/api/browser', route => route.fulfill({ json: { running: false, sessions: [], install: { container: 'stopped' } } }));
   await page.route('**/api/sessions/test/commands', route => route.fulfill({ json: { commands: [] } }));
   await page.route('**/api/sessions/test/config', route => route.fulfill({ status: 503, json: {} }));
 });
@@ -19,10 +21,7 @@ test('real browser VAD submits turns, supports barge-in, and releases the mic', 
     expect(route.request().postDataBuffer()?.subarray(0, 4).toString()).toBe('RIFF');
     return route.fulfill({ json: { text: 'A test voice turn.' } });
   });
-  let speechRequests = 0;
-  await page.route('**/voice/speech', route => ++speechRequests === 1
-    ? route.fulfill({ status: 502, json: { error: 'Breeze returned HTTP 409 (voice service is busy; try again)' } })
-    : route.fulfill({ body: sample, contentType: 'audio/wav' }));
+  await page.route('**/voice/speech', route => route.fulfill(speech));
   await page.goto('/tests/voice.html');
   await page.getByRole('textbox', { name: 'Message' }).fill('Keep this draft');
   await page.getByRole('button', { name: 'Profile voice latency' }).click();
@@ -76,7 +75,7 @@ test('mute keeps playback and option prompts available; end restores the chat', 
   await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true } }));
   await page.route('**/test-speech.wav', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
   await page.route('**/voice/transcribe', route => route.fulfill({ json: { text: 'A test voice turn.' } }));
-  await page.route('**/voice/speech', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
+  await page.route('**/voice/speech', route => route.fulfill(speech));
   let chosen: unknown;
   await page.route('**/ui-response', route => { chosen = route.request().postDataJSON(); return route.fulfill({ json: { ok: true } }); });
   await page.goto('/tests/voice.html');
@@ -128,8 +127,9 @@ test('voice pipelines next-sentence synthesis during PCM playback and cancels on
   const texts: string[] = [];
   await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true } }));
   await page.route('**/voice/speech', route => {
-    expect(route.request().headers().accept).toBe('audio/pcm');
-    texts.push(route.request().postDataJSON().text);
+    // The spoken error line, asked for as voice mode starts, is not a phrase of the reply.
+    const text = route.request().postDataJSON().text;
+    if (text !== 'An error occurred.') texts.push(text);
     return route.fulfill({ body: pcm, headers: { 'content-type': 'audio/pcm', 'x-sample-rate': '24000' } });
   });
   await page.goto('/tests/voice.html');
@@ -147,6 +147,51 @@ test('voice pipelines next-sentence synthesis during PCM playback and cancels on
   await expect(page.getByRole('textbox', { name: 'Message' })).toBeVisible();
   expect(failures).toEqual([]);
 });
+
+for (const pipelineMode of ['parallel', 'sequential'] as const) {
+  test(`a phrase is played ${pipelineMode === 'parallel' ? 'before the rest of its PCM has come, in the streaming pipeline' : 'only once all its PCM has come, one phrase after another'}`, async ({ page }) => {
+    // A phrase answered with 0.7 s of 24 kHz PCM at once, and the rest once the test lets go; each buffer of a phrase started is counted.
+    await page.addInitScript(() => {
+      const w = window as any;
+      w.started = 0;
+      w.held = [] as (() => void)[];
+      w.letGo = () => { w.free = true; w.held.forEach((release: () => void) => release()); };
+      const start = AudioBufferSourceNode.prototype.start;
+      AudioBufferSourceNode.prototype.start = function (...args: Parameters<typeof start>) { w.started++; return start.apply(this, args); };
+      const real = window.fetch;
+      window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        // The spoken error line, asked for as voice mode starts, is not a phrase of the reply.
+        if (!String(input).endsWith('/voice/speech') || JSON.parse(String(init?.body)).text === 'An error occurred.') return real(input, init);
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            const rest = () => { c.enqueue(new Uint8Array(48000)); c.close(); };
+            c.enqueue(new Uint8Array(33600));
+            if (w.free) rest(); else w.held.push(rest);
+          },
+        });
+        return new Response(body, { headers: { 'content-type': 'audio/pcm', 'x-sample-rate': '24000' } });
+      }) as typeof fetch;
+    });
+    await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true, pipelineMode } }));
+    await page.route('**/voice/speech', route => route.fulfill(speech));
+    await page.goto('/tests/voice.html');
+    await page.getByRole('button', { name: 'Turn on hands-free voice' }).click();
+    await expect(page.getByRole('status')).toHaveText('Listening', { timeout: 25000 });
+    await page.getByRole('button', { name: 'Stream reply', exact: true }).click();
+    await page.getByRole('button', { name: 'Finish reply', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).held.length)).toBeGreaterThan(0);
+    const started = () => page.evaluate(() => (window as any).started);
+    if (pipelineMode === 'parallel') {
+      await expect.poll(started).toBeGreaterThan(0);
+    } else {
+      await page.waitForTimeout(1000);
+      expect(await started()).toBe(0);
+    }
+    await page.evaluate(() => (window as any).letGo());
+    await expect.poll(started).toBeGreaterThan(0);
+    await page.getByRole('button', { name: 'End voice mode' }).click();
+  });
+}
 
 test('slow PCM chunks become one uninterrupted buffer, including split samples', async ({ page }) => {
   await page.goto('/tests/voice.html');
@@ -197,7 +242,7 @@ test('live transcription begins before turn completion and previews recognized w
   await page.route('**/test-speech.wav', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
   const purposes: (string | null)[] = [];
   await page.route('**/voice/transcribe*', route => { purposes.push(new URL(route.request().url()).searchParams.get('purpose')); return route.fulfill({ json: { text: 'Recognized while you speak.' } }); });
-  await page.route('**/voice/speech', route => route.fulfill({ body: sample, contentType: 'audio/wav' }));
+  await page.route('**/voice/speech', route => route.fulfill(speech));
   await page.goto('/tests/voice.html');
   await page.getByRole('button', { name: 'Turn on hands-free voice' }).click();
   await expect(page.getByRole('status')).toHaveText('Listening', { timeout: 25000 });
@@ -214,64 +259,67 @@ test('live transcription begins before turn completion and previews recognized w
 });
 
 
-test('voice panels animate into browser, side window and simultaneous layouts', async ({ page }) => {
-  await page.addInitScript(() => {
-    // Streams, which have no server behind them here.
-    (window as any).EventSource=class { onmessage:any; onopen:any; close(){} };
-  });
-  const failures: string[] = []; page.on('pageerror', e => failures.push(e.message));
-  await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true } }));
-  await page.route('**/api/browser', route => route.fulfill({ json: { install: { container: 'running' } } }));
-  await page.route('**/browser-ui/', route => route.fulfill({ contentType: 'text/html', body: '<body style="margin:0;background:#171a20;color:#d1d8e3;font:15px system-ui;padding:36px"><small style="color:#778294">EXAMPLE.COM</small><h1 style="font-weight:500">A browser, in view.</h1><p>The live page stays visible while you keep talking.</p></body>' }));
-  await page.goto('/tests/voice.html');
-  await page.getByRole('button', { name: 'Turn on hands-free voice' }).click();
-  await expect(page.getByRole('status')).toHaveText('Listening', { timeout: 25000 });
-  await page.getByRole('button', { name: 'Voice settings' }).click();
-  await page.getByRole('group', { name: 'Sound effects' }).getByRole('button', { name: 'Off' }).click();
-  expect(await page.evaluate(() => localStorage.getItem('voiceSounds'))).toBe('off');
-  await page.keyboard.press('Escape');
-  await page.getByRole('button', { name: 'Use browser', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Live browser', exact: true })).toBeVisible();
-  await expect(page.locator('.voice-stage')).toHaveClass(/is-browsing/);
-  await settled(page);
-  await page.getByRole('button', { name: 'Use terminal', exact: true }).click();
-  await expect(page.getByRole('region', { name: 'Console', exact: true })).toBeVisible();
-  await expect(page.getByLabel('Console output')).toContainText('42 modules transformed');
-  await expect(page.getByLabel('Tool activity')).toContainText('Running a command');
-  await settled(page);
-  const browser = await page.locator('.voice-browser-window').boundingBox();
-  const consoleWindow = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
-  expect(browser!.width).toBeGreaterThan(consoleWindow!.width * 1.8);
-  expect(browser!.x + browser!.width).toBeLessThan(consoleWindow!.x);
+// An extension's window in the middle as well, beside the console's at the side: the portal's tests' stand-in for one.
+test.describe('with a window in the middle', () => {
+  test.use({ installed: ['tests/fixtures/extensions/console', 'tests/fixtures/extensions/viewer'] });
 
-  await page.getByRole('button', { name: 'Minimize browser' }).click();
-  await settled(page);
-  const orb = await page.locator('.voice-presence').boundingBox();
-  const right = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
-  const stage = await page.locator(".voice-stage").boundingBox();
-  expect(orb!.x + orb!.width).toBeLessThan(right!.x);
-  expect(orb!.height).toBeGreaterThan(150);
-  await page.getByRole('button', { name: 'Finish terminal', exact: true }).click();
-  await expect(page.getByLabel('Console output')).toContainText('Build completed successfully');
-  await page.getByRole('button', { name: 'Show browser', exact: true }).click();
-  await page.getByRole('button', { name: 'Stream thinking', exact: true }).click();
-  await expect(page.getByLabel('Live model thinking')).toContainText('verify the page layout');
-  await expect(page.locator('.voice-presence')).toHaveCSS('height', '80px');
-  await page.setViewportSize({ width: 390, height: 844 });
-  await settled(page);
-  const mobileBrowser = await page.locator('.voice-browser-window').boundingBox();
-  const mobileConsole = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
-  expect(mobileBrowser!.y + mobileBrowser!.height).toBeLessThan(mobileConsole!.y);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
-  await page.getByRole('button', { name: 'End voice mode' }).click();
-  await expect(page.getByRole('textbox', { name: 'Message' })).toBeVisible();
-  expect(failures).toEqual([]);
+  test('voice panels animate into a middle window, a side window and both at once', async ({ page }) => {
+    await page.addInitScript(() => {
+      // Streams, which have no server behind them here.
+      (window as any).EventSource=class { onmessage:any; onopen:any; close(){} };
+    });
+    const failures: string[] = []; page.on('pageerror', e => failures.push(e.message));
+    await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true } }));
+    await page.goto('/tests/voice.html');
+    await page.getByRole('button', { name: 'Turn on hands-free voice' }).click();
+    await expect(page.getByRole('status')).toHaveText('Listening', { timeout: 25000 });
+    await page.getByRole('button', { name: 'Voice settings' }).click();
+    await page.getByRole('group', { name: 'Sound effects' }).getByRole('button', { name: 'Off' }).click();
+    expect(await page.evaluate(() => localStorage.getItem('voiceSounds'))).toBe('off');
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Show Viewer', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Viewer', exact: true })).toBeVisible();
+    await expect(page.locator('.voice-stage')).toHaveClass(/is-browsing/);
+    await settled(page);
+    await page.getByRole('button', { name: 'Use terminal', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Console', exact: true })).toBeVisible();
+    await expect(page.getByLabel('Console output')).toContainText('42 modules transformed');
+    await expect(page.getByLabel('Tool activity')).toContainText('Running a command');
+    await settled(page);
+    const middle = await page.locator('.voice-extension-window[data-extension="test-viewer"]').boundingBox();
+    const consoleWindow = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
+    expect(middle!.width).toBeGreaterThan(consoleWindow!.width * 1.8);
+    expect(middle!.x + middle!.width).toBeLessThan(consoleWindow!.x);
+
+    await page.getByRole('button', { name: 'Minimize Viewer' }).click();
+    await settled(page);
+    const orb = await page.locator('.voice-presence').boundingBox();
+    const right = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
+    const stage = await page.locator(".voice-stage").boundingBox();
+    expect(orb!.x + orb!.width).toBeLessThan(right!.x);
+    expect(orb!.height).toBeGreaterThan(150);
+    await page.getByRole('button', { name: 'Finish terminal', exact: true }).click();
+    await expect(page.getByLabel('Console output')).toContainText('Build completed successfully');
+    await page.getByRole('button', { name: 'Show Viewer', exact: true }).click();
+    await page.getByRole('button', { name: 'Stream thinking', exact: true }).click();
+    await expect(page.getByLabel('Live model thinking')).toContainText('verify the page layout');
+    await expect(page.locator('.voice-presence')).toHaveCSS('height', '80px');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await settled(page);
+    const mobileMiddle = await page.locator('.voice-extension-window[data-extension="test-viewer"]').boundingBox();
+    const mobileConsole = await page.locator('.voice-extension-window[data-extension="test-console"]').boundingBox();
+    expect(mobileMiddle!.y + mobileMiddle!.height).toBeLessThan(mobileConsole!.y);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
+    await page.getByRole('button', { name: 'End voice mode' }).click();
+    await expect(page.getByRole('textbox', { name: 'Message' })).toBeVisible();
+    expect(failures).toEqual([]);
+  });
 });
 
-test('managed voice connects before listening and releases its lease on End',async({page})=>{
+test('voice mode takes its lease before listening and gives it back on End, whatever it listens and speaks through',async({page})=>{
  const leases:boolean[]=[];
- await page.route('**/api/voice',r=>r.fulfill({json:{enabled:true,managed:true,lazyLoad:true}}));
- await page.route('**/api/sessions/test/voice/connection',r=>{leases.push(r.request().postDataJSON().active);return r.fulfill({json:{managed:true}});});
+ await page.route('**/api/voice',r=>r.fulfill({json:{enabled:true}}));
+ await page.route('**/api/sessions/test/voice/connection',r=>{leases.push(r.request().postDataJSON().active);return r.fulfill({json:{ok:true}});});
  await page.goto('/tests/voice.html');
  await page.getByRole('button',{name:'Turn on hands-free voice'}).click();
  await expect(page.getByRole('status')).toHaveText('Listening',{timeout:25000});
@@ -280,26 +328,41 @@ test('managed voice connects before listening and releases its lease on End',asy
  await expect.poll(()=>leases).toEqual([true,false]);
 });
 
-test('ending while the managed model loads releases the connection and never starts listening',async({page})=>{
+test('ending while the lease is being taken (a model loading) gives it back once it is taken, and never starts listening',async({page})=>{
  let finishLoad!:()=>Promise<void>; const leases:boolean[]=[];
- await page.route('**/api/voice',r=>r.fulfill({json:{enabled:true,managed:true}}));
+ await page.route('**/api/voice',r=>r.fulfill({json:{enabled:true}}));
  await page.route('**/api/sessions/test/voice/connection',async r=>{
   const active=r.request().postDataJSON().active;leases.push(active);
-  if(active){finishLoad=()=>r.fulfill({json:{managed:true}});return;}
-  await r.fulfill({json:{managed:true}});
+  if(active){finishLoad=()=>r.fulfill({json:{ok:true}});return;}
+  await r.fulfill({json:{ok:true}});
  });
  await page.goto('/tests/voice.html');await page.getByRole('button',{name:'Turn on hands-free voice'}).click();
  await expect.poll(()=>leases).toEqual([true]);
  await page.getByRole('button',{name:'End voice mode'}).click();
- await expect.poll(()=>leases).toEqual([true,false]);await finishLoad();
  await expect(page.getByRole('button',{name:'Turn on hands-free voice'})).toBeVisible();
+ // The lease's updates go in the order they were made: the release waits for the lease to be answered, and so reaches the server after it.
+ expect(leases).toEqual([true]);
+ await finishLoad();
+ await expect.poll(()=>leases).toEqual([true,false]);
  await expect(page.getByLabel('Voice conversation')).toHaveCount(0);
+});
+
+test('a lease voice mode is refused, as by an extension it listens through that is not running, is said, and nothing listens',async({page})=>{
+ const notRunning='Voice mode listens and speaks through test-speaker, which is not running: install or start it in Settings → Extensions, or stop using it in Settings → Defaults → Voice mode';
+ await page.route('**/api/voice',r=>r.fulfill({json:{enabled:true,provider:'test-speaker',ready:false,speech:true,voices:[]}}));
+ await page.route('**/api/sessions/test/voice/connection',r=>r.fulfill({status:503,json:{error:notRunning}}));
+ await page.goto('/tests/voice.html');
+ await page.getByRole('button',{name:'Turn on hands-free voice'}).click();
+ await expect(page.getByRole('alert')).toContainText(notRunning);
+ await page.getByRole('button',{name:'Check mic tracks'}).click();
+ await expect(page.getByTestId('tracks')).toHaveText('ended:true');
+ await expect(page.getByRole('button',{name:'Turn on hands-free voice'})).toBeVisible();
 });
 
 
 test('prompt and compaction progress remain visible in chat and voice',async({page})=>{
  await page.route('**/api/voice',r=>r.fulfill({json:{enabled:true}}));
- await page.route('**/voice/speech',r=>r.fulfill({body:sample,contentType:'audio/wav'}));
+ await page.route('**/voice/speech',r=>r.fulfill(speech));
  await page.goto('/tests/voice.html');
  await page.getByRole('button',{name:'Show prefill',exact:true}).click();
  // In the chat it is the status pill, there at once like the other phases rather than after two seconds.
@@ -346,6 +409,57 @@ test('without speech synthesis voice mode is not offered, because it speaks its 
   await page.reload();
   await expect(page.getByRole('button', { name: 'Dictate a message' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Turn on hands-free voice' })).toBeVisible();
+});
+
+test('voice conversations switched off end voice mode that is on, and leave dictation: voice mode is not offered, and its shortcut starts nothing', async ({ page }) => {
+  let conversation = true;
+  const leases: boolean[] = [];
+  await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true, speech: true, conversation } }));
+  await page.route('**/voice/connection', route => { leases.push(route.request().postDataJSON().active); return route.fulfill({ json: { ok: true } }); });
+  // As Settings → Defaults → Voice mode tells the page once it has saved.
+  const switched = async (on: boolean) => { conversation = on; await page.evaluate(() => window.dispatchEvent(new Event('voice-config-changed'))); };
+  await page.goto('/tests/voice.html');
+  await page.getByRole('button', { name: 'Turn on hands-free voice' }).click();
+  await expect(page.getByRole('button', { name: 'End voice mode' })).toBeVisible({ timeout: 25000 });
+  await switched(false);
+  await expect(page.getByRole('button', { name: 'End voice mode' })).toHaveCount(0);
+  await expect.poll(() => leases).toEqual([true, false]);
+  await expect(page.getByRole('button', { name: 'Dictate a message' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Turn on hands-free voice' })).toHaveCount(0);
+  // Alt+V starts nothing, from the page or from the message box.
+  await page.keyboard.press('Alt+v');
+  await page.getByRole('textbox', { name: 'Message' }).focus();
+  await page.keyboard.press('Alt+v');
+  expect(await page.evaluate(() => sessionStorage.getItem('voiceActive'))).toBeNull();
+  await expect(page.getByRole('textbox', { name: 'Message' })).toBeVisible();
+  expect(leases).toEqual([true, false]);
+  // Dictation listens as before.
+  await page.getByRole('button', { name: 'Dictate a message' }).click();
+  await expect(page.getByRole('button', { name: 'Stop dictating' })).toBeVisible({ timeout: 25000 });
+  await page.getByRole('button', { name: 'Stop dictating' }).click();
+  // Switched on again: voice mode is offered once more.
+  await switched(true);
+  await expect(page.getByRole('button', { name: 'Turn on hands-free voice' })).toBeVisible();
+});
+
+test('voice mode that a reload would bring back while voice conversations are off does not start when they are switched on again', async ({ page }) => {
+  let conversation = false;
+  const leases: boolean[] = [];
+  await page.route('**/api/voice', route => route.fulfill({ json: { enabled: true, speech: true, conversation } }));
+  await page.route('**/voice/connection', route => { leases.push(route.request().postDataJSON().active); return route.fulfill({ json: { ok: true } }); });
+  // Voice mode was on in this tab, and was switched off in another before this one was reloaded.
+  await page.addInitScript(() => sessionStorage.setItem('voiceActive', 'test'));
+  await page.goto('/tests/voice.html');
+  await expect(page.getByRole('button', { name: 'Dictate a message' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => sessionStorage.getItem('voiceActive'))).toBeNull();
+  // Switched on again, and Settings closed in this tab, which tells the page.
+  conversation = true;
+  await page.evaluate(() => window.dispatchEvent(new Event('voice-config-changed')));
+  await expect(page.getByRole('button', { name: 'Turn on hands-free voice' })).toBeVisible();
+  await page.waitForTimeout(1500);
+  await expect(page.getByRole('button', { name: 'End voice mode' })).toHaveCount(0);
+  expect(await page.evaluate(() => sessionStorage.getItem('voiceActive'))).toBeNull();
+  expect(leases).toEqual([]);
 });
 
 test('dictation in send mode sends what was said to the chat it was started in', async ({ page }) => {

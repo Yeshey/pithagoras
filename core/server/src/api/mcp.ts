@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import express, { type Router } from "express";
 import { writeFileAtomic } from "../atomic-write.js";
 import { isSwitchedOff, sourceOf } from "../extension-switch.js";
-import { piAgentDir, readPiSettings } from "../pi-settings.js";
+import { piAgentDir, piSettingsPath, readPiSettings } from "../pi-settings.js";
 import { BROWSER_MCP } from "../tool-policy.js";
 
 /**
@@ -31,7 +31,7 @@ const ADAPTER = "pi-mcp-adapter";
  */
 export const ADAPTER_SPEC = `npm:${ADAPTER}@2.18.0`;
 
-const NAME_RE = /^[A-Za-z0-9][\w.-]*$/;
+export const NAME_RE = /^[A-Za-z0-9][\w.-]*$/;
 
 export interface McpFile {
   mcpServers: Record<string, Record<string, unknown>>;
@@ -168,42 +168,25 @@ export function dropMcpCache(names: string[]): void {
   }
 }
 
-/** Where the agent's browser listens for the debugging protocol, read from the environment as it is now. */
-export const browserCdp = () => process.env.BROWSER_CDP_URL || "http://127.0.0.1:9222";
-/** The same, as it was when the portal started: what the tools and the servers configured for it go by. */
-export const BROWSER_CDP = browserCdp();
-
-/** The servers of a configuration that attach to our browser, whatever they are called. */
+/** The servers of a configuration that attach to a browser that is already running, whatever they are called. */
 function connectedIn(config: McpFile): string[] {
   const names: string[] = [];
   for (const [name, entry] of Object.entries(config.mcpServers ?? {})) {
     // An entry that is not an object (`"old": null`) is no server that attaches to anything.
     const args = entry && typeof entry === "object" ? (entry as { args?: unknown }).args : undefined;
-    if (Array.isArray(args) && args.includes("--cdp-endpoint") && args.includes(BROWSER_CDP)) {
-      names.push(name);
-    }
+    if (Array.isArray(args) && args.includes("--cdp-endpoint")) names.push(name);
   }
   return names;
-}
-
-/** The servers configured to attach to our browser, whatever they are called. */
-function connectedServers(): string[] {
-  return connectedIn(readMcpFile().config);
-}
-
-/** Is some MCP server pointed at our browser, whatever it is called? */
-export function findConnection(): string | null {
-  return connectedServers()[0] ?? null;
 }
 
 /**
  * Which servers are the agent's browser.
  *
  * Found by what they connect to, not by a name: `--cdp-endpoint` is what makes
- * a Playwright server the browser rather than a throwaway Chromium, and an
- * entry written by hand or by an older portal may be called anything. The one
- * the portal writes is called `browser`, and one that is called that counts
- * too — it is the name the rest of the portal has always looked for.
+ * a Playwright server a browser the agent is signed into, at whatever address,
+ * rather than a throwaway Chromium, and an entry written by hand or by an older
+ * portal may be called anything. One called `browser` counts too — it is the
+ * name the portal wrote, and has always looked for.
  */
 export function browserServers(): string[] {
   return serversAndBrowsers().browsers;
@@ -219,15 +202,27 @@ export function serversAndBrowsers(): { servers: string[]; browsers: string[] } 
 }
 
 /**
- * The file holds the keys of the MCP servers and the portal's own token for
- * Understory, so it is for its owner alone, and put in place whole: one cut
- * off by a full disk would take every MCP server with it.
+ * The file holds the keys and tokens of the MCP servers, so it is for its
+ * owner alone, and put in place whole: one cut off by a full disk would take
+ * every MCP server with it.
  */
 export function writeMcpText(text: string): void {
   const file = mcpConfigPath();
   const before = Object.keys(readableMcpConfig()?.mcpServers ?? {});
   mkdirSync(path.dirname(file), { recursive: true });
   writeFileAtomic(file, text.endsWith("\n") ? text : text + "\n", 0o600);
+  mcpWritten(before);
+}
+
+const writtenListeners = new Set<(before: string[]) => void>();
+
+/**
+ * Tell the listeners (onMcpWritten) that the file was written, with the
+ * servers it had before: by writeMcpText, after its write, and for an edit
+ * made outside the portal that adds or takes out a server, once it is noticed
+ * (db.ts noticeMcpEdits), with the servers the portal last saw in the file.
+ */
+export function mcpWritten(before: string[]): void {
   for (const listener of [...writtenListeners]) {
     try {
       listener(before);
@@ -237,15 +232,14 @@ export function writeMcpText(text: string): void {
   }
 }
 
-const writtenListeners = new Set<(before: string[]) => void>();
-
 /**
  * Told after every write of the file, whoever wrote it — a route of the panel,
- * a feature switched off, the browser moved over — with the servers it had
- * before: what the configuration offers decides which tools a running chat may
- * still use (see mcp-offer.ts), and a chat that has to be restarted to notice
- * a server switched off is a switch that looks broken. Returns the way to stop
- * listening.
+ * a feature switched off, the browser moved over, or an edit made outside the
+ * portal that adds or takes out a server, once it is noticed — with the
+ * servers it had before: what the configuration offers decides which tools a
+ * running chat may still use (see mcp-offer.ts), and a chat that has to be
+ * restarted to notice a server switched off is a switch that looks broken.
+ * Returns the way to stop listening.
  */
 export function onMcpWritten(listener: (before: string[]) => void): () => void {
   writtenListeners.add(listener);
@@ -270,6 +264,52 @@ export function mcpAdapter(packages: unknown = readPiSettings().packages): { sou
   return undefined;
 }
 
+/** What `mcpServer` answers from: the servers and the adapter as the files were when last read. */
+let lastRead: { stamp: string; servers?: McpFile["mcpServers"]; adapter: boolean } | undefined;
+
+/** When mcp.json and pi's settings last changed: read again only when they did. */
+function filesStamp(): string {
+  return [mcpConfigPath(), piSettingsPath()]
+    .map((f) => {
+      try {
+        const st = statSync(f);
+        return `${st.mtimeMs}:${st.size}`;
+      } catch {
+        return "-";
+      }
+    })
+    .join("|");
+}
+
+/**
+ * The server of that name, and whether the chats have its tools now (`on`):
+ * there, not switched off, and pi-mcp-adapter, which its tools come through,
+ * installed and on. Asked each time a chat starts, and read from the files
+ * whenever they changed, so mcp.json is the one place it is said: switching
+ * the server or the adapter off in Settings is heard too. Nothing where there
+ * is no such server, or the file cannot be read.
+ */
+export function mcpServer(name: string): { entry: Record<string, unknown>; on: boolean } | undefined {
+  const stamp = filesStamp();
+  if (lastRead?.stamp !== stamp) {
+    let servers: McpFile["mcpServers"] | undefined;
+    let adapter = false;
+    try {
+      const { config, error } = readMcpFile();
+      if (!error) servers = config.mcpServers;
+      adapter = mcpAdapter()?.enabled === true;
+    } catch {
+      // Not readable: no server is there.
+    }
+    lastRead = { stamp, servers, adapter };
+  }
+  const { servers, adapter } = lastRead;
+  const entry = servers && Object.prototype.hasOwnProperty.call(servers, name) ? servers[name] : undefined;
+  if (!entry || typeof entry !== "object") return undefined;
+  // A copy: what the next caller is told is the file's, not what this one made of it.
+  return { entry: structuredClone(entry), on: entry.disabled !== true && adapter };
+}
+
 /** stdio, http and socket are mutually exclusive in the adapter. */
 function transportOf(entry: Record<string, unknown>): "stdio" | "http" | "socket" | "unknown" {
   if (typeof entry.command === "string" && entry.command) return "stdio";
@@ -278,7 +318,7 @@ function transportOf(entry: Record<string, unknown>): "stdio" | "http" | "socket
   return "unknown";
 }
 
-function validateEntry(entry: unknown): string | null {
+export function validateEntry(entry: unknown): string | null {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) return "Server must be an object";
   const e = entry as Record<string, unknown>;
   const transports = ["command", "url", "socket"].filter(

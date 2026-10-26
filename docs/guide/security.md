@@ -13,7 +13,7 @@ an attempt visible instead of silent.
 
 Output from a source carrying other people's words — a mail client, `curl`,
 `wget`, `ssh`, `git clone`, a package install, any MCP tool, and every page the
-agent's own [browser](/guide/browser) reads — is wrapped before the model sees it:
+agent's [browser](/guide/browser) reads — is wrapped before the model sees it:
 
 ```
 <<<untrusted:9f3ac1d20e4b7a61>>>
@@ -30,15 +30,50 @@ the block itself and everything after it would read as trusted again. Anything
 already shaped like a marker is defaced before wrapping, so a forged one never
 reaches the model to be reasoned about.
 
-The browser's tools read a page after nearly every click, so their results carry
-a shorter envelope: the same random closing id, with the warning above said once
-in the agent's instructions instead of on every result. Every browser tool carries
-that warning, so it is said while any of them is on, whichever of the others are
-switched off, and by the `tools` tool while they are lazy.
+A tool that declares that what it returns is outside content carries a shorter
+envelope: the same random closing id, with the warning above said once in the
+agent's instructions instead of on every result. The [Browser](/guide/browser)
+extension's tools declare it, as they read a page after nearly every click. The portal says the warning while
+any such tool is on, whichever of the others are switched off, and through the
+`tools` tool while they are lazy.
+
+What a tool declares is in `guard` on its definition, which a tool of the portal
+or of an [extension](/guide/extension-ui#what-the-guard-holds-a-tool-to) may
+have: `outside`, that what it returns is outside content; `reaches`, the
+parameters that hold an address the agent chose, each of which is held to the
+list of sites in **Settings → Guard** (empty is any site) and recorded in Audit;
+`acts`, the rules [below](#limiting-what-happens-next) that every call of it is
+the shape of; and `files`, the files a call works on. An extension's tool that
+declares nothing is trusted as the extension that registered it is: what it
+returns is not wrapped, and of the rules below only `read-credentials` holds it,
+where its `path` or `file_path` argument names a place secrets are kept. An MCP
+server's tools declare nothing: what they return is wrapped unless the server
+is counted as your own. A tool named like a browser's (`browser_navigate`,
+`playwright_browser_click`) is held to the browser's rules by its name, whoever
+registered it and whether or not it declares anything: what it returns is
+wrapped, and a call is held to the list of sites for its `url`, and Audit.
+Whether a conversation may drive a browser at all is its tools' switches, as for
+any tool.
 
 What is wrapped: mail and the web read through a command (`curl`, `wget`, `ssh`,
-`git clone` and the like), the tools of an MCP server, and the browser. The
-agent's own tools, a subagent's answer and a routine's are not.
+`git clone` and the like), the tools of an MCP server, the browser, and a tool
+that declares outside content. A
+server's tools count however they are called: through the adapter's `mcp` tool,
+under their own names (`jira_get_issue`) where its tools are direct, and through
+the `tools` tool where they are lazy. An issue comment or a mail body a server
+hands back is whoever wrote it, and so is what a server from a config other than
+the portal's hands back, or one whose tools are named without the server. A
+server you run yourself can be counted as your own, and its output is then
+neither wrapped nor checked. No server is counted so until you say it is. An
+extension you switch on from its own page can count its server as your own in
+the same way: [Understory](/guide/features#memory-understory) does, as what it
+holds are the agent's own notes. It is listed in Settings → Guard, where you can
+take it out, and it is no longer counted once the extension removes its server.
+A portal that ran Understory before it was an extension, where you had not said
+which servers are your own, has it in that list from the upgrade (see
+[Upgrading](/guide/upgrading#understory-is-an-extension)).
+The browser is always outside content, whoever runs it. The agent's own tools, a subagent's answer and
+a routine's are not wrapped.
 
 A [code mode](/guide/extensions#code-mode) script calls tools one at a time
 through the same guard, so each of its calls is checked by the rules below as the
@@ -104,26 +139,98 @@ leaves that conversation able to use the rule.
 
 A flagged result marks the session **tainted**. Until it is trusted or its turn
 removed, the handful of actions that turn a bad suggestion into a lasting
-problem are refused:
+problem are held: put to you where you are there to answer (see
+[below](#asked-or-refused)), refused everywhere else.
 
 | Rule | Why |
 | --- | --- |
-| `pipe-to-shell` | Downloading something and running it unseen |
+| `pipe-to-shell` | Downloading something and running it unseen: a pipe into a shell, or into `python`, `perl`, `ruby`, `node` or `php` given nothing to run but what comes in (`curl … \| python3`, and not `\| python3 -m json.tool`); a shell, `source` or `eval` handed a download (`bash <(curl …)`, `sh -c "$(curl …)"`, `bash <<< "$(curl …)"`); and a download run in the same line (`curl -o i.sh … && sh i.sh`) |
 | `write-to-path` | A file on `PATH` runs later, without anyone asking |
-| `upload` | `curl`/`wget` carrying data out: a body (`-d`, `-F`, `-T`, alone or folded into a group like `-sd`; `--data*`, `--form`, `--json`, `--post-data`, `--post-file`, `--body-*`) or a `POST`, `PUT` or `PATCH` |
-| `read-credentials` | `auth.json`, `.env`, `.ssh/`, tokens |
+| `upload` | Data carried out: `curl`/`wget` with a body (`-d`, `-F`, `-T`, alone or folded into a group like `-sd`; `--data*`, `--form`, `--json`, `--post-data`, `--post-file`, `--body-*`) or a `POST`, `PUT` or `PATCH`; `scp` or `rsync` to another machine; a pipe or a file into `nc`, `socat`, `telnet` or `ssh`; mail sent (`mail`, `sendmail`, `mutt -s`, `himalaya … send`); httpie with a body; `gh gist create` and a write through `gh api`; a copy to an S3, GCS or rclone remote; a script's own `requests.post` or `fetch` with a body |
+| `read-credentials` | `auth.json`, `.env`, `.ssh/`, tokens, also among the files a tool declares it takes |
 | `publish` | `git push` is not undoable from here, also with git's options before it (`git -C repo push`, `git -c k=v push`) |
-| `persist` | Scheduling outlives the conversation: a routine, `cron`, a systemd unit, a shell start-up file |
-| `delegate` | A `subagent` runs its own pi, which has no guard, so a tainted session may not start one |
+| `persist` | What outlives the conversation: a routine, `cron`, a systemd unit, a shell start-up file, and a change to what the agent loads as its own (`AGENTS.md`, `CLAUDE.md`, its context files, `WATCH.md`, `.pi/`, `.agents/`, `.mcp.json`; see [what a colleague may do](/people/roles#what-a-colleague-may-do)), by a tool or by a command that writes there (a redirect, `tee`, `cp`, `mv`, `ln`, `sed -i`, a download's `-o`, a clone) |
+| `delegate` | A `subagent` and a routine work in a conversation of their own, which has not read what this one read and so is not held back as it is: a tainted session may start neither, nor send a subagent at work a message (that is a `subagent` call too). Listing and stopping its subagents (`subagents`) stays open. A chat's mark never passes down to its subagents, since a tainted chat starts none, and a subagent's own mark passes up to its chat. A subagent's chat is guarded on its own, and marked by what it reads itself. When it was marked, the chat it worked for is marked as its answer comes back, and stays marked when the chat is opened again, so what it relays is held like outside content. Nothing it says reaches that chat before: `subagents` lists none of what one at work has said, and gives what one it stopped had only once its run has ended, held the same way |
+
+A tool that declares that every call of it is the shape of one of these rules
+(`acts`), such as an extension's tool that sends mail declaring `upload`, is
+held as a command that rule catches.
+
+A command is read as a shell reads it on its face, not by its letters: past
+`sudo`, `env`, `timeout` and the like, into `sh -c '…'` and `bash -lc '…'`, into
+`$(…)` and backticks, and into a here-document handed to a shell, following a
+`cd` before a write. Quoted text is text: an arrow in a commit message is no
+redirect, and `git commit -m "fix token refresh"` names no secret.
 
 Enforcement is **tainted-only** on purpose. A session writing code in a
 repository never meets any of this; the rules apply exactly where the risk
 appeared.
 
-A refusal is logged in [Audit](/guide/sessions#audit) and the agent is told to
-say it was refused rather than to find another route. A [routine](/guide/routines#the-injection-guard)
-can have the blocking turned off for itself; what the rules would have stopped is
-then recorded instead.
+### Asked or refused
+
+Where you are there to answer, a call a rule holds is put to you in the chat
+before it runs: in a chat of yours, and in a conversation you started on the
+Agent page, while you are the one speaking. The dialog names the tool and the
+rule that holds the call in its title. Its text says first why the rule holds such
+a call, then the result that was flagged and what made it look like an injection,
+and last the call as the agent wrote it: the call may be what the injection asked
+for, so however long it is, the guard's own lines stay at the top. **Yes** lets
+that one call run, and [Audit](/guide/sessions#audit) records it as *Allowed by
+approval*; the conversation stays tainted, so the next such call is asked about
+again. **No**, closing the dialog or stopping the run refuses it. The run waits
+for your answer, and a page that opens the chat later is shown the dialog.
+
+Where nobody can answer, the call is refused: a routine's run, a heartbeat, a chat
+on a channel, and a conversation in which somebody other than the primary user is
+speaking. A refusal is logged in Audit and the agent is told to say it was
+refused rather than to find another route. A [routine](/guide/routines#the-injection-guard)
+can be let off a rule, one at a time, in **Settings → Guard**; what that rule would
+have stopped is then recorded instead. Nothing else can be: chats, channels and
+heartbeats keep every rule.
+
+**Settings → Guard** shows all of this in one place: the rules and what each holds
+back, how the sandbox, the primary user and the place approvals are asked for stand,
+each routine's exemptions, which MCP servers count as your own, the sites the agent's
+tools may reach (one list for every tool that declares where it goes and for a browser
+server's tools, where an empty list is any site; see [Where it may go](/guide/browser#where-it-may-go)), the approvals not
+yet spent (with **Revoke**), the flagged results you trusted (with **Un-trust**, which
+holds their chat back again), and what is always on and why.
+
+## Creator mode
+
+[Creator mode](/guide/creator-mode), an extension that comes with the portal, is
+a chat mode in which the agent writes extensions and installs them into the
+portal. Choosing it grants a lot, and its warning says so:
+
+- **It installs without asking**, except after the chat has read something that
+  looks like a prompt injection.
+- **What it installs has the portal's own rights**, outside the sandbox. In the
+  image the portal is root, and where Compose gives it the Docker socket and the
+  host's network, that is control of the host.
+- **Its tools are offered in every chat and run there without asking.** The
+  guard holds them only where they declare what they do (`acts`, `outside`), as
+  it holds any extension's: a tool that runs code needs no further install.
+- **Its pages run in every browser signed in to the portal**, with that
+  sign-in, so they can call any route the portal has.
+
+**The ask rests on the detector.** `extension_install` and `extension_remove`
+declare `acts: ["persist"]`, so after a [suspected prompt injection](#suspected-prompt-injection)
+each call is [asked about](#asked-or-refused). An injection worded around the
+signs is wrapped as data, does not taint, and asks nothing: Creator mode is for
+work you would do yourself, in chats that read what you trust.
+
+**Its own process contains accidents.** Every extension Creator installs runs its
+server half in a process of its own: a loop that never ends, a heap or memory
+that grows without end, or a crash ends that process and not the portal. It does
+not contain intent: the process is the portal's user, with the portal's
+environment and what the portal reaches. The browser half runs in your pages,
+and Creator refuses a pi half, which would run in every chat's pi.
+
+**With the sandbox off** (the default), the agent already runs as the portal's
+user. It can change the copies in Creator's data folder directly, which load at
+the next change of what is installed, and run `pi install` itself, with no ask and
+no row in Audit. Creator mode adds the structure, the marks and the audit, not a
+wall: the [sandbox](/guide/sandbox) is what closes Creator's folder to the agent.
 
 ## What this does not do
 
@@ -157,12 +264,14 @@ label is refused there.
 
 ## The agent's browser is behind the login
 
-The portal proxies the agent's [browser](/guide/browser#embedded-or-in-a-tab) at
-`/browser-ui`, and what the browser holds (its logins, its open pages, whatever the
-agent is doing in it) is shown there live. The page and its websocket therefore sit
-behind the portal's login like every other route: without it they answer 401, and a
-websocket opened from another site is refused. The portal does not hand its own
-login cookie, or the visitor's `Authorization` header, on to the browser.
+The [Browser](/guide/browser#embedded-or-in-a-tab) extension serves the agent's
+browser through the portal at `/api/x/pithagoras-browser/ui/`, and what the browser
+holds (its logins, its open pages, whatever the agent is doing in it) is shown there
+live. The page and its websocket therefore sit behind the portal's login like every
+extension's route: without it they answer 401, and a websocket opened from another
+site is refused, which the portal checks before the extension is asked. Browser does
+not hand the portal's login cookie, or the visitor's `Authorization` header, on to
+the browser.
 
 The browser's own ports (`3010` and `3011`) are not the way in: they listen on the
 loopback address only, so that the one password in front of them is not all that

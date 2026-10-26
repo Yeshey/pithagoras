@@ -4,7 +4,7 @@
  * components drawn in them. The portal implements exactly this, and is
  * checked against it when it is built.
  *
- * See docs/guide/extension-ui.md, "Building an extension".
+ * See "Building an extension": https://thecodacus.github.io/pithagoras/guide/extension-ui
  */
 import type { ComponentType, KeyboardEvent, LazyExoticComponent, ReactNode } from "react";
 import type * as ReactNamespace from "react";
@@ -55,6 +55,12 @@ export interface PanelHandle {
   guardClose(guard: (() => boolean | Promise<boolean>) | null): void;
   /** Opens another panel from this one (a file it lists, in Files): this one is not the one closed to make room for it. */
   open(name: string, params?: unknown): void;
+  /**
+   * Shows the panel, its head and its body, on the whole screen, where the browser lets a page: the panel beside it
+   * stays where it is. Closed, it leaves the screen. Escape gives it its place back. Called from something the person
+   * did (a click), while the panel is open; otherwise nothing happens.
+   */
+  fullscreen(): void;
 }
 
 export type PanelProps = ChatProps & { close(): void; panel: PanelHandle };
@@ -72,6 +78,10 @@ export interface ToolCallView {
   output?: string;
   /** What it reported about itself beside its text: a tool result's `details`. */
   details?: unknown;
+  /** When it started running, in milliseconds as `Date.now()` counts them: for how long it has been going. */
+  since?: number;
+  /** Set when the run ended with the call still open: it never said how it came out. */
+  interrupted?: true;
   /**
    * The files it gave the person, once it ended: what its `details.files`
    * named, as the portal found them in the chat's folder by their bytes. `url`
@@ -82,6 +92,37 @@ export interface ToolCallView {
   files?: CallFile[];
 }
 
+/** A model the chat's model menu lists: see `chat.model.menu`. */
+export interface MenuModel {
+  provider: string;
+  id: string;
+  /** What it is called, where its provider says. */
+  name?: string;
+}
+
+/** A picture for `ui.ImageViewer`. */
+export interface ViewerPicture {
+  /** Tells it from the others in the list, and is what `from` of another points at. */
+  id: string;
+  /** Where the picture is, as an <img> takes it. Also what Open in a new tab and Download go to. */
+  src: string;
+  /** What it shows, for those who cannot see it. */
+  alt: string;
+  /** Shown under it, when there is something to say: its title. */
+  caption?: string;
+  /** What Download names the file, when the address does not say. */
+  fileName?: string;
+  /** The `id` of the picture this one was edited from, where that is known. */
+  from?: string;
+}
+
+/**
+ * How something goes, for `ui.useLeaveRef`: as a dialog does (the dimming lets go and what is in it sinks), a menu,
+ * a panel (out through the edge it is docked at, its `data-dock`), a deleted row, a message, a page, or something that
+ * no longer exists.
+ */
+export type Leave = "dialog" | "menu" | "panel" | "row" | "message" | "page" | "gone";
+
 /** A file a call gave the person, in the chat's folder: see ToolCallView.files. */
 export interface CallFile {
   /** Relative to the chat's folder. */
@@ -91,6 +132,54 @@ export interface CallFile {
   /** The files it was made from, relative to the chat's folder. */
   from?: string[];
   url: string;
+  /**
+   * For a picture in a chat's conversation: opens the chat's picture viewer
+   * at it, with the conversation's other pictures to step through.
+   * `ui.ImagePreview` given the file does this when it is clicked.
+   */
+  open?(): void;
+}
+
+/** How loud each side of a voice conversation is now, from 0 to 1: what the microphone hears, and what is played. */
+export interface AvatarLevels {
+  input: number;
+  output: number;
+}
+
+/**
+ * What voice mode is doing, as an avatar shows it: the person is heard
+ * (`input`); the reply is played (`output`); the agent is at work on what to
+ * say and nothing is played (`thinking`, while the stage says Transcribing,
+ * Thinking, Preparing your reply or Compacting context); the microphone is
+ * off and nothing else is going on (`muted`); or none of these (`idle`).
+ */
+export type AvatarMode = "idle" | "input" | "output" | "thinking" | "muted";
+
+/** What an entry of `voice.avatar` is drawn with. */
+export interface AvatarProps {
+  /** The agent it is drawn for. */
+  agent: { id: string; name: string };
+  mode: AvatarMode;
+  /**
+   * The levels now. They change many times a second and the component is not
+   * drawn again for them: read `levels.current.input` and
+   * `levels.current.output` in an animation frame of your own. The object in
+   * `current` is replaced at times, so read it through `levels` each time
+   * rather than keeping it.
+   */
+  levels: { readonly current: AvatarLevels };
+  /**
+   * A picture of the agent, not voice mode: its card on the Agents page, and
+   * the avatar on its page. `mode` is "idle" and the levels stay 0. Draw it
+   * once and keep nothing running for it: a page can show many.
+   */
+  still: boolean;
+  /**
+   * The portal's orb for the same agent, in the same mode and with the same
+   * levels: to draw while there is nothing of your own to draw yet (a model
+   * still loading, a drawing context that was lost).
+   */
+  orb: ReactNode;
 }
 
 export interface SlotMap {
@@ -101,10 +190,11 @@ export interface SlotMap {
    * button. `useButton` is a hook, called as the chat's header is drawn: how
    * its button is for this chat. `name` is a name of its own that
    * `portal.panels.open(name, params)` reaches it by, from anywhere: the
-   * portal's own panels go by "browser" and "agents", and while
-   * one of those is the portal's, it is the one.
+   * subagent extension's goes by "agents", the terminal's by "terminal".
    * Of two extensions that name a panel alike, the one first in the slot's
    * order has it (a lower `order`, then the one whose extension is first in the list of installed extensions).
+   * `bleed` makes its body black from edge to edge, and not a box that
+   * scrolls: for what fills it by itself, a frame or another program's screen.
    */
   "chat.panel": {
     entry: {
@@ -114,6 +204,7 @@ export interface SlotMap {
       header?: ComponentType<PanelProps>;
       actions?: ComponentType<PanelProps>;
       useButton?: (props: ChatProps) => { hidden?: boolean; live?: boolean; title?: string };
+      bleed?: boolean;
     };
     props: PanelProps;
   };
@@ -125,8 +216,39 @@ export interface SlotMap {
   "chat.overlay": { entry: {}; props: ChatProps };
   /** Above the message box: what is running, what waits. */
   "chat.composer.above": { entry: {}; props: ChatProps };
-  /** How a call of one tool is drawn in the conversation, in place of the portal's card for it. `card` is that card. */
-  "chat.tool": { entry: { tool: string }; props: ChatProps & { call: ToolCallView; card: ReactNode } };
+  /**
+   * Chips in the running tray, just above the message box, before the
+   * chat's background jobs and the statuses extensions set: what the
+   * extension has going in this chat, each a way into where it is shown
+   * (`ui.TrayChip`). The component draws nothing while nothing is going; the
+   * tray shows only while something in it is drawn.
+   */
+  "chat.tray": { entry: {}; props: ChatProps };
+  /**
+   * A row in the chat's model menu, under its models: something else of the
+   * chat's that runs on a model (what its subagents run on). `models` are
+   * those the menu lists. It is drawn as the menu opens, so what it shows is
+   * best fetched with the chat (`chat.background`), not then: a row that
+   * arrives a moment later pushes the rest of the menu down.
+   */
+  "chat.model.menu": { entry: {}; props: { chat: Chat; models: readonly MenuModel[] } };
+  /**
+   * How a call of one tool is drawn in the conversation, in place of the
+   * portal's card for it. `card` is that card.
+   *
+   * `tile`, where given, is drawn small on the call's card in voice mode, in
+   * place of the mark that says how it stands: a picture being made, say.
+   * `describe` is what that card says of the call, in place of the portal's
+   * words for a tool it does not know ("Using make picture").
+   */
+  "chat.tool": {
+    entry: {
+      tool: string;
+      tile?: ComponentType<{ call: ToolCallView; chat: Chat }>;
+      describe?: (call: ToolCallView, chat: Chat) => { label: string; detail?: string } | undefined;
+    };
+    props: ChatProps & { call: ToolCallView; card: ReactNode };
+  };
   /**
    * Something to do with a call of a tool, drawn on the portal's card for it
    * when it is opened, under what the call returned: "Open in the terminal".
@@ -134,9 +256,12 @@ export interface SlotMap {
    * `cut` is whether the card shows only the end of the output. `chat` is
    * the chat whose conversation the card is in; a card elsewhere, such as a
    * subagent's run, has none. The component draws nothing for a call it has
-   * nothing for. `ui.ToolLink` is the portal's own look for it.
+   * nothing for. `ui.ToolLink` is the portal's own look for it. With `head`
+   * it is drawn beside the card's head instead, where it shows while the card
+   * is folded too: a way in that should not wait for the card to be opened
+   * (Watch, on a call that started a subagent).
    */
-  "chat.tool.action": { entry: { tool?: string | RegExp }; props: { call: ToolCallView; cut: boolean; panels: Panels; chat?: Chat } };
+  "chat.tool.action": { entry: { tool?: string | RegExp; head?: boolean }; props: { call: ToolCallView; cut: boolean; panels: Panels; chat?: Chat } };
   /**
    * A window in voice mode, placed and sized like the portal's own. `place`
    * is where it goes when it has the choice: at the side, or in the middle.
@@ -144,7 +269,10 @@ export interface SlotMap {
    * that opens the window each time it grows (the agent ran a command). A
    * card of a call in voice mode that `opensFor` says yes to opens it when
    * tapped, for calls the portal's own windows are not for. Its own shortcut
-   * is `portal.shortcuts`.
+   * is `portal.shortcuts`. `useButton` is a hook, called as voice mode's
+   * toolbar is drawn, while the window is open too (it has no button then):
+   * how the window's button there is for this chat, as a panel's is in the
+   * chat's header.
    *
    * `maximizable` gives its head a Maximize button: the window then fills the
    * stage, over the others and above the dock, until it is restored by its
@@ -163,6 +291,8 @@ export interface SlotMap {
       maximizable?: boolean;
       keepLoaded?: boolean;
       useAutoOpen?: (props: ChatProps) => number;
+      /** `hidden`: no button while it is closed (it still opens for work, a card and a shortcut). `live`: a dot that says something in it is running. `title`: what the button says when pointed at. */
+      useButton?: (props: ChatProps) => { hidden?: boolean; live?: boolean; title?: string };
       /** `chat` is the chat on screen: its `workspace` tells a path in its folder from one elsewhere. */
       opensFor?: (call: ToolCallView, chat: Chat) => boolean;
       /** What the card of a call it opens for says, in place of the portal's words for a tool it does not know ("Using canvas write"). */
@@ -171,14 +301,42 @@ export interface SlotMap {
     props: ChatProps & { close(): void; opened: VoiceWindowOpened; maximized: boolean; maximize(): void; restore(): void };
   };
   /**
+   * The agent, drawn where voice mode draws its orb, for an agent whose
+   * avatar it was chosen as. The agent's Avatar dialog lists every entry
+   * beside the orb, by its `title` and `description` (translated as `title`
+   * is), and what is chosen is kept as "<package>/<id>": an id kept the same
+   * across versions keeps the agents that chose it, and the two together must
+   * stay within 256 characters.
+   *
+   * It is drawn in the orb's box, which is square and changes size without
+   * the component being made again (from 380 pixels in the middle of the
+   * stage to 64 in its dock on a phone), and may draw past it as the orb's
+   * glow does, by 3/14 of its size on each side. It is drawn too in the
+   * dialog's preview, with a made-up voice, and `still` on the Agents page;
+   * there the box is the whole square it is drawn on, and what is past it is
+   * cut.
+   * Where it is not in the page (its extension is not, or has not registered
+   * it yet) or fails to draw, the orb is drawn in its place.
+   */
+  "voice.avatar": { entry: { title: string; description?: string }; props: AvatarProps };
+  /**
    * A page of the portal, at /x/<extension>/<id>, with an entry in the
    * sidebar. `useShown` is a hook, called as the sidebar is drawn: whether the
    * entry is listed now (not while the service the page is for is not set
    * up). Until it says yes, it is not. The page is at its address either way.
    */
   "nav.page": { entry: { title: string; icon?: ComponentType; useShown?: () => boolean }; props: {} };
-  /** The extension's page in Settings, above the fields the portal found for it. */
-  "settings.page": { entry: {}; props: {} };
+  /**
+   * The extension's page in Settings, above the fields the portal found for
+   * it, at /settings/x/<extension>. `title` and `icon` are its entry in
+   * Settings' list, in place of the extension's name and the mark every
+   * extension has. `search` is what Settings' search finds on the page,
+   * beside the extension's name: each a `title`, the heading on the page it is
+   * under (`section`, scrolled to), and other `words` someone might type for
+   * it. Titles and headings are said in the page's language as the
+   * extension's own `t` says them, so a heading is found as the page shows it.
+   */
+  "settings.page": { entry: { title?: string; icon?: ComponentType; search?: { title: string; section?: string; words?: string }[] }; props: {} };
 }
 export type SlotName = keyof SlotMap;
 
@@ -249,6 +407,17 @@ export interface ChatFeed {
   background: BackgroundState;
   /** Asks for `background` again at once: after a job was stopped, or the finished ones cleared. */
   refreshBackground(): void;
+}
+
+/** A chat's events as `chats.useEvents` streams them. */
+export interface ChatEvents {
+  events: readonly PortalEvent[];
+  /** How the chat stands, as its events last said: "idle" until one says otherwise. */
+  status: "idle" | "running" | "error" | "interrupted";
+  /** What it has said so far is still being fetched. */
+  loading: boolean;
+  /** The portal has no such chat (deleted, or never made): nothing more is asked. */
+  missing: boolean;
 }
 
 /** The panels of the chat on screen, any of them, by name. */
@@ -331,8 +500,12 @@ export interface FollowBottom<T extends HTMLElement> {
  * an extension draws is made of what the portal's pages are made of.
  */
 export interface Ui {
-  /** Markdown as the conversation draws it: code, tables, diagrams, and no picture from another site. */
-  Markdown: ComponentType<{ children: string; animated?: boolean; className?: string }>;
+  /**
+   * Markdown as the conversation draws it: code, tables, diagrams, and no picture from another site. A link is a
+   * button that asks before it opens the address in a new tab; `components.a`, where given, draws the links instead
+   * (one to a page of the extension's own, opened there).
+   */
+  Markdown: ComponentType<{ children: string; animated?: boolean; className?: string; components?: { a?: ComponentType<{ href?: string; children?: ReactNode }> } }>;
   Select<T extends string | number = string>(props: {
     value: T;
     onChange: (value: T) => void;
@@ -392,10 +565,92 @@ export interface Ui {
   lazy<M extends Record<K, ComponentType<any>>, K extends keyof M>(load: () => Promise<M>, name: K): LazyExoticComponent<M[K]>;
   /** A link on a tool call's card, as the portal's own are drawn: for `chat.tool.action`. */
   ToolLink: ComponentType<{ icon?: ComponentType<{ "aria-hidden"?: boolean }>; onClick: () => void; children: ReactNode }>;
+  /**
+   * A conversation as the chat draws its own, from its events (`PortalEvent`s, as a chat's stream carries them: pi's,
+   * and `portal_prompt` for what was asked): what was asked, the replies with their thinking, each tool call on its
+   * card, compactions and notices. A call of a tool an extension draws (`chat.tool`) is drawn by that extension, as in
+   * `chat`, where one is given. A question asked of the person is left out: only a chat's own agent asks one. `running`:
+   * it is still being written, and its last reply streams in. `empty` is drawn while there is nothing yet to show. The
+   * rows are drawn one under the other; the box that scrolls them is the caller's.
+   */
+  Transcript: ComponentType<{ events: readonly PortalEvent[]; running?: boolean; chat?: Chat; empty?: ReactNode }>;
+  /**
+   * A chip for `chat.tray`, as the portal draws a background job there: a ring that spins, `icon`, `label`, `detail`
+   * in a quieter colour, and how long it has run since `since` (ms since the epoch), counting. `onClick` opens where
+   * it is shown; without it the chip is only a label.
+   */
+  TrayChip: ComponentType<{ icon?: ComponentType<{ "aria-hidden"?: boolean; className?: string }>; label: string; detail?: string; since?: number; title?: string; onClick?: () => void }>;
+  /** The small ring that spins beside what is running, as on a tool call's card; given a fraction from 0 to 1, it fills instead. */
+  Ring: ComponentType<{ value?: number; className?: string }>;
+  /** Text that shimmers, as "Thinking" does while the agent thinks: for what is going on now. */
+  Shimmer: ComponentType<{ children: ReactNode }>;
+  /**
+   * A picture as the conversation shows one a tool makes: the place it will
+   * be in while it is made (`making`, with how long it has taken), the picture
+   * once it is there (`done`), or why it is not (`failed`, `reason`). An edit
+   * shows its original (`before`) until the new one arrives over it. A clip
+   * (`kind: "video"`) shows its poster, or its first frame, with a mark that it
+   * plays. `file`, a picture a call gave, is the picture shown, and a click
+   * opens the chat's viewer at it; `onOpen` is a click otherwise. `compact` is
+   * the small tile voice mode's cards show, and `actions` what goes under it.
+   * `pictureId` marks it (`data-picture-id`) for a viewer's `anchor` to find.
+   */
+  ImagePreview: ComponentType<{
+    state: "making" | "done" | "failed";
+    file?: CallFile;
+    kind?: "picture" | "video";
+    src?: string;
+    video?: string;
+    before?: string;
+    edit?: boolean;
+    ratio?: number;
+    title?: string;
+    detail?: string;
+    reason?: string;
+    elapsed?: number;
+    compact?: boolean;
+    onOpen?: () => void;
+    actions?: ReactNode;
+    pictureId?: string;
+  }>;
+  /**
+   * The portal's picture viewer, over the page: the pictures to step through,
+   * opened at `startId`, with zoom, Open in a new tab and Download. `anchor` is
+   * where focus goes when it closes, for the picture shown last; `actions` are
+   * more buttons beside Close, for the picture shown.
+   */
+  ImageViewer: ComponentType<{
+    pictures: ViewerPicture[];
+    startId: string;
+    onClose: () => void;
+    anchor?: (id: string) => HTMLElement | null | undefined;
+    actions?: (picture: ViewerPicture) => ReactNode;
+  }>;
+  /**
+   * A dialog over the page, as the portal's own: Escape and a click beside it
+   * close it, after asking when `unsaved` says something typed in it is not
+   * saved (or a part of it says so with `useUnsavedDraft`).
+   */
+  Modal: ComponentType<{ title: ReactNode; subtitle?: ReactNode; onClose: () => void; children: ReactNode; footer?: ReactNode; wide?: boolean; unsaved?: boolean }>;
+  /**
+   * A group of settings that folds, as Settings' own: its `title` and a
+   * `summary` of what is set in it while it is folded. Settings' search opens
+   * it when what it finds is in it.
+   */
+  DetailsGroup: ComponentType<{ title: string; summary: ReactNode; defaultOpen?: boolean; children: ReactNode }>;
+  /**
+   * A hook: this part of a dialog (a page in Settings, a `Modal`) holds
+   * something typed in that is not saved, so closing the dialog asks first.
+   */
+  useUnsavedDraft(unsaved: boolean): void;
   /** A question with two answers, asked over the page: resolves true for yes. */
   confirm(options: ConfirmOptions): Promise<boolean>;
-  /** The look of the portal's own fields and buttons, as class names for a `className`. */
-  classes: { input: string; inputSmall: string; codeArea: string; button: string; primary: string; primarySmall: string; ghost: string };
+  /**
+   * The look of the portal's own fields and buttons, as class names for a
+   * `className`; `viewerButton` and `iconButton` are the buttons over a
+   * picture and in a viewer's head (`aria-pressed` drawn as chosen).
+   */
+  classes: { input: string; inputSmall: string; codeArea: string; button: string; primary: string; primarySmall: string; ghost: string; viewerButton: string; iconButton: string };
   /** Copies text, where the page is served over plain HTTP as well. Resolves false when it could not. */
   copyText(text: string): Promise<boolean>;
   /** Whether the person wants to be asked before something is deleted (Settings → This browser): ask first when true. */
@@ -408,6 +663,14 @@ export interface Ui {
   useNow(on: boolean, every?: number): number;
   /** Arrow keys for a row of tabs: on the element with `role="tablist"`. */
   tabKeys(event: KeyboardEvent<HTMLElement>): void;
+  /**
+   * A hook: the ref for the one element a part draws (a viewer of its own over
+   * the page, say), so that when it goes, a picture of it leaves as the
+   * portal's own do, where the animations are on (Settings → This browser)
+   * and the system does not ask for less motion. `how` may be a function,
+   * asked as it goes, that says null for "not this time".
+   */
+  useLeaveRef<T extends HTMLElement>(how: Leave | (() => Leave | null)): (element: T | null) => void;
 }
 
 // --- shortcuts ---
@@ -475,8 +738,14 @@ export interface Portal {
   /** The portal's own React: what a component drawn in a slot has to be made with, for its hooks to work. */
   React: typeof ReactNamespace;
   slots: { register<S extends SlotName>(slot: S, entry: Entry<S>): () => void };
-  /** Go to a page of the portal: "/s/<chat id>", "/x/<extension>/<page id>". */
-  navigate(path: string): void;
+  /**
+   * Go to a page of the portal: "/s/<chat id>", "/x/<extension>/<page id>",
+   * "/settings/x/<extension>". With `replace`, in place of the page shown in
+   * the browser's history (a page that keeps what it shows in its address).
+   */
+  navigate(path: string, options?: { replace?: boolean }): void;
+  /** A hook: the page's address, drawn again when it changes, Back and Forward included. */
+  useLocation(): { path: string; search: string };
   ui: Ui;
   api: {
     /** A request as the portal's own are made: JSON back, an ApiError with what was said for one refused, and a login that is gone told to the page. */
@@ -507,6 +776,8 @@ export interface Portal {
     date(d: Date | number | string, options?: Intl.DateTimeFormatOptions): string;
     dateTime(d: Date | number | string, options?: Intl.DateTimeFormatOptions): string;
     time(d: Date | number | string, options?: Intl.DateTimeFormatOptions): string;
+    /** How long something has run, in whole seconds, as the chat says it: "42s", "3m 05s". */
+    elapsed(seconds: number): string;
   };
   locale: {
     /** The package's texts in a language ("de"), each by what the code says in English: a text, or a count's forms (see `tp`). */
@@ -521,7 +792,7 @@ export interface Portal {
     run(name: string, ...args: unknown[]): unknown;
     has(name: string): boolean;
   };
-  /** The panels of the chat on screen, any of them: the portal's ("browser", "agents") and an extension's ("<package>/<id>", or the name it gave itself, as Files' is "files"). */
+  /** The panels of the chat on screen, any of them: an extension's, by "<package>/<id>" or by the name it gave itself, as Files' is "files". */
   panels: PanelController;
   chats: {
     /**
@@ -532,6 +803,13 @@ export interface Portal {
     use<T = ChatFeed>(chatId: string, pick?: (feed: ChatFeed) => T, same?: (a: T, b: T) => boolean): T;
     /** The same outside a component: told each time the chat changes. Returns the unsubscribe. */
     on(chatId: string, handler: (feed: ChatFeed) => void): () => void;
+    /**
+     * A hook: any chat's events by its id, streamed while the component is drawn, as the chat on screen streams its
+     * own: for drawing a chat beside the one on screen, such as a child chat's run (`ui.Transcript`). Of a long
+     * conversation its latest part, as a page load has it. One stream for each chat however many parts ask; nothing is
+     * asked without an id.
+     */
+    useEvents(chatId: string | undefined): ChatEvents;
   };
   shortcuts: {
     /** A shortcut of the extension's: see `Shortcut`. Its label is translated as the extension's own texts are. */

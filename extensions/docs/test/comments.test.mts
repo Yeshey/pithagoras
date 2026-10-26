@@ -7,7 +7,7 @@ import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import express from 'express';
 import docsServer from '../server.js';
-import { resolveInside } from '../../../core/server/src/workspace-files.ts';
+import { folderFiles } from '../../../core/server/src/folder-files.ts';
 import { scratch } from '../../../tests/helpers.mts';
 
 /**
@@ -29,12 +29,13 @@ async function portal(folders: Record<string, string>, data = DATA) {
     log: (line: string) => logged.push(line),
     router,
     http: { json: express.json },
-    files: { inside: resolveInside },
+    files: folderFiles,
     sandbox: { on: () => false },
     dataDir: () => data,
     chats: {
       list: () => Object.keys(folders).map((id) => ({ id, title: `Chat ${id}` })),
       folder: (id: string) => realpathSync(folders[id]),
+      inFolder: (folder: string) => Object.keys(folders).filter((id) => ((() => { try { return realpathSync(folders[id]) === folder; } catch { return false; } })())).map((id) => ({ id, title: `Chat ${id}` })),
     },
   }, { dependencies: async () => true, pollMs: 40 }) as () => Promise<void>;
   const app = express();
@@ -92,6 +93,8 @@ async function portal(folders: Record<string, string>, data = DATA) {
     close: async () => {
       for (const abort of aborts) abort.abort();
       await stop();
+      // close() leaves a connection open that fetch made and has not sent a request on yet.
+      server.closeAllConnections();
       server.close();
     },
   };

@@ -68,6 +68,15 @@ box and its conversation use as well.
   repository itself, or has changes a repository around it tracks, is asked
   about.
 
+What you make here belongs to the folder it is made in. A new file, an upload
+and a new folder get the folder's owner and group, and are writable by that group
+where the folder is, so that the agent, which with the [sandbox](/guide/sandbox)
+on is another user, can go on editing what you made. A file you save over keeps
+the owner, group and permissions it had. Where the portal is not allowed to give
+a file away (it is not root and the folder is someone else's), the file stays the
+portal's and is group-writable only if its group is the folder's. On a system
+without `/proc` (macOS) the portal gives nothing away at all.
+
 A save is made whole: the text is written beside the file and put in place, so a
 save that fails (a full disk, say) leaves the file as it was. The reason is shown
 above the editor; your text and the **Save** button stay, to copy or to try again.
@@ -80,6 +89,14 @@ meantime, you get the same choice as at a save.
 The agent writes here too, so a save is checked. If the file changed after you
 opened it, the save is refused and you choose between loading the new version
 and saving yours anyway.
+
+**Refresh** reads the folder again and, when a file is open, that file too. A
+file without unsaved changes shows its new text in place, as the page or the
+source it was shown as. With unsaved changes, your text stays; if the file
+changed, you get the same choice as at a save. The only change Files notices by
+itself is one the agent makes with its write and edit tools. A change made any
+other way — by the agent's shell commands, a terminal, another chat or another
+device — shows with **Refresh**.
 
 The Markdown files in a folder called `documents` are also the project's
 [Documents](/guide/documents), with a history of their own. A change made here
@@ -94,6 +111,9 @@ is shown — the editor, live, as it changes. Opening a file or a folder yoursel
 takes over from that, and **Follow** hands it back; clicking **Following** again
 stops following. Editing is never interrupted:
 while you have unsaved changes, the agent's next file does not replace them.
+When the agent writes or edits the file that is open, its new text shows there,
+following or not; with unsaved changes you get the same choice as at a save
+instead.
 
 In [voice mode](/guide/voice) it opens on its own the first time the agent touches
 a file, in the same way as the browser and the terminal, and there is a folder

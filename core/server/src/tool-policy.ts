@@ -5,40 +5,60 @@
  * place and tested without either: a default that applies everywhere, and a
  * conversation that may disagree about any tool in either direction.
  *
- * There are three layers, each an exception to the one before it: the
- * portal-wide default, a project's exceptions to it, and a conversation's
- * exceptions to what the project leaves. The project's layer is folded into
- * the default with `defaultsFor`, so a conversation is judged against "what its
- * project starts it with" and nothing else here has to know projects exist.
+ * There are six layers, each an exception to the one before it: the
+ * portal-wide default, an agent's, a project's, a routine's for its runs, a
+ * chat's mode, and the conversation's own exceptions, which are the last word.
+ * All but the last are folded into one default with `defaultsFor`
+ * (`toolDefaultsFor` and `toolDefaultsForSession` in db.ts), so a conversation
+ * is judged against "what it starts with" and nothing else here has to know the
+ * layers exist.
  */
 
 /**
- * The MCP the portal attaches the agent's browser as.
+ * The name the portal gave the MCP it attached the agent's browser as.
  *
  * Its tools arrive named `browser_<whatever>`, and they are switched here like
  * any other server's: having the browser is having its tools, and there is no
- * second switch for it. The globe beside the composer only shows or hides the
- * view of the browser the agent is driving.
+ * second switch for it.
  */
 export const BROWSER_MCP = "browser";
 
 /**
- * The portal's own browser tools (browser/tools.ts): browser tools by name,
- * whatever MCP servers there are, since they come from no server.
+ * How the adapter starts the names of a server's tools, in its default `server` mode
+ * (getServerPrefix): the server's name with its hyphens as underscores, and its dots
+ * kept. `brave-search` registers `brave_search_brave_web_search`, and `docs.v2`
+ * registers `docs.v2_search`. A tool's own dots are written as underscores
+ * (formatToolName), a server's are not: `docs_v2_search` is the tool `v2_search` of
+ * a server called `docs`.
  */
-export const PORTAL_BROWSER_TOOLS = [
-  "browser_navigate",
-  "browser_back",
-  "browser_snapshot",
-  "browser_click",
-  "browser_type",
-  "browser_select",
-  "browser_key",
-  "browser_scroll",
-  "browser_find",
-  "browser_get_text",
-  "browser_screenshot",
-] as const;
+export function mcpPrefix(server: string): string {
+  return server.replace(/-/g, "_");
+}
+
+/**
+ * How the adapter starts the names of a server's tools in the naming it is set to
+ * (`toolPrefix`, getServerPrefix): `server` is mcpPrefix; `short` leaves out a
+ * closing `mcp` (`docs-mcp` names its tools `docs_…`); `mcp` puts `mcp__` before
+ * it; `none` starts them with nothing, a tool's own name being all of it.
+ */
+export function mcpPrefixAs(server: string, naming: string): string {
+  if (naming === "none") return "";
+  if (naming === "short") return server.replace(/-?mcp$/i, "").replace(/-/g, "_") || "mcp";
+  if (naming === "mcp") return `mcp__${mcpPrefix(server)}`;
+  return mcpPrefix(server);
+}
+
+/**
+ * Could a tool of this name be this server's, as the adapter names them? What
+ * every place that tells a tool's server by its name goes by, so that none of
+ * them gives a tool to a server another would not. In the naming given, the
+ * default where none is: one that names a tool by its own name alone could have
+ * a tool of any name.
+ */
+export function mcpClaims(server: string, name: string, naming = "server"): boolean {
+  const prefix = mcpPrefixAs(server, naming);
+  return !prefix || name.startsWith(`${prefix}_`);
+}
 
 /**
  * Which MCP server a tool came through, if any.
@@ -46,50 +66,26 @@ export const PORTAL_BROWSER_TOOLS = [
  * Everything behind the adapter registers itself as one package, so a machine
  * with three servers attached had one group of forty tools called
  * `pi-mcp-adapter`. Nobody thinks of them that way: they think "the browser
- * one", "the Jira one". The adapter names a tool `<server>_<tool>`, so the
- * server is recoverable from the name given the list of configured servers.
+ * one", "the Jira one". The adapter names a tool `<server>_<tool>` (mcpPrefix),
+ * so the server is recoverable from the name given the list of configured servers.
  *
  * The longest match wins, or a server called `browser` would claim the tools
  * of one called `browser_staging`.
  *
- * The prefix is the server's name with its hyphens as underscores, which is how
- * the adapter writes it: `brave-search` registers `brave_search_brave_web_search`.
  * What is returned is the name as configured.
  */
 export function mcpServerOf(name: string, servers: Iterable<string>): string | undefined {
   let best: string | undefined;
   let bestLength = -1;
   for (const server of servers) {
-    const prefix = server.replace(/-/g, "_");
-    if (!name.startsWith(`${prefix}_`)) continue;
-    if (prefix.length > bestLength) {
+    if (!mcpClaims(server, name)) continue;
+    const length = mcpPrefix(server).length;
+    if (length > bestLength) {
       best = server;
-      bestLength = prefix.length;
+      bestLength = length;
     }
   }
   return best;
-}
-
-/**
- * Does this tool come from the agent's browser?
- *
- * `browsers` is the servers that are the browser, which the caller works out
- * from what they connect to; it defaults to the name the portal writes.
- *
- * Asked through mcpServerOf rather than by prefix, because the prefix is
- * ambiguous: a server called `browser_staging` names a tool
- * `browser_staging_click`, which starts with `browser_` and is not the
- * browser's. Whether a conversation may drive the signed-in Chromium hangs on
- * this answer, so it is the careful one.
- */
-export function browserTool(
-  name: string,
-  servers: Iterable<string>,
-  browsers: string[] = [BROWSER_MCP]
-): boolean {
-  if ((PORTAL_BROWSER_TOOLS as readonly string[]).includes(name)) return true;
-  const server = mcpServerOf(name, servers);
-  return server !== undefined && browsers.includes(server);
 }
 
 
@@ -97,16 +93,6 @@ export function browserTool(
 export function toolSource(name: string, source: string, servers: Iterable<string>): string {
   return mcpServerOf(name, servers) ?? source;
 }
-
-/**
- * The key of the set the portal's picture and video tools share, as the tool lists show them in one box.
- * Brackets, as no package, file or MCP server is called: a set an extension's tool of the same
- * name could be filed in by accident. The web app keys the same box the same way.
- */
-export const MEDIA_SET = "<portal:media>";
-
-/** Showing a picture or a clip, making one, changing a picture: the tools that make up MEDIA_SET. */
-const MEDIA_TOOLS = ["show_image", "generate_image", "edit_image", "show_video", "generate_video"];
 
 /** What the web app calls the tools that say nothing about where they came from: pi's own among them. */
 export const BUILT_IN_SET = "built in";
@@ -120,10 +106,9 @@ export const PI_BUILT_IN_TOOLS = ["read", "bash", "edit", "write", "grep", "find
 
 /**
  * The tool set a tool belongs to: the box the tool lists show it in, which is also what
- * can be made lazy. The portal's own picture and video tools are one set, whichever extension registered each.
+ * can be made lazy.
  */
-export function toolSetOf(tool: { name: string; source: string; inline?: boolean }, servers: Iterable<string>): string {
-  if (tool.inline && MEDIA_TOOLS.includes(tool.name)) return MEDIA_SET;
+export function toolSetOf(tool: { name: string; source: string }, servers: Iterable<string>): string {
   return toolSource(tool.name, tool.source, servers).trim() || BUILT_IN_SET;
 }
 

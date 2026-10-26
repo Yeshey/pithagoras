@@ -6,12 +6,9 @@ import { splitContext } from "../context-blocks";
 import { workingText } from "./StatusDot";
 import { RunningTray } from "./RunningTray";
 import { mentionsCommand } from "../status-commands";
-import { SubagentPanel } from "./SubagentPanel";
-import { stableSubagents, subagents, type Subagent } from "../subagents";
 import { useBackground } from "../use-background";
 import { useWorkPanels } from "../use-work-panels";
 import { useFollowBottom } from "../use-follow-bottom";
-import { latestBrowserActivity } from "../voice-browser";
 import { VoiceControl } from "./VoiceControl";
 import { DictationButton, DictationStrip } from "./Dictation";
 import { insertAtCaret } from "../dictation";
@@ -20,13 +17,15 @@ import { createPortal } from "react-dom";
 import { Fragment, memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { DiagramPlugin } from "streamdown";
 import { followPointer } from "../pointer-drag";
-import { LuGripVertical, LuMenu, LuBot, LuArrowDown, LuGlobe, LuSquare, LuArrowUp, LuPaperclip, LuPuzzle, LuX } from "react-icons/lu";
-import { api, type PiCommand, type PortalEvent, type PromptOptions, type Session } from "../api";
+import { LuGripVertical, LuMenu, LuArrowDown, LuSquare, LuArrowUp, LuPaperclip, LuPuzzle, LuX, LuCornerLeftUp } from "react-icons/lu";
+import { Link } from "react-router-dom";
+import { api, EXTENSIONS_CHANGED, MODES_CHANGED, type ChatMode, type PiCommand, type PortalEvent, type PromptOptions, type Session } from "../api";
 import { pending, refetchImage, sortFiles, uploadedNote, type Attachment } from "../attachments";
 import { activity, buildTranscript, keepItems, type Item, type SentImage } from "../transcript";
 import { HAS_MERMAID, loadMermaidPlugin } from "../mermaid";
 import { useResolvedTheme } from "../theme";
 import { ComposerBar } from "./ComposerBar";
+import { ModePicker, ModePill } from "./ModePicker";
 import { QuestionCard } from "./QuestionCard";
 import { useChatPictures } from "./ChatPictures";
 import { confirmDialog } from "./ConfirmDialog";
@@ -48,6 +47,7 @@ import { forgetChatFeed, publishChat } from "../extensions/chat-feed";
 import { forgetOpenCalls, openCalls } from "../open-calls";
 import { setPanelController, type ChatPanels } from "../extensions/panels";
 import { runCommand, useHasCommand } from "../extensions/commands";
+import { failedIn } from "../extensions/loader";
 import { STEP, arrowSteps } from "../resize-keys";
 
 /** How many messages are drawn at first, and added each time you scroll up to the edge. */
@@ -72,17 +72,11 @@ const ASIDE: Record<Dock, string> = {
   float: "absolute z-20 rounded-xl border border-line bg-surface shadow-pop",
 };
 
-type OwnPanel = "browser" | "agents";
-/** A panel an extension brought (the `chat.panel` slot), by its entry's key: `x:<extension>/<id>`. */
-type ExtensionPanel = `x:${string}`;
-/** The panels that sit beside the conversation, each in a place of its own. */
-type AsidePanel = OwnPanel | ExtensionPanel;
-const isOwn = (kind: AsidePanel): kind is OwnPanel => !kind.startsWith("x:");
-/** What each of the portal's own panels is called: in its header, and on its close button. */
-const PANEL: Record<OwnPanel, { label: string; close: string }> = {
-  browser: { label: msg("Browser"), close: msg("Close the browser") },
-  agents: { label: msg("Subagents"), close: msg("Close the subagents") },
-};
+/**
+ * The panels that sit beside the conversation, each in a place of its own: those the extensions brought (the
+ * `chat.panel` slot), by their entries' keys, `x:<extension>/<id>`.
+ */
+type AsidePanel = `x:${string}`;
 
 /** Where a slash command comes from; one a newer portal adds is shown as it is named. */
 const COMMAND_SOURCE: Record<string, string> = {
@@ -112,8 +106,8 @@ const moveInto = (parent: HTMLElement, box: HTMLElement) => {
  * place it is in: carried elsewhere, it is the same panel — Files keeps an
  * edit not saved, a list its scroll — rather than one made anew there.
  *
- * A box taken off the page and put back loses what the page held for it: the
- * browser's page loads again, and a list is scrolled back to its top. So
+ * A box taken off the page and put back loses what the page held for it: a
+ * frame's page loads again, and a list is scrolled back to its top. So
  * before the place it is in goes, it steps out into `park`, and on into its
  * next place, with moveBefore — which moves it without taking it off. A
  * browser without moveBefore takes it off and puts it back as before. Made
@@ -127,7 +121,7 @@ function panelBoxes(park: { readonly current: HTMLElement | null }, pressed: { r
     let el = boxes[kind];
     if (!el) {
       el = boxes[kind] = document.createElement("div");
-      el.className = `flex min-h-0 min-w-0 flex-1 flex-col${kind === "browser" ? " bg-black" : ""}`;
+      el.className = "flex min-h-0 min-w-0 flex-1 flex-col";
       // On the page, not in React: what is in the box is drawn from elsewhere
       // in the chat (a portal), and its events never reach the window it is in.
       el.addEventListener("pointerdown", () => pressed.current(kind), true);
@@ -186,7 +180,9 @@ export function Chat({
   onAbort,
   onClientCommand,
   onRename,
+  onSetMode,
   onOpenNavigation,
+  parentTitle,
   versions = {},
   loading,
   hasEarlier,
@@ -214,8 +210,12 @@ export function Chat({
   onClientCommand: (name: string, args: string) => void | Promise<void>;
   /** Give the chat another name, from its header. */
   onRename: (title: string) => Promise<void>;
+  /** Put the chat, which has said nothing yet, in a mode (see ModePicker); `confirmed` for one that asks first. */
+  onSetMode: (mode: string, confirmed?: boolean) => Promise<void>;
   /** On a phone, where the sidebar is a drawer: opens it. */
   onOpenNavigation?: () => void;
+  /** For a sub-chat (see sub-chats.ts): its chat's title, where the list has that chat. */
+  parentTitle?: string;
   /**
    * The versions of messages edited or sent again, by the seq of the one
    * shown: the seqs of all of them, oldest first. Said by the chat's stream.
@@ -270,16 +270,6 @@ export function Chat({
   const [panelRequest, setPanelRequest] = useState<"model" | "effort" | null>(null);
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const [composerHeight, setComposerHeight] = useState(storedComposerHeight);
-  // Whether there is a browser to watch, and whether you are watching it. Asked
-  // once — the answer only changes when somebody installs or removes one.
-  const [browserUp, setBrowserUp] = useState(false);
-  const [watching, setWatching] = useState(false);
-  const [agentsOpen, setAgentsOpen] = useState(false);
-  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
-  const openAgent = (id: string) => {
-    setSelectedAgent(id);
-    setAgentsOpen(true);
-  };
   // A job in the running tray is shown where an extension says jobs are shown (`jobs.show`); while none does, a job
   // there is only listed.
   const jobsShown = useHasCommand("jobs.show");
@@ -297,6 +287,7 @@ export function Chat({
   const backgrounds = useSlot("chat.background");
   const overlays = useSlot("chat.overlay");
   const aboveComposer = useSlot("chat.composer.above");
+  const trayEntries = useSlot("chat.tray");
   const [extensionsOpen, setExtensionsOpen] = useState<readonly string[]>([]);
   // What each was last opened with, what its body and its head share, and which are not to be closed to make room.
   const [panelParams, setPanelParams] = useState<Record<string, unknown>>({});
@@ -382,6 +373,12 @@ export function Chat({
           setOpenedFrom(key);
           panelControl.current.open(name, opened);
         },
+        // Its own box: the panel beside it stays where it is, and closed, the box leaves the page, and fullscreen with it.
+        // Not open, there is no box on the page to show; and a browser refuses it but for something the person did.
+        fullscreen: () => {
+          const box = boxes.box(`x:${key}`);
+          if (box.isConnected) box.requestFullscreen?.().catch(() => {});
+        },
       },
     };
     panelParts.current.set(key, now);
@@ -395,11 +392,8 @@ export function Chat({
   };
   const toggleExtensionPanel = useStable((key: string, open: boolean) => (open ? void closeExtensionPanel(key) : showExtensionPanel(key, true)));
   useWorkPanels(
-    {
-      browser: !voiceMode && watching, agents: !voiceMode && agentsOpen,
-      ...Object.fromEntries(extensionPanels.map((key) => [`x:${key}`, !voiceMode])),
-    },
-    panel => { if (panel === "browser") setWatching(false); else if (panel === "agents") setAgentsOpen(false); else if (panel.startsWith("x:")) showExtensionPanel(panel.slice(2), false); },
+    Object.fromEntries(extensionPanels.map((key) => [`x:${key}`, !voiceMode])),
+    panel => { if (panel.startsWith("x:")) showExtensionPanel(panel.slice(2), false); },
     // A third panel closes another one instead of one an extension says holds
     // something that would be lost (an edit not saved), and of one that has
     // just opened the third.
@@ -409,7 +403,7 @@ export function Chat({
     ],
   );
   // Beside the conversation, top to bottom in this order.
-  const asidePanels = [watching && "browser", agentsOpen && "agents", ...extensionPanels.map((key) => `x:${key}`)].filter(Boolean) as AsidePanel[];
+  const asidePanels = extensionPanels.map((key) => `x:${key}` as AsidePanel);
 
   // Kept across reloads: a width you dragged is a preference, and losing it on
   // every refresh makes the handle feel decorative. Where each panel goes, the
@@ -1044,16 +1038,8 @@ export function Chat({
   // What it is doing, and for how long. The clock ticks only while something is
   // running, so an idle session re-renders no more than it used to.
   const phase = useMemo(() => (running ? activity(events) : null), [running, events]);
-  // Scans of every event, for the voice view: with the box's text in this component, they would run for each key typed.
-  const browserActivity = useMemo(() => latestBrowserActivity(events), [events]);
-  // Beside the conversation: subagents, jobs left running, extension statuses.
-  // The same entry for a subagent whose own events have not changed: an open
-  // panel draws its transcript again only when there is more of it, not on
-  // every word of the main chat.
-  const lastAgents = useRef<Subagent[]>([]);
-  const agents = useMemo(() => (lastAgents.current = stableSubagents(lastAgents.current, subagents(events, items, ended))), [events, items, ended]);
+  // Beside the conversation: what extensions have going, jobs left running, extension statuses.
   const [background, refreshBackground] = useBackground(session.id, running, events);
-  const agentFor = (callId?: string) => (callId ? agents.find((a) => a.toolCallId === callId || a.id === `tool:${callId}`) : undefined);
   // The thinking block and the compaction marker already say so, animated,
   // where it is happening; the status pill would say it twice.
   const statusShownElsewhere = useMemo(() => {
@@ -1084,6 +1070,39 @@ export function Chat({
     return () => clearTimeout(timer);
   }, [heard]);
   useEffect(() => setHeard(null), [session.id]);
+
+  // The modes the chat may be put in: for the picker before it has said anything, and after that to name its mode in
+  // the header. One that cannot be read is no list, and no picker: the chat works as it is. Read again when what is
+  // installed changes (an extension's modes come and go with it), and when the person's own change (Settings → Modes).
+  const [modes, setModes] = useState<{ chat: string; list: ChatMode[] } | null>(null);
+  const wantsModes = !loading && (!started || session.mode !== null);
+  useEffect(() => {
+    if (!wantsModes) return;
+    const id = session.id;
+    let live = true;
+    const read = () =>
+      api.chatModes(id).then(
+        (r) => {
+          if (live) setModes({ chat: id, list: r.modes });
+        },
+        () => undefined,
+      );
+    void read();
+    window.addEventListener(EXTENSIONS_CHANGED, read);
+    window.addEventListener(MODES_CHANGED, read);
+    return () => {
+      live = false;
+      window.removeEventListener(EXTENSIONS_CHANGED, read);
+      window.removeEventListener(MODES_CHANGED, read);
+    };
+  }, [session.id, wantsModes]);
+  const modeList = modes?.chat === session.id ? modes.list : [];
+  // A mode chosen here, shown at once, before the chat's row says so.
+  const [chosenHere, setChosenHere] = useState<{ chat: string; mode: string } | null>(null);
+  const currentMode = (chosenHere?.chat === session.id ? chosenHere.mode : null) ?? session.mode ?? "standard";
+  // The save of the mode chosen, while it is on its way: true once it was saved, false once it failed and said why.
+  // A first message waits for it (see submit).
+  const modeSave = useRef<{ chat: string; saved: Promise<boolean> } | null>(null);
   const wasRunning = useRef({ id: session.id, running });
   useEffect(() => {
     const before = wasRunning.current;
@@ -1191,16 +1210,6 @@ export function Chat({
     changeInput(`${trigger}${c.name} `);
   };
 
-  useEffect(() => {
-    // Only offered where it would work: an iframe needs a secure context, and
-    // over plain HTTP the client inside it refuses to start.
-    if (!window.isSecureContext) return;
-    api
-      .browser()
-      .then((b) => setBrowserUp(b.install.container === "running"))
-      .catch(() => setBrowserUp(false));
-  }, []);
-
   useLayoutEffect(() => {
     // Stay at the end while the agent writes — unless you scrolled up to read,
     // which new output must not undo. Something you just said, and the first
@@ -1240,6 +1249,10 @@ export function Chat({
    * get there. Throws, for the caller to say what went wrong.
    */
   const submit = async (msg: string, fromBox: boolean): Promise<void> => {
+    // Not before the mode chosen is saved, which the first message fixes; nor at all after it failed: the chat would
+    // be fixed in a mode the person did not choose. What was typed stays in the box.
+    const saving = modeSave.current;
+    if (saving?.chat === session.id && !(await saving.saved)) return;
     const sent = session.id;
     const typed = typedCommand(msg, trigger);
     // pi is told "/name" whatever character the command was typed with, so the
@@ -1365,13 +1378,41 @@ export function Chat({
     }
   };
 
+  /** Puts the chat in `mode`: shown at once, and back as it was if it is not saved. */
+  const chooseMode = (mode: string, confirmed?: boolean) => {
+    const chat = session.id;
+    setChosenHere({ chat, mode });
+    // One save at a time in a chat: a choice made while the last one is on its way is sent after it, so that the
+    // server is not asked to change the mode while it is still changing it, and the choice made last is the one kept.
+    const before = modeSave.current?.chat === chat ? modeSave.current.saved : undefined;
+    const saved = (async () => {
+      await before;
+      let done = false;
+      await attempt(async () => {
+        try {
+          await onSetMode(mode, confirmed);
+        } catch (e) {
+          // Shown back as it was, unless another choice was made since: that one is shown.
+          if (modeSave.current === saving) setChosenHere(null);
+          throw e;
+        }
+        done = true;
+      });
+      return done;
+    })();
+    const saving = { chat, saved };
+    modeSave.current = saving;
+    void saved.then(() => {
+      if (modeSave.current === saving) modeSave.current = null;
+    });
+  };
+
   // What the rows can do. Rows are drawn only when what they show changes, so they are handed one object
   // that stays the same, whose functions do what these do now (see useStableActions).
   // Results trusted while this page is open, before the chat's details say so.
   const trustedHere = useRef(new Set<string>());
   const rowActions = useStableActions<RowActions>({
     openPicture: pictures.open,
-    openAgent,
     edit: setEditing,
     cancelEdit: () => setEditing(null),
     saveEdit: (seq, next) => {
@@ -1565,16 +1606,11 @@ export function Chat({
     if (voiceMode) void dictation.stop();
   }, [voiceMode, dictation.stop]);
 
-  const closeOwn: Record<OwnPanel, () => void> = {
-    browser: () => setWatching(false),
-    agents: () => setAgentsOpen(false),
-  };
-  const closePanel = (kind: AsidePanel) => (isOwn(kind) ? closeOwn[kind]() : void closeExtensionPanel(kind.slice(2)));
+  const closePanel = (kind: AsidePanel) => void closeExtensionPanel(kind.slice(2));
   /** The entry an extension's panel is drawn from. */
-  const entryOf = (kind: AsidePanel) => (isOwn(kind) ? undefined : panelEntries.find((entry) => entry.key === kind.slice(2)));
+  const entryOf = (kind: AsidePanel) => panelEntries.find((entry) => entry.key === kind.slice(2));
   /** What a panel is called: in its header, and on its close button. */
   const panelName = (kind: AsidePanel) => {
-    if (isOwn(kind)) return { label: t(PANEL[kind].label), close: t(PANEL[kind].close) };
     const entry = entryOf(kind);
     const title = entry ? titleOf(entry) : "";
     return { label: title, close: t("Close {panel}", { panel: title }) };
@@ -1591,8 +1627,9 @@ export function Chat({
     if (!entry) return null;
     const Body = entry.component;
     return (
-      <div className="flex min-h-0 flex-1 flex-col overflow-auto bg-surface" data-extension={entry.extension}>
-        <ErrorBoundary resetKey={`${entry.key}:${session.id}`} fallback={(error) => <div className="p-4"><PartFailed error={error} /></div>}>
+      // From edge to edge (`bleed`): black, and what it draws fills it rather than scrolls in it.
+      <div className={`flex min-h-0 flex-1 flex-col ${entry.bleed ? "overflow-hidden bg-black" : "overflow-auto bg-surface"}`} data-extension={entry.extension}>
+        <ErrorBoundary resetKey={`${entry.key}:${session.id}`} fallback={(error) => <div className="p-4"><PartFailed error={error} /></div>} onError={failedIn(entry.extension)}>
           <Body key={session.id} {...panelProps(entry)} />
         </ErrorBoundary>
       </div>
@@ -1604,42 +1641,33 @@ export function Chat({
     const Part = entry?.[part];
     if (!entry || !Part) return null;
     return (
-      <ErrorBoundary resetKey={`${entry.key}:${part}:${session.id}`} fallback={() => null}>
+      <ErrorBoundary resetKey={`${entry.key}:${part}:${session.id}`} fallback={() => null} onError={failedIn(entry.extension)}>
         <Part key={session.id} {...panelProps(entry)} />
       </ErrorBoundary>
     );
   };
   /** The parts of the installed extensions that are drawn in the chat itself, each alone in what it does when it fails. */
-  const extensionParts = (entries: readonly Registered<"chat.header.action" | "chat.background" | "chat.overlay" | "chat.composer.above">[]) =>
+  const extensionParts = (entries: readonly Registered<"chat.header.action" | "chat.background" | "chat.overlay" | "chat.composer.above" | "chat.tray">[]) =>
     entries.map((entry) => (
-      <ErrorBoundary key={entry.key} resetKey={`${entry.key}:${session.id}`} fallback={() => null}>
+      <ErrorBoundary key={entry.key} resetKey={`${entry.key}:${session.id}`} fallback={() => null} onError={failedIn(entry.extension)}>
         <entry.component key={session.id} chat={chat} channel={channelFor(session.id, entry.extension)} panels={panelsOf(entry.extension)} />
       </ErrorBoundary>
     ));
 
   // The panels by name, for anything in the page: see extensions/panels.ts. Read as they are when asked.
   // An extension's panel goes by its key ("<package>/<id>") or by the name it gave itself (`name`), the first
-  // loaded having a name two give; the portal's own names are the portal's while those panels are its own.
+  // loaded having a name two give.
   const panelKey = (key: string) => (panelEntries.some((entry) => entry.key === key) ? key : panelEntries.find((entry) => entry.name === key)?.key);
   const panelControl = useRef<ChatPanels>({ isOpen: () => false, open: () => {}, close: () => {} });
   panelControl.current = {
-    isOpen: (key) =>
-      key === "browser" ? watching : key === "agents" ? agentsOpen : extensionPanels.includes(panelKey(key) ?? key),
+    isOpen: (key) => extensionPanels.includes(panelKey(key) ?? key),
     open: (key, params) => {
-      const given = (params ?? {}) as { id?: unknown };
-      if (key === "browser") setWatching(true);
-      else if (key === "agents") typeof given.id === "string" ? openAgent(given.id) : setAgentsOpen(true);
-      else {
-        const found = panelKey(key);
-        if (!found) throw new Error(`There is no panel called "${key}"`);
-        showExtensionPanel(found, true, params);
-      }
+      const found = panelKey(key);
+      if (!found) throw new Error(`There is no panel called "${key}"`);
+      showExtensionPanel(found, true, params);
     },
     // As by hand: what an extension's panel asks before it is closed is asked.
-    close: (key) => {
-      if (key in closeOwn) closeOwn[key as OwnPanel]();
-      else void closeExtensionPanel(panelKey(key) ?? key);
-    },
+    close: (key) => void closeExtensionPanel(panelKey(key) ?? key),
   };
   useEffect(() => {
     setPanelController({ isOpen: (key) => panelControl.current.isOpen(key), open: (key, params) => panelControl.current.open(key, params), close: (key) => panelControl.current.close(key) });
@@ -1672,17 +1700,6 @@ export function Chat({
         {extensionHead(kind, "header") ?? <span className="text-[11px] text-fg-subtle">{panelName(kind).label}</span>}
         <div className="ml-auto flex items-center gap-0.5">
           {extensionHead(kind, "actions")}
-          {kind === "browser" && (
-            <button
-              // The browser's own box is what goes fullscreen, not the place
-              // it shares: the panel beside it stays where it is,
-              // and closed, the box leaves the page, and fullscreen with it.
-              onClick={() => boxes.box("browser").requestFullscreen?.()}
-              className="rounded px-1.5 py-0.5 text-[11px] text-fg-faint transition hover:text-fg"
-            >
-              {t("Fullscreen")}
-            </button>
-          )}
           <button
             onClick={() => closePanel(kind)}
             title={t("Collapse")}
@@ -1693,19 +1710,6 @@ export function Chat({
           </button>
         </div>
       </div>
-      {kind === "browser" && (
-        <iframe
-          src="/browser-ui/"
-          title={t("The agent's browser")}
-          className="fx-power min-h-0 flex-1 border-0"
-          allow="clipboard-read; clipboard-write; fullscreen"
-        />
-      )}
-      {kind === "agents" && (
-        <div className="min-h-0 flex-1 bg-surface">
-          <SubagentPanel sessionId={session.id} agents={agents} items={items} selected={selectedAgent} onSelect={setSelectedAgent} />
-        </div>
-      )}
       {extensionBody(kind)}
     </>
   );
@@ -1818,6 +1822,16 @@ export function Chat({
           </button>
         )}
         <div className="min-w-0 flex-1">
+          {/* A sub-chat says whose it is, and leads back there: it may have been opened from a link, with its chat nowhere in view. */}
+          {session.parent && (
+            <Link
+              to={`/s/${session.parent}`}
+              className="chat-parent flex min-w-0 max-w-full items-center gap-1 text-[11px] leading-4 text-fg-subtle hover:text-accent"
+            >
+              <LuCornerLeftUp aria-hidden className="h-3 w-3 shrink-0" />
+              <span className="truncate">{parentTitle ? t("Sub-chat of {name}", { name: parentTitle }) : t("Sub-chat: open its chat")}</span>
+            </Link>
+          )}
           {renaming ? (
             <TitleInput
               value={session.title}
@@ -1850,32 +1864,13 @@ export function Chat({
               {t("interrupted — send a message to resume")}
             </span>
           )}
+          {/* The mode the chat was started in, once it has started; Standard says nothing. Named from the list, once it is here. */}
+          {started && session.mode && modes?.chat === session.id && <ModePill stored={session.mode} modes={modeList} />}
           {/* The installed extensions' own controls. One that fails to draw is left out, and the header stays. */}
           {extensionParts(headerActions)}
-          {agents.length > 0 && (
-            <PanelToggle
-              open={agentsOpen}
-              onClick={() => setAgentsOpen((v) => !v)}
-              label={t("Subagents")}
-              title={agentsOpen ? t("Hide the subagents") : t("The agents working beside this one")}
-              live={agents.some((a) => a.status === "running")}
-            >
-              <LuBot />
-            </PanelToggle>
-          )}
-          {browserUp && (
-            <PanelToggle
-              open={watching}
-              onClick={() => setWatching((v) => !v)}
-              label={t("Browser")}
-              title={watching ? t("Hide the browser") : t("Watch the browser the agent is driving")}
-            >
-              <LuGlobe />
-            </PanelToggle>
-          )}
           {panelEntries.map((entry) => (
             // Its button is its own to say about (hidden, live): one whose say fails is left out, and the header stays.
-            <ErrorBoundary key={entry.key} resetKey={`${entry.key}:${session.id}`} fallback={() => null}>
+            <ErrorBoundary key={entry.key} resetKey={`${entry.key}:${session.id}`} fallback={() => null} onError={failedIn(entry.extension)}>
               <ExtensionToggle key={session.id} entry={entry} chat={chat} channel={channelFor(session.id, entry.extension)} panels={panelsOf(entry.extension)} open={extensionPanels.includes(entry.key)} onToggle={toggleExtensionPanel} />
             </ErrorBoundary>
           ))}
@@ -1955,10 +1950,8 @@ export function Chat({
               switching={switching !== null}
               sessionId={session.id}
               chat={chat}
-              folder={session.workspace}
               mermaid={mermaid}
               mermaidOptions={mermaidOptions}
-              agent={item.kind === "tool" ? agentFor(item.callId)?.id : undefined}
               act={rowActions}
             />
           );
@@ -2012,6 +2005,12 @@ export function Chat({
         }}
         className="px-4 pb-4 pt-2 sm:px-6 sm:pb-5"
       >
+        {/* How the chat works, chosen before it has said anything: where there is a choice. */}
+        {!loading && !started && modeList.length > 1 && (
+          <div className="relative mx-auto mb-1.5 flex w-full max-w-3xl items-center gap-2">
+            <ModePicker chat={session.id} current={currentMode} modes={modeList} onChoose={chooseMode} />
+          </div>
+        )}
         <div className="prompt-shell relative mx-auto w-full max-w-3xl">
         {/* Scrolled up to read, the way back to the end is one click rather
             than a long drag — and during a run, where the new output is. */}
@@ -2084,11 +2083,10 @@ export function Chat({
         {/* What the installed extensions say above the message box. */}
         {extensionParts(aboveComposer)}
         <RunningTray
-          agents={agents}
+          extensions={trayEntries.length ? extensionParts(trayEntries) : undefined}
           jobs={background.jobs}
           statuses={background.statuses}
           commands={commandNames}
-          onAgent={openAgent}
           onJob={jobsShown ? showJob : undefined}
           onCommand={(command) => attempt(() => submit(command, false))}
         />
@@ -2242,6 +2240,7 @@ export function Chat({
           <ComposerBar
             sessionId={session.id}
             session={session}
+            chat={chat}
             running={running}
             turns={turns}
             started={started}
@@ -2258,7 +2257,7 @@ export function Chat({
                 <LuPaperclip aria-hidden className="h-4 w-4" />
               </button>
               <DictationButton dictation={dictation} />
-              <VoiceControl folder={session.workspace} key={session.id} sessionId={session.id} items={items} running={running} work={phase} onSend={onSend} onAbort={onAbort} stageTarget={voiceHost} onModeChange={setVoiceMode} title={session.title} browserAvailable={browserUp} browserActivity={browserActivity} toolEvents={events} />
+              <VoiceControl folder={session.workspace} key={session.id} sessionId={session.id} items={items} running={running} work={phase} onSend={onSend} onAbort={onAbort} stageTarget={voiceHost} onModeChange={setVoiceMode} title={session.title} toolEvents={events} />
               {/* Mid-run, Stop stays while a message is written: it is the
                   moment the agent is seen going the wrong way, and whether to
                   steer it or stop it is still open. */}

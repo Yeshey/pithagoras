@@ -8,8 +8,9 @@ import { useSlot } from "../extensions/slots";
 import { useCached } from "../settings-cache";
 import { isEnter } from "../shortcuts";
 import { tabKeys } from "../tab-keys";
-import { msg, t, tp } from "../i18n";
+import { formatDateTime, msg, t, tp } from "../i18n";
 import { confirmDialog } from "./ConfirmDialog";
+import { InstallProgress, installExtension, type InstallStep } from "./ExtensionInstall";
 import { PackageCatalog } from "./PackageCatalog";
 import { Empty, LoadFailed, Section, Switch, btnCls, gridCls, inputCls, primaryCls } from "./SettingsUi";
 import { SkeletonGroup } from "./Skeleton";
@@ -129,8 +130,11 @@ export function ExtensionsPanel({
   const [filter, setFilter] = useState<PackageKind | "all">("all");
   const [spec, setSpec] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
-  // Why a package's interface is not in the page, or its server half not running, where it brings one: see extensions/loader.ts.
-  const { failures, serverFailures } = useExtensions();
+  // Which package an install of more than one has come to.
+  const [step, setStep] = useState<InstallStep | null>(null);
+  // Why a package's interface is not in the page, or failed in a page (this one or another), or its server half is not
+  // running, where it brings one: see extensions/loader.ts.
+  const { failures, clientFailures, serverFailures, serverCrashes } = useExtensions();
   const ownPages = useSlot("settings.page");
   // The same, readable by a second Enter that comes before the draw.
   const busyRef = useRef(false);
@@ -148,6 +152,7 @@ export function ExtensionsPanel({
   }, []);
   const shipped = useCached("extensions-shipped", api.shippedExtensions, { freshMs: 30_000 });
 
+  /** Runs `fn`, one at a time; one the person said no to (false) changes nothing. */
   const act = async (label: string, fn: () => Promise<unknown>) => {
     // Enter in the name field gets here without the disabled button's say: a second install into the same folder collides with the first.
     if (busyRef.current) return;
@@ -155,11 +160,13 @@ export function ExtensionsPanel({
     setBusy(label);
     setNote(null);
     try {
-      await fn();
+      if ((await fn()) === false) return;
       await onRefresh();
       setSpec("");
     } catch (e) {
       onError((e as Error).message);
+      // What it did before it failed stays done (what an extension needs, installed before it): the list is read again.
+      await onRefresh();
     } finally {
       busyRef.current = false;
       setBusy(null);
@@ -175,7 +182,7 @@ export function ExtensionsPanel({
       if (r.reloaded) parts.push(() => tp(r.reloaded, "{n} open conversation reloaded.", "{n} open conversations reloaded."));
       if (r.waiting)
         parts.push(() =>
-          tp(r.waiting, "{n} still working — it keeps it as it was until /reload, or its next start.", "{n} still working — they keep it as it was until /reload, or their next start."),
+          tp(r.waiting, "{n} still working — it takes the change at its next step.", "{n} still working — they take the change at their next step."),
         );
       setNote(() => () => parts.map((part) => part()).join(" "));
     });
@@ -329,15 +336,48 @@ export function ExtensionsPanel({
                       )}
                       {/* Said where it is not the usual one: a package a project brings has no switch here, and this is why. */}
                       {ext.scope && !/^user/i.test(ext.scope) && <span className={pillCls}>{ext.scope}</span>}
-                      {failures[ext.name] && (
+                      {/* The extension whose own folder it is in; when, where that extension installed it itself. */}
+                      {ext.installedFrom && (
+                        <span className={pillCls} title={ext.installedFrom.at ? formatDateTime(ext.installedFrom.at) : undefined}>
+                          {t("From {name}", { name: displayName(ext.installedFrom.extension, names) })}
+                        </span>
+                      )}
+                      {/* The extension's own words, shown as they are. */}
+                      {ext.installedFrom?.note && <p className="basis-full break-words text-xs text-fg-subtle">{ext.installedFrom.note}</p>}
+                      {failures[ext.name] ? (
                         <p role="alert" className="basis-full break-words text-xs text-warn">
                           {t("Its interface could not be loaded: {reason}", { reason: failures[ext.name] })}
                         </p>
+                      ) : (
+                        clientFailures[ext.name] && (
+                          <p role="alert" className="basis-full break-words text-xs text-warn">
+                            {t("Its interface failed in a page: {reason}", { reason: clientFailures[ext.name] })}
+                          </p>
+                        )
                       )}
-                      {serverFailures[ext.name] && (
-                        <p role="alert" className="basis-full break-words text-xs text-warn">
-                          {t("Its server half could not be started: {reason}", { reason: serverFailures[ext.name] })}
-                        </p>
+                      {serverCrashes[ext.name] ? (
+                        <div role="alert" className="basis-full text-xs text-warn">
+                          <p className="break-words">
+                            {t("Its server half crashed at {time}, and is off until another version of it is installed, or it is switched off and on: {error}", {
+                              time: formatDateTime(serverCrashes[ext.name].at),
+                              error: serverCrashes[ext.name].error,
+                            })}
+                          </p>
+                          {serverCrashes[ext.name].lines.length > 0 && (
+                            <details className="mt-1">
+                              <summary className="cursor-pointer text-fg-subtle">{t("What it said last")}</summary>
+                              <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-fg/5 p-2 font-mono text-[10px] leading-4 text-fg-muted">
+                                {serverCrashes[ext.name].lines.join("\n")}
+                              </pre>
+                            </details>
+                          )}
+                        </div>
+                      ) : (
+                        serverFailures[ext.name] && (
+                          <p role="alert" className="basis-full break-words text-xs text-warn">
+                            {t("Its server half could not be started: {reason}", { reason: serverFailures[ext.name] })}
+                          </p>
+                        )
                       )}
                     </Card>
                   );
@@ -354,37 +394,45 @@ export function ExtensionsPanel({
             {(shipped.failed || (shipped.value?.extensions.length ?? 0) > 0) && (
               <Section title={t("Comes with Pithagoras")} hint={t("Shipped with this portal, and installed from its own folder.")}>
                 {shipped.value ? (
-                  <ul className={gridCls}>
-                    {shipped.value.extensions.map((ext: ShippedExtension) => (
-                      <Card
-                        key={ext.name}
-                        kinds={ext.kinds}
-                        name={ext.name}
-                        version={ext.version}
-                        description={ext.description}
-                        action={
-                          installed.has(ext.name) ? (
-                            <span className="pop-in inline-flex shrink-0 items-center gap-1 rounded-lg bg-ok/10 px-2 py-1 text-[11px] text-ok">
-                              <LuCheck className="h-3.5 w-3.5" /> {t("Installed")}
+                  <>
+                    <ul className={gridCls}>
+                      {shipped.value.extensions.map((ext: ShippedExtension) => (
+                        <Card
+                          key={ext.name}
+                          kinds={ext.kinds}
+                          name={ext.name}
+                          version={ext.version}
+                          description={ext.description}
+                          action={
+                            installed.has(ext.name) ? (
+                              <span className="pop-in inline-flex shrink-0 items-center gap-1 rounded-lg bg-ok/10 px-2 py-1 text-[11px] text-ok">
+                                <LuCheck className="h-3.5 w-3.5" /> {t("Installed")}
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => act(ext.spec, () => installExtension(ext.spec, { progress: setStep }))}
+                                disabled={busy !== null}
+                                aria-label={t("Install {name}", { name: ext.name })}
+                                className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-accent/12 px-2 py-1 text-[11px] text-accent ring-1 ring-inset ring-accent/25 transition hover:bg-accent/20 disabled:opacity-40"
+                              >
+                                {busy === ext.spec ? <LuRefreshCw className="h-3.5 w-3.5 animate-spin" /> : <LuDownload className="h-3.5 w-3.5" />}
+                                {busy === ext.spec ? t("Installing…") : t("Install")}
+                              </button>
+                            )
+                          }
+                        >
+                          <KindPills kinds={ext.kinds} />
+                          {ext.requires && (
+                            <span title={t("It does not run without these: installing it installs them too, where they are not there")} className={pillCls}>
+                              {t("Needs {names}", { names: Object.keys(ext.requires).join(", ") })}
                             </span>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => act(ext.spec, () => api.installPackage(ext.spec))}
-                              disabled={busy !== null}
-                              aria-label={t("Install {name}", { name: ext.name })}
-                              className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-accent/12 px-2 py-1 text-[11px] text-accent ring-1 ring-inset ring-accent/25 transition hover:bg-accent/20 disabled:opacity-40"
-                            >
-                              {busy === ext.spec ? <LuRefreshCw className="h-3.5 w-3.5 animate-spin" /> : <LuDownload className="h-3.5 w-3.5" />}
-                              {busy === ext.spec ? t("Installing…") : t("Install")}
-                            </button>
-                          )
-                        }
-                      >
-                        <KindPills kinds={ext.kinds} />
-                      </Card>
-                    ))}
-                  </ul>
+                          )}
+                        </Card>
+                      ))}
+                    </ul>
+                    {shipped.value.extensions.some((ext) => ext.spec === busy) && <InstallProgress step={step} />}
+                  </>
                 ) : (
                   <LoadFailed error={shipped.failed!} onRetry={shipped.reload} />
                 )}
@@ -400,16 +448,17 @@ export function ExtensionsPanel({
                 <input
                   value={spec}
                   onChange={(e) => setSpec(e.target.value)}
-                  onKeyDown={(e) => isEnter(e) && spec.trim() && act("install", () => api.installPackage(spec.trim()))}
+                  onKeyDown={(e) => isEnter(e) && spec.trim() && act("install", () => installExtension(spec.trim(), { progress: setStep }))}
                   placeholder="npm:@scope/package"
                   aria-label={t("Install by name")}
                   className={`${inputCls} font-mono text-xs`}
                 />
-                <button disabled={!spec.trim() || busy !== null} onClick={() => act("install", () => api.installPackage(spec.trim()))} className={primaryCls}>
+                <button disabled={!spec.trim() || busy !== null} onClick={() => act("install", () => installExtension(spec.trim(), { progress: setStep }))} className={primaryCls}>
                   <LuDownload className="h-4 w-4" />
                   {busy === "install" ? t("Installing…") : t("Install")}
                 </button>
               </div>
+              {busy === "install" && <InstallProgress step={step} />}
               <div className="mt-2 flex flex-wrap gap-1">
                 {SOURCES.map((s) => (
                   <button

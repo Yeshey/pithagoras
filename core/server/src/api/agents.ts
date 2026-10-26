@@ -13,6 +13,7 @@ import { FileError } from "../workspace-files.js";
 import { CONTEXT_FILES } from "../pi/context-files.js";
 import { fail } from "./files.js";
 import { userFor } from "../sandbox/identity.js";
+import { sourceVoices } from "./voice.js";
 
 /**
  * The agents: listing them, making one, naming it, and its own files and setup.
@@ -63,6 +64,8 @@ export function agentsRouter(): Router {
     const agents = listAgents();
     const counts = new Map<string, number>();
     for (const s of [...listSessions(), ...listAgentSessions()]) {
+      // A child chat is part of its parent's work, not a chat of the agent's of its own.
+      if (s.parent_id) continue;
       const a = agentOf(s.workspace, agents);
       if (a) counts.set(a.id, (counts.get(a.id) ?? 0) + 1);
     }
@@ -124,10 +127,10 @@ export function agentsRouter(): Router {
     }
   });
 
-  /** `{ voice }`: "design", a voice library id, one of Kokoro's voices, or "" for the one in the voice settings. */
+  /** `{ voice }`: an id from the voices voice mode's source offers, or "" for its own choice. */
   router.put("/agents/:id/voice", (req, res) => {
     try {
-      res.json(agentToApi(setVoice(req.params.id, req.body?.voice)));
+      res.json(agentToApi(setVoice(req.params.id, req.body?.voice, sourceVoices()?.map((v) => v.id))));
     } catch (e) {
       failed(res, e);
     }

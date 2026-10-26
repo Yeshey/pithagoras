@@ -9,7 +9,9 @@ import { test as base, expect, type Page, type Route } from '@playwright/test';
  * name, so a call that no test mocked fails where it is made, with the URL in the message. Nothing reaches the dev
  * server's proxy, and so no portal that runs on this machine. The extensions the portal has installed are the
  * exception: they are listed and their files served, for the app and for a fixture page that loads them as the app
- * does. A test's own `page.route` is registered after it and wins; what it does not answer falls back to this one.
+ * does. So is the lease every voice session takes as it starts and gives back at its end (`…/voice/connection`),
+ * which is granted. A test's own `page.route` is registered after it and wins; what it does not answer falls back to
+ * this one.
  *
  * `installed` is those extensions, by their folders from the repository's root, and is none unless a spec says:
  * `test.use({ installed: ['extensions/git'] })`. The portal's own specs install a stand-in where they need an
@@ -27,6 +29,7 @@ export const test = base.extend<{ unmocked: string[]; installed: string[] }>({
         if (pathname === '/api/extension-ui') return route.fulfill({ json: { extensions: extensions.map((ext) => ext.listing) } });
         for (const ext of extensions) if (await ext.serve(pathname, route)) return;
       }
+      if (route.request().method() === 'POST' && /^\/api\/sessions\/[^/]+\/voice\/connection$/.test(pathname)) return route.fulfill({ json: { ok: true } });
       const what = `${route.request().method()} ${pathname}${search}`;
       asked.push(what);
       return route.fulfill({ status: 501, json: { error: `Not mocked: ${what}` } });
@@ -78,7 +81,7 @@ export function extensionOnDisk(dir: string) {
     name: meta.name,
     version: meta.version,
     ...(Array.isArray(declared.themes) ? { themes: declared.themes } : {}),
-    ...(client ? { entry: `${prefix}${path.basename(client)}?v=test` } : {}),
+    ...(client ? { rev: 'test', entry: `${prefix}${path.basename(client)}?v=test` } : {}),
     ...(client && typeof declared.style === 'string' ? { style: `${prefix}${path.relative(served!, path.resolve(dir, declared.style)).split(path.sep).join('/')}?v=test` } : {}),
     ...(typeof declared.server === 'string' ? { server: `/api/x/${meta.name}` } : {}),
   };
@@ -94,24 +97,22 @@ export function extensionOnDisk(dir: string) {
 
 
 /**
- * What every portal says unless a test says otherwise: signed in without a password, no chats, and the three things the
- * shell asks of every page (the add-on flags, the browser add-on, the voice add-on, which extensions draw in it, the places for a new chat) and of
- * every chat (what runs in the background, what came before), with nothing set up.
+ * What every portal says unless a test says otherwise: signed in without a password, no chats, and the things the
+ * shell asks of every page (the feature flags, voice mode with no source, which extensions draw in it, the places for a new
+ * chat) and of every chat (what runs in the background, what came before, the modes it may be put in), with nothing set up.
  */
 const portalBase = ({ path, method, url }: Ask): Answer => {
   if (method !== 'GET') return undefined;
   if (path === '/api/auth/status') return { authed: true, authRequired: false };
   if (path === '/api/sessions') return { sessions: [], executor: 'host' };
-  if (path === '/api/features/flags') return { subagent: { enabled: false }, understory: { enabled: false }, images: { enabled: false } };
-  if (path === '/api/browser') return {
-    running: false, unprotected: false, connectedAs: null, install: { available: false, image: false, container: 'absent', pulling: { active: false, line: '' } },
-    config: { user: '', hasPassword: false }, version: null, pages: [], uiPort: '', uiExposed: false, uiOutdated: false, cursor: true, allowlist: '', configured: false, byDefault: true, sessions: [], routines: [],
-  };
-  if (path === '/api/voice') return { enabled: false };
+  if (path === '/api/features/flags') return { memory: { held: false, by: null } };
+  if (path === '/api/voice') return { provider: '', ready: false, speech: true, voices: [], enabled: false };
   // A portal that is not run from a checkout: nothing to update, no notice.
   if (path === '/api/update') return { kind: 'none', boot: 'boot-a' };
   if (/^\/api\/sessions\/[^/]+\/background$/.test(path)) return { supported: true, jobs: [], statuses: [], widgets: [] };
   if (/^\/api\/sessions\/[^/]+\/events\/before$/.test(path)) return { events: [], more: false };
+  // No modes to choose from: a chat draws no picker unless a test offers some.
+  if (/^\/api\/sessions\/[^/]+\/modes$/.test(path)) return { modes: [] };
   if (path === '/api/projects' && url.searchParams.has('bare')) return { root: '/w', home: '/h', projects: [] };
   return undefined;
 };
@@ -129,6 +130,8 @@ const settingsBase = ({ path, method }: Ask): Answer => {
   if (path === '/api/routines/report-targets') return { targets: [], default: null };
   if (path === '/api/extensions') return { settingsPath: '/a/settings.json', extensions: [] };
   if (path === '/api/extensions/shipped') return { extensions: [] };
+  // What installing a package brings with it, asked before it is installed: nothing else.
+  if (path === '/api/extensions/plan') return { needs: [] };
   if (path === '/api/tool-names') return { names: {} };
   if (path === '/api/packages/catalog') return { packages: [] };
   if (path === '/api/workspaces') return { root: '/w', workspaces: [] };

@@ -1,4 +1,4 @@
-import { createElement, memo, useSyncExternalStore, type ComponentType } from "react";
+import { createContext, createElement, memo, useSyncExternalStore, type ComponentType } from "react";
 
 /**
  * Where an extension's browser half puts what it draws: the portal's slots.
@@ -17,9 +17,12 @@ import { createElement, memo, useSyncExternalStore, type ComponentType } from "r
 import type { Entry, SlotName } from "@pithagoras/extension-api";
 import { byRank, onRanked } from "./rank";
 import { translate } from "./strings";
-export type { Channel, Chat, ChatProps, Entry, PanelHandle, PanelProps, Panels, SlotMap, SlotName, ToolCallView, VoiceWindowOpened } from "@pithagoras/extension-api";
+export type { Channel, Chat, ChatProps, Entry, MenuModel, PanelHandle, PanelProps, Panels, SlotMap, SlotName, ToolCallView, VoiceWindowOpened } from "@pithagoras/extension-api";
 
-const SLOTS: readonly SlotName[] = ["chat.panel", "chat.header.action", "chat.background", "chat.overlay", "chat.composer.above", "chat.tool", "chat.tool.action", "voice.window", "nav.page", "settings.page"];
+const SLOTS: readonly SlotName[] = [
+  "chat.panel", "chat.header.action", "chat.background", "chat.overlay", "chat.composer.above", "chat.tray", "chat.model.menu", "chat.tool", "chat.tool.action",
+  "voice.window", "voice.avatar", "nav.page", "settings.page",
+];
 
 /** An entry as the portal holds it. `key` is its name among all the slot's entries. */
 export type Registered<S extends SlotName> = Entry<S> & { extension: string; key: string };
@@ -60,6 +63,13 @@ onRanked(() => {
 });
 
 /**
+ * Whose part is being drawn: for what the portal draws of an extension's out
+ * of its element, over the page, to be drawn as that extension's again there
+ * (see kit.ts).
+ */
+export const DrawnFor = createContext<string | undefined>(undefined);
+
+/**
  * An extension's part, drawn inside an element that says whose it is
  * (`data-extension`) and that is laid out as if it were not there. What an
  * extension's stylesheet scopes to that, as the utilities `buildExtension`
@@ -68,7 +78,7 @@ onRanked(() => {
  */
 const marked = (extension: string, Part: ComponentType<any>) =>
   memo(function ExtensionPart(props: object) {
-    return createElement("div", { "data-extension": extension, style: { display: "contents" } }, createElement(Part, props));
+    return createElement(DrawnFor.Provider, { value: extension }, createElement("div", { "data-extension": extension, style: { display: "contents" } }, createElement(Part, props)));
   });
 
 /**
@@ -88,12 +98,13 @@ export function register<S extends SlotName>(extension: string, slot: S, entry: 
   if (before.some((e) => e.key === key)) throw new Error(`${extension} already has an entry called "${entry.id}" in ${slot}`);
   // Each of its components is drawn again only when what it is given changes: the chat around it is drawn again
   // with every token of a reply, and an extension's part of it must not be.
-  const parts = entry as { header?: ComponentType<any>; actions?: ComponentType<any> };
+  const parts = entry as { header?: ComponentType<any>; actions?: ComponentType<any>; tile?: ComponentType<any> };
   const row = {
     ...entry,
     component: marked(extension, entry.component as ComponentType<any>),
     ...(parts.header ? { header: marked(extension, parts.header) } : {}),
     ...(parts.actions ? { actions: marked(extension, parts.actions) } : {}),
+    ...(parts.tile ? { tile: marked(extension, parts.tile) } : {}),
     extension,
     key,
   } as unknown as Registered<SlotName>;

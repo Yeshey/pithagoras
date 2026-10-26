@@ -1,20 +1,22 @@
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { Select } from "./Select";
 import {
   LuBlocks,
   LuBrain,
   LuCheck,
+  LuChevronRight,
   LuScrollText,
   LuExternalLink,
   LuEye,
   LuFileJson,
   LuFolder,
   LuHammer,
+  LuShield,
   LuShieldCheck,
-  LuImages,
   LuInfo,
   LuKeyRound,
   LuKeyboard,
+  LuLayers,
   LuMonitor,
   LuMoon,
   LuPlug,
@@ -29,7 +31,7 @@ import {
   LuTriangleAlert,
   LuUsers,
 } from "react-icons/lu";
-import { api, SIGNED_OUT, type AvailableModel, type ExtensionInfo, type GlobalSettings, type ReportTarget, type ReportTo } from "../api";
+import { api, EXTENSIONS_CHANGED, SIGNED_OUT, type ExtensionInfo, type GlobalSettings, type ReportTarget, type ReportTo } from "../api";
 import { ChannelsPanel } from "./ChannelsPanel";
 import { SkillsPanel } from "./SkillsPanel";
 import { McpPanel } from "./McpPanel";
@@ -45,16 +47,18 @@ import { useNotifyState } from "../notify";
 import { setCommandTrigger, typedCharacter, useCommandTrigger, validTrigger } from "../command-trigger";
 import { DEFAULT_TRIGGER } from "../slash-palette";
 import { PeoplePanel } from "./PeoplePanel";
-import { MediaPanel } from "./MediaPanel";
-import { PortalExtensions } from "./PortalExtensions";
+import { VoiceModeSettings } from "./VoiceModeSettings";
 import { RestartSection } from "./RestartSection";
 import { UpdateSection } from "./UpdateSection";
 import { Modal, useUnsavedDraft } from "./Modal";
 import { ToolDefaults } from "./ToolDefaults";
 import { SandboxSettings } from "./SandboxSettings";
+import { GuardSettings } from "./GuardSettings";
 import { isEnter } from "../shortcuts";
 import { KeyboardShortcuts } from "./KeyboardShortcuts";
 import { ProvidersPanel } from "./ProvidersPanel";
+import { ModelChoice } from "./ModelChoice";
+import { ModesPanel } from "./ModesPanel";
 import { EffortPicker, Empty, ErrorBanner, Field, LoadFailed, Section, Switch, SwitchRow, btnCls, inputCls, primaryCls } from "./SettingsUi";
 import { ExtensionsPanel } from "./ExtensionsPanel";
 import { webLink } from "../package-names";
@@ -67,10 +71,11 @@ import { usePalette, useTheme, type Theme } from "../theme";
 import { choose as chooseTheme, useThemes } from "../extensions/themes";
 import { humanKey, typed } from "../setting-values";
 import { effortLabel } from "../effort";
-import { modelTraits } from "../model-traits";
 import { languageChoice, languages, msg, setLanguage, t, tp, tx, useLanguage, type LanguageChoice } from "../i18n";
 import { ErrorBoundary, PartFailed } from "./ErrorBoundary";
-import { useSlot } from "../extensions/slots";
+import { useSlot, type Registered } from "../extensions/slots";
+import { failedIn } from "../extensions/loader";
+import { translate } from "../extensions/strings";
 import { SkeletonGroup } from "./Skeleton";
 import { useFlash } from "../use-flash";
 
@@ -83,8 +88,11 @@ import { useFlash } from "../use-flash";
  */
 const OWN_LAYOUT = new Set<Tab>(["extensions", "logs", "advanced"]);
 
-/** Either a fixed tab or one extension's own configuration page. */
-type Nav = { kind: "tab"; id: Tab } | { kind: "ext"; spec: string };
+/**
+ * Either a fixed tab or one extension's own configuration page: by its package's spec, which tells two installs of
+ * one package apart, or by its name, as its address names it (/settings/x/<name>).
+ */
+type Nav = { kind: "tab"; id: Tab } | { kind: "ext"; spec: string } | { kind: "ext"; name: string };
 
 type TabDef = { id: Tab; label: string; icon: ReactNode; hint: string };
 
@@ -105,8 +113,9 @@ const GROUPS: { label: string; tabs: TabDef[] }[] = [
     label: msg("Agent"),
     tabs: [
       { id: "tools", label: msg("Tools"), icon: <LuHammer />, hint: msg("What the agent may reach for, by default") },
+      { id: "modes", label: msg("Modes"), icon: <LuLayers />, hint: msg("Your own ways a chat can work, chosen above the message box") },
       { id: "sandbox", label: msg("Sandbox"), icon: <LuShieldCheck />, hint: msg("What the agent may read, change and run") },
-      { id: "media", label: msg("Media"), icon: <LuImages />, hint: msg("The image and video models behind making pictures and videos") },
+      { id: "guard", label: msg("Guard"), icon: <LuShield />, hint: msg("What the agent is held to after it reads something untrusted") },
       { id: "skills", label: msg("Skills"), icon: <LuWrench />, hint: msg("Procedures the agent can reach for") },
       { id: "mcp", label: msg("MCP"), icon: <LuPlug />, hint: msg("Servers the agent can pull tools from") },
       { id: "extensions", label: msg("Extensions"), icon: <LuBlocks />, hint: msg("Install and manage packages") },
@@ -124,7 +133,6 @@ const GROUPS: { label: string; tabs: TabDef[] }[] = [
     tabs: [
       { id: "browser", label: msg("This browser"), icon: <LuMonitor />, hint: msg("Theme, notifications, confirmations") },
       { id: "authentication", label: msg("Authentication"), icon: <LuKeyRound />, hint: msg("The password, and signing in through a provider") },
-      { id: "add-ons", label: msg("Add-ons"), icon: <LuPuzzle />, hint: msg("Optional parts of the portal itself") },
       { id: "shortcuts", label: msg("Shortcuts"), icon: <LuKeyboard />, hint: msg("Keyboard shortcuts, and changing them") },
       { id: "logs", label: msg("Logs"), icon: <LuScrollText />, hint: msg("What the server prints, and a file to take away") },
       { id: "about", label: msg("About"), icon: <LuInfo />, hint: msg("Where this portal keeps things") },
@@ -145,17 +153,47 @@ function railSnapshot(): { spec: string; name: string }[] {
   }
 }
 
+/**
+ * The rail's groups folded by hand in this browser, by their names in English. None is folded until somebody folds
+ * it: a rail nobody has touched is the one it always was.
+ */
+const FOLDED_KEY = "pithagoras.settings.rail-closed";
+function foldedGroups(): string[] {
+  try {
+    const list = JSON.parse(local.get(FOLDED_KEY) ?? "[]");
+    return Array.isArray(list) ? list.filter((name) => typeof name === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * An extension's page as Settings' rail lists it: the title and the icon its own page gives (`settings.page`), in
+ * place of its package's name and the mark every extension has.
+ */
+function railEntry(name: string, pages: readonly Registered<"settings.page">[]): { label: string; icon: ReactNode } {
+  const page = pages.find((p) => p.extension === name);
+  return {
+    label: page?.title ? translate(name, page.title) : name,
+    // An extension's icon is a bare <svg>, sized as the portal's own icons size themselves: by the text beside them.
+    icon: page?.icon ? <span className="contents [&>svg]:h-[1em] [&>svg]:w-[1em]"><page.icon /></span> : <LuPuzzle />,
+  };
+}
+
 export const ConfigModal = memo(function ConfigModal({
   onClose,
   initialTab = "general",
+  extension,
   onSetup,
 }: {
   onClose: () => void;
   initialTab?: Tab;
+  /** An extension's page to open on in place of a tab, by its package's name. */
+  extension?: string;
   /** Opens the setup assistant in its place. */
   onSetup?: () => void;
 }) {
-  const [nav, setNav] = useState<Nav>({ kind: "tab", id: TABS.some((t) => t.id === initialTab) ? initialTab : "general" });
+  const [nav, setNav] = useState<Nav>(extension ? { kind: "ext", name: extension } : { kind: "tab", id: TABS.some((t) => t.id === initialTab) ? initialTab : "general" });
   const [error, setError] = useState<string | null>(null);
   const banner = useRef<HTMLDivElement>(null);
   /** A section a search went to, to scroll to once its page has drawn it. */
@@ -169,16 +207,22 @@ export const ConfigModal = memo(function ConfigModal({
   const settingsPath = exts.value?.settingsPath ?? "";
   const loadingExts = !exts.value && !exts.failed;
   const loadExtensions = async () => (await exts.reload())?.extensions ?? [];
+  // What is installed changed, here or elsewhere (another tab, the API, an agent): the list follows without being opened again.
+  useEffect(() => {
+    const again = () => void exts.reload();
+    window.addEventListener(EXTENSIONS_CHANGED, again);
+    return () => window.removeEventListener(EXTENSIONS_CHANGED, again);
+  }, [exts.reload]);
 
   useEffect(() => prefetchSettings(), []);
+  // What changed in voice mode's settings here, its source chosen on an extension's page among it, reaches the voice controls open as Settings closes.
+  useEffect(() => () => void window.dispatchEvent(new Event("voice-config-changed")), []);
 
   // A refused save is said at the top of the pane, which a long form has scrolled away from: it is brought into
   // view when it comes, and it is not the next section's.
   useEffect(() => {
     if (error) banner.current?.scrollIntoView({ block: "nearest" });
   }, [error]);
-  const section = nav.kind === "tab" ? nav.id : nav.spec;
-  useEffect(() => setError(null), [section]);
 
   // A package has a page here when the portal found settings it reads, or when it brought a page of its own.
   const settingsPages = useSlot("settings.page");
@@ -189,8 +233,14 @@ export const ConfigModal = memo(function ConfigModal({
     // Only a head start for next time.
     local.set(RAIL_KEY, JSON.stringify(configurable.map((e) => ({ spec: e.spec, name: e.name }))));
   }, [exts.value]);
+  // Opened at its address, the page is that of the first package of the name.
   const activeExt =
-    nav.kind === "ext" ? extensions.find((e) => e.spec === nav.spec) : undefined;
+    nav.kind === "ext" ? extensions.find((e) => ("spec" in nav ? e.spec === nav.spec : e.name === nav.name)) : undefined;
+  // Its entry in the rail: while the list is still asked for, one of the entries drawn from last time's, by the name.
+  const railSpec = nav.kind !== "ext" ? undefined : "spec" in nav ? nav.spec : (activeExt ?? configurable.find((e) => e.name === nav.name))?.spec;
+  // By the spec once it is known: a page opened at its address and then chosen in the rail is not drawn anew.
+  const section = nav.kind === "tab" ? nav.id : activeExt?.spec ?? ("spec" in nav ? nav.spec : nav.name);
+  useEffect(() => setError(null), [section]);
   // The extension pages rise in when they arrive late; drawn from what was
   // kept, they are simply there. Once in, a refresh does not replay it.
   // Not over names already drawn from the snapshot: they would rise a second time.
@@ -216,12 +266,26 @@ export const ConfigModal = memo(function ConfigModal({
       words: `${e.words ?? ""} ${e.title} ${e.section ?? ""}`,
       where: label(e.tab),
     }));
-    const own = extensions.flatMap((x) => [
-      { tab: "extensions", ext: x.spec, title: x.name, words: `${x.description ?? ""} extension settings`, where: t("Extension settings") },
-      ...x.settings.map((st) => ({ tab: "extensions", ext: x.spec, section: t("Settings"), title: humanKey(st.key), words: `${st.key} ${x.name}`, where: x.name })),
-    ]);
+    const own = extensions.flatMap((x) => {
+      const { label } = railEntry(x.name, settingsPages);
+      return [
+        { tab: "extensions", ext: x.spec, title: label, words: `${x.name} ${x.description ?? ""} extension settings`, where: t("Extension settings") },
+        ...x.settings.map((st) => ({ tab: "extensions", ext: x.spec, section: t("Settings"), title: humanKey(st.key), words: `${st.key} ${x.name}`, where: label })),
+        // What the extension's own page says is on it, in the words the page shows, and in English too.
+        ...settingsPages.filter((page) => page.extension === x.name).flatMap((page) =>
+          (page.search ?? []).map((found) => ({
+            tab: "extensions",
+            ext: x.spec,
+            title: translate(x.name, found.title),
+            ...(found.section ? { section: translate(x.name, found.section) } : {}),
+            words: `${found.words ?? ""} ${found.title} ${found.section ?? ""}`,
+            where: label,
+          })),
+        ),
+      ];
+    });
     return [...fixed, ...own];
-  }, [extensions, lang]);
+  }, [extensions, settingsPages, lang]);
 
   const go = (entry: SettingEntry) => {
     setNav(entry.ext ? { kind: "ext", spec: entry.ext } : { kind: "tab", id: entry.tab as Tab });
@@ -257,13 +321,13 @@ export const ConfigModal = memo(function ConfigModal({
       title={t("Settings")}
       subtitle={t("Applies to the whole portal")}
       onClose={onClose}
-      startInRail={initialTab === "general"}
-      section={nav.kind === "tab" ? t(TABS.find((x) => x.id === nav.id)?.label ?? "") : activeExt?.name}
+      startInRail={!extension && initialTab === "general"}
+      section={nav.kind === "tab" ? t(TABS.find((x) => x.id === nav.id)?.label ?? "") : activeExt && railEntry(activeExt.name, settingsPages).label}
       rail={
         <SettingsSearch index={index} onPick={go}>
         <div className="space-y-4">
           {GROUPS.map((g) => (
-            <RailGroup key={g.label} label={t(g.label)}>
+            <RailGroup key={g.label} name={g.label} label={t(g.label)} held={nav.kind === "tab" && g.tabs.some((tab) => tab.id === nav.id)}>
               {g.tabs.map((tab) => (
                 <RailItem
                   key={tab.id}
@@ -279,13 +343,17 @@ export const ConfigModal = memo(function ConfigModal({
 
           {/* Only appears for extensions that actually read settings. */}
           {configurable.length > 0 && (
-            <RailGroup label={t("Extension settings")} className={exts.value && !railShown.current ? "stagger-in" : ""}>
+            <RailGroup
+              name="Extension settings"
+              label={t("Extension settings")}
+              held={configurable.some((e) => e.spec === railSpec)}
+              className={exts.value && !railShown.current ? "stagger-in" : ""}
+            >
               {configurable.map((e) => (
                 <RailItem
                   key={e.spec}
-                  icon={<LuPuzzle />}
-                  label={e.name}
-                  active={nav.kind === "ext" && nav.spec === e.spec}
+                  {...railEntry(e.name, settingsPages)}
+                  active={railSpec === e.spec}
                   onClick={() => setNav({ kind: "ext", spec: e.spec })}
                 />
               ))}
@@ -299,17 +367,17 @@ export const ConfigModal = memo(function ConfigModal({
 
       <div key={section} ref={page} className={`settings-page${nav.kind === "tab" && OWN_LAYOUT.has(nav.id) ? "" : " settings-flow"}`}>
       {nav.kind === "tab" && nav.id === "models" && <ProvidersPanel onError={setError} onSetup={onSetup} />}
-      {nav.kind === "tab" && nav.id === "general" && <GeneralPanel onError={setError} onProviders={() => setNav({ kind: "tab", id: "models" })} />}
+      {nav.kind === "tab" && nav.id === "general" && <GeneralPanel onError={setError} onProviders={() => setNav({ kind: "tab", id: "models" })} onExtensions={() => setNav({ kind: "tab", id: "extensions" })} onSource={(name) => setNav({ kind: "ext", name })} />}
       {nav.kind === "tab" && nav.id === "browser" && <BrowserPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "authentication" && <><PasswordPanel /><SsoPanel /></>}
       {nav.kind === "tab" && nav.id === "logs" && <LogsPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "about" && <AboutPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "channels" && <ChannelsPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "people" && <PeoplePanel onError={setError} />}
-      {nav.kind === "tab" && nav.id === "add-ons" && <PortalExtensions onError={setError} />}
       {nav.kind === "tab" && nav.id === "tools" && <ToolDefaults onError={setError} />}
+      {nav.kind === "tab" && nav.id === "modes" && <ModesPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "sandbox" && <SandboxSettings onError={setError} />}
-      {nav.kind === "tab" && nav.id === "media" && <MediaPanel onError={setError} />}
+      {nav.kind === "tab" && nav.id === "guard" && <GuardSettings onError={setError} onOpen={(id) => setNav({ kind: "tab", id })} />}
       {nav.kind === "tab" && nav.id === "skills" && <SkillsPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "mcp" && <McpPanel onError={setError} />}
       {nav.kind === "tab" && nav.id === "extensions" && (
@@ -345,15 +413,58 @@ export const ConfigModal = memo(function ConfigModal({
 
 // --- rail ---
 
-function RailGroup({ label, children, className = "" }: { label?: string; children: ReactNode; className?: string }) {
+/**
+ * One of the rail's groups, under a heading that folds it like a folder. Open or shut as it was left in this
+ * browser; held open while one of its pages is showing, so that the page marked as the current one is in view, and a
+ * search that goes to a page in a folded group finds the group open. The search's own list stands in for the rail
+ * while something is typed, so what it finds is listed whatever is folded.
+ */
+function RailGroup({
+  name,
+  label,
+  held,
+  children,
+  className = "",
+}: {
+  /** What it is kept as: the same in every language. */
+  name: string;
+  label: string;
+  /** One of its pages is showing. */
+  held: boolean;
+  children: ReactNode;
+  className?: string;
+}) {
+  const [shut, setShut] = useState(() => foldedGroups().includes(name));
+  const open = !shut || held;
+  const body = useId();
   return (
     <div>
-      {label && (
-        <p className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-fg-faint">
-          {label}
-        </p>
-      )}
-      <div className={`space-y-0.5 ${className}`}>{children}</div>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={body}
+        aria-disabled={held || undefined}
+        title={held ? t("Open while one of its pages is showing") : undefined}
+        onClick={() => {
+          // A click that shut nothing, with its page in view, would still be remembered as shut.
+          if (held) return;
+          // Read again rather than kept from the first draw: the other groups write to the same list.
+          const others = foldedGroups().filter((n) => n !== name);
+          local.set(FOLDED_KEY, JSON.stringify(shut ? others : [...others, name]));
+          setShut(!shut);
+        }}
+        // Held open, it does nothing when pressed, and does not look as if it did.
+        className={`flex w-full items-center gap-1 rounded px-2 pb-1 text-left text-[10px] font-semibold uppercase tracking-wider text-fg-faint transition ${
+          held ? "cursor-default" : "hover:text-fg-subtle"
+        }`}
+      >
+        {/* A name wider than the rail goes on to a second line rather than being cut off, as the German for "Extension settings" does. */}
+        <span>{label}</span>
+        <LuChevronRight aria-hidden className={`ml-auto h-3 w-3 shrink-0 transition-transform motion-reduce:transition-none ${open ? "rotate-90" : ""} ${held ? "opacity-40" : ""}`} />
+      </button>
+      <div id={body} role="group" aria-label={label} hidden={!open} className={`space-y-0.5 ${className}`}>
+        {children}
+      </div>
     </div>
   );
 }
@@ -836,12 +947,7 @@ function AboutDeployment({ onError }: { onError: (e: string) => void }) {
   );
 }
 
-/** What a model can do, said in a few words under its name. */
-function modelHint(m: AvailableModel): string {
-  return [m.name !== m.id ? m.id : "", ...modelTraits(m)].filter(Boolean).join(" · ");
-}
-
-function GeneralPanel({ onError, onProviders }: { onError: (e: string) => void; onProviders: () => void }) {
+function GeneralPanel({ onError, onProviders, onExtensions, onSource }: { onError: (e: string) => void; onProviders: () => void; onExtensions: () => void; onSource: (name: string) => void }) {
   // All three are fetched ahead and kept, and the page waits for all three:
   // drawn part by part, the model menus filled in and a warning pushed the
   // context settings down after the page was already on screen.
@@ -949,12 +1055,6 @@ function GeneralPanel({ onError, onProviders }: { onError: (e: string) => void; 
     }
   };
 
-  const byProvider = useMemo(() => {
-    const map = new Map<string, AvailableModel[]>();
-    for (const m of models?.models ?? []) map.set(m.provider, [...(map.get(m.provider) ?? []), m]);
-    return map;
-  }, [models]);
-
   const ready = stored && defaults && (models || modelsFailed) && (reports.value || reports.failed);
   // Without the settings there is nothing to show: no skeleton that never ends.
   if (!r && settings.failed) return <LoadFailed error={settings.failed} onRetry={settings.reload} />;
@@ -983,24 +1083,6 @@ function GeneralPanel({ onError, onProviders }: { onError: (e: string) => void; 
     }
   };
 
-  const provider = stored.provider || defaults.provider;
-  const providerName = (id: string) => models?.providers[id] ?? id;
-  const providerOptions = [
-    { value: "", label: defaults.provider ? t("pi's default — {name}", { name: providerName(defaults.provider) }) : t("pi's default"), hint: t("From pi's own settings.json") },
-    ...[...byProvider.entries()].map(([id, list]) => ({ value: id, label: providerName(id), hint: tp(list.length, "{n} model", "{n} models") })),
-    ...(stored.provider && !byProvider.has(stored.provider)
-      ? [{ value: stored.provider, label: stored.provider, hint: t("Not available now — no key, or not set up") }]
-      : []),
-  ];
-  const offered = byProvider.get(provider ?? "") ?? [];
-  const modelOptions = [
-    { value: "", label: defaults.model && (!stored.provider || stored.provider === defaults.provider) ? t("pi's default — {name}", { name: offered.find((m) => m.id === defaults.model)?.name ?? defaults.model }) : t("pi's default"), hint: t("Whatever pi picks for the provider") },
-    ...offered.map((m) => ({ value: m.id, label: m.name, text: `${m.name} ${m.id}`, hint: modelHint(m) || undefined })),
-    ...(stored.model && !offered.some((m) => m.id === stored.model)
-      ? [{ value: stored.model, label: stored.model, hint: t("Not offered by this provider now") }]
-      : []),
-  ];
-
   return (
     <>
       <Section
@@ -1016,43 +1098,20 @@ function GeneralPanel({ onError, onProviders }: { onError: (e: string) => void; 
               <button type="button" onClick={onProviders} className="font-medium underline-offset-2 hover:underline">{t("Add a provider")}</button>
             </div>
           )}
-          <div className="grid gap-3 sm:grid-cols-2">
-            <label className="block">
-              <span className="text-xs text-fg-muted">{t("Provider")}</span>
-              {modelsFailed ? (
-                <input value={stored.provider ?? ""} onChange={(e) => setStored({ ...stored, provider: e.target.value })} onBlur={() => void save(stored)} placeholder={defaults.provider || t("inherit")} className={`${inputCls} mt-1 font-mono`} />
-              ) : (
-                <Select
-                  className="mt-1 w-full"
-                  aria-label={t("Default provider")}
-                  value={stored.provider ?? ""}
-                  options={providerOptions}
-                  disabled={!models}
-                  placeholder={t("Loading…")}
-                  onChange={(next) => {
-                    const keeps = (byProvider.get(next || defaults.provider) ?? []).some((m) => m.id === stored.model);
-                    void save({ ...stored, provider: next, model: keeps ? stored.model : "" });
-                  }}
-                />
-              )}
-            </label>
-            <label className="block">
-              <span className="text-xs text-fg-muted">{t("Model")}</span>
-              {modelsFailed ? (
-                <input value={stored.model ?? ""} onChange={(e) => setStored({ ...stored, model: e.target.value })} onBlur={() => void save(stored)} placeholder={defaults.model || t("pi decides")} className={`${inputCls} mt-1 font-mono`} />
-              ) : (
-                <Select
-                  className="mt-1 w-full"
-                  aria-label={t("Default model")}
-                  value={stored.model ?? ""}
-                  options={modelOptions}
-                  disabled={!models}
-                  placeholder={t("Loading…")}
-                  onChange={(next) => void save({ ...stored, model: next })}
-                />
-              )}
-            </label>
-          </div>
+          <ModelChoice
+            models={models}
+            failed={modelsFailed}
+            provider={stored.provider ?? ""}
+            model={stored.model ?? ""}
+            onChange={(next) => void save({ ...stored, ...next })}
+            labels={{ provider: t("Default provider"), model: t("Default model") }}
+            inherit={{
+              provider: defaults.provider,
+              model: defaults.model,
+              label: (name) => (name ? t("pi's default — {name}", { name }) : t("pi's default")),
+              hints: { provider: t("From pi's own settings.json"), model: t("Whatever pi picks for the provider") },
+            }}
+          />
           <div>
             <div className="flex items-baseline gap-2">
               <span className="text-xs text-fg-muted">{t("Effort")}</span>
@@ -1121,6 +1180,7 @@ function GeneralPanel({ onError, onProviders }: { onError: (e: string) => void; 
       </Section>
 
       <ReportDefault onError={onError} />
+      <VoiceModeSettings onError={onError} onExtensions={onExtensions} onSource={onSource} />
     </>
   );
 }
@@ -1177,14 +1237,18 @@ function ExtensionPanel({
     }
   };
 
+  // Headed as its entry in the rail is: by the title and the icon its own page gives.
+  const { label, icon } = railEntry(ext.name, settingsPages);
+
   return (
     <>
       <div className="mb-5 flex items-start gap-3">
-        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/10 text-accent">
-          <LuPuzzle className="h-4 w-4" />
+        {/* At the size the mark had here: the icon sizes itself by the text. */}
+        <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-accent/10 text-base text-accent">
+          {icon}
         </div>
         <div className="min-w-0 flex-1">
-          <h3 className="truncate text-sm font-medium text-fg">{ext.name}</h3>
+          <h3 className="truncate text-sm font-medium text-fg">{label}</h3>
           {ext.description && <p className="text-xs text-fg-subtle">{ext.description}</p>}
           <p className="mt-0.5 truncate font-mono text-[10px] text-fg-faint">{ext.spec}</p>
         </div>
@@ -1204,7 +1268,7 @@ function ExtensionPanel({
       {/* The package's own page, where it brought one, above what the portal found for it. One that fails to draw says so, and the fields stay. */}
       {settingsPages.filter((page) => page.extension === ext.name).map((page) => (
         <div key={page.key} className="mb-5" data-extension={page.extension}>
-          <ErrorBoundary resetKey={page.key} fallback={(error) => <PartFailed error={error} />}>
+          <ErrorBoundary resetKey={page.key} fallback={(error) => <PartFailed error={error} />} onError={failedIn(page.extension)}>
             <page.component />
           </ErrorBoundary>
         </div>

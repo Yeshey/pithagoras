@@ -66,11 +66,11 @@ test("a name set by hand stays through the person's next message, with or withou
   assert.equal(again.body.person.name, "Sam (accountant)", "a blank name is not a rename");
 });
 
-test("a rule cannot be written for a tool that would run what they write as the primary user", async () => {
+test("a rule cannot be written for a tool that would run what they write as the primary user, nor for a heartbeat, which looks around on its own", async () => {
   person("tg:priya", "colleague", "Priya");
   const before = (await call("GET", "/tool-rules")).body.rules.length;
   for (const tool of ["subagent", "routine_create", "routine_update", "routine_run"]) {
-    for (const role of ["colleague", "guest", "all"]) {
+    for (const role of ["colleague", "guest", "all", "heartbeat"]) {
       const refused = await call("POST", "/tool-rules", { role, tool, pattern: "{*", personKey: "tg:priya" });
       assert.equal(refused.status, 400, `${role}: ${tool}`);
       assert.match(refused.body.error, new RegExp(`^A rule cannot allow ${tool}: `));
@@ -99,7 +99,7 @@ test("a rule for one person is allowed for anybody whatever their role, applies 
   const rules = listed.body.rules;
   const guard = (role, key) => {
     const h = {};
-    guardExtension("t", () => ({ role, key }), "s", true, () => ({ allowed: true, allowlist: [] }))({ on: (k, f) => (h[k] = f) });
+    guardExtension("t", () => ({ role, key }), "s", () => new Set(), () => ({ allowed: true, allowlist: [] }))({ on: (k, f) => (h[k] = f) });
     return h;
   };
   const rule = rules.find((r) => r.role === "guest" && r.person_key === "tg:priya");

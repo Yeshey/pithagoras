@@ -14,7 +14,7 @@ const cacheFile = (servers) => writeFileSync(path.join(agent, "mcp-cache.json"),
 
 const { mcpCatalogue, mcpDirect, mcpOffer } = await import("../dist/mcp-offer.js");
 const { switchedOffVia, guardExtension } = await import("../dist/pi/guard.js");
-const { createSession, rememberTools, setToolDefaultsOff, shownTools, withdrawnMcpTools } = await import("../dist/db.js");
+const { createSession, knownTools, rememberTools, setToolDefaultsOff, shownTools, withdrawnMcpTools } = await import("../dist/db.js");
 // Nothing off by default, not even code mode, which a new install has off: what is off here is the servers' doing.
 setToolDefaultsOff([]);
 const { sessions } = await import("../dist/session-manager.js");
@@ -62,6 +62,26 @@ test("a server's tools are listed whether the model is offered them one by one o
   assert.equal(mcpOffer(config({}), { servers: cache })("jira_search"), "cached", "not registered one by one is no reason to withdraw it");
 });
 
+// pi-mcp-adapter 2.18.0 keeps a server's dots in the names of its tools and writes a tool's own as underscores
+// (getServerPrefix, formatToolName): `docs.v2` registers `docs.v2_search`, and `docs_v2_search` is `docs`' `v2.search`.
+const dotted = { docs: { tools: [{ name: "v2.search" }, { name: "open" }] }, "docs.v2": { tools: [{ name: "search" }] } };
+
+test("a server with a dot in its name is judged and listed by the names the adapter gives its tools, and so is the server its name starts like", () => {
+  const config = (v2) => ({ mcpServers: { docs: { command: "d" }, "docs.v2": { command: "d2", ...v2 } } });
+  assert.deepEqual(
+    mcpCatalogue(config({}), { servers: dotted }).map((t) => [t.name, t.server]),
+    [["docs_v2_search", "docs"], ["docs_open", "docs"], ["docs.v2_search", "docs.v2"]],
+  );
+  const off = mcpOffer(config({ disabled: true }), { servers: dotted });
+  assert.equal(off("docs.v2_search"), "withdrawn");
+  assert.equal(off("docs_v2_search"), "cached", "docs' own tool");
+  assert.equal(mcpOffer(config({ excludeTools: ["search"] }), { servers: dotted })("docs.v2_search"), "withdrawn");
+  assert.equal(mcpOffer(config({ excludeTools: ["search"] }), { servers: dotted })("docs_v2_search"), "cached");
+  const direct = mcpDirect(config({ directTools: ["search"] }), { servers: dotted });
+  assert.equal(direct("docs.v2_search"), true);
+  assert.equal(direct("docs_v2_search"), false);
+});
+
 test("the mcp tool does not reach a tool that is switched off, by any of its names", () => {
   const off = new Set(["jira_create_issue", "brave_search_web_search", "bash"]);
   const mcp = { servers: ["jira", "brave-search", "shell"], serverTool: (name) => name !== "bash" };
@@ -85,7 +105,7 @@ test("the guard refuses it before anything could allow it, and an MCP script whi
   mcpFile({ mcpServers: { jira: { command: "j", directTools: true, excludeTools: ["admin.delete"] }, web: { command: "w" } } });
   let off = new Set(["jira_create_issue"]);
   const h = {};
-  guardExtension("t", () => ({ role: "primary" }), "s", true, () => ({ allowed: true, allowlist: [] }), undefined, [], () => off)({ on: (k, f) => (h[k] = f) });
+  guardExtension("t", () => ({ role: "primary" }), "s", () => new Set(), () => ({ allowed: true, allowlist: [] }), undefined, [], () => off)({ on: (k, f) => (h[k] = f) });
   const refused = h.tool_call({ toolName: "mcp", input: { tool: "jira_create_issue", args: {} } });
   assert.equal(refused?.block, true);
   assert.match(refused.reason, /switched off in this conversation/);
@@ -99,6 +119,8 @@ test("the guard refuses it before anything could allow it, and an MCP script whi
 });
 
 const names = (list) => list.map((t) => t.name).sort();
+/** Tools as a chat reports them, by name alone. */
+const named = (...list) => list.map((name) => ({ name }));
 test("what the configuration says no to is not listed, is off in pi, and what comes from the cache is marked", async () => {
   cacheFile(cache);
   mcpFile({ mcpServers: { jira: { command: "j", directTools: true, excludeTools: ["create_issue"] }, "brave-search": { command: "b", disabled: true } } });
@@ -157,26 +179,28 @@ test("a server that was removed has its tools off in a chat still running with i
   let told = 0;
   const stop = onMcpWritten(() => told++);
   writeMcpFile({ mcpServers: { jira: { command: "j" }, notes: { command: "n" } } });
-  // As Features does when Understory is switched off: the file written without the panel's routes.
+  // As an extension does when it switches its server off (portal.mcp.set): the file written without the panel's routes.
   writeMcpFile({ mcpServers: { jira: { command: "j" } } });
   assert.equal(told, 2, "the running chats are told after every write");
-  assert.deepEqual(withdrawnMcpTools(["notes_read", "jira_search", "mcp", "bash"]), ["notes_read"]);
+  assert.deepEqual(withdrawnMcpTools(named("notes_read", "jira_search", "mcp", "bash")), ["notes_read"]);
+  // A tool of the portal's inline extensions is no server's, whatever its name starts with: a server half's, say.
+  assert.deepEqual(withdrawnMcpTools([{ name: "notes_read" }, { name: "notes_board", inline: true }]), ["notes_read"]);
   writeMcpFile({ mcpServers: { jira: { command: "j" }, notes: { command: "n" } } });
-  assert.deepEqual(withdrawnMcpTools(["notes_read"]), [], "configured again");
+  assert.deepEqual(withdrawnMcpTools(named("notes_read")), [], "configured again");
   stop();
 });
 
 test("a configuration that cannot be read is taken as it last could be", () => {
   mcpFile({ mcpServers: { jira: { command: "j", disabled: true } } });
-  assert.deepEqual(withdrawnMcpTools(["jira_search"]), ["jira_create_issue", "jira_search"]);
+  assert.deepEqual(withdrawnMcpTools(named("jira_search")), ["jira_create_issue", "jira_search"]);
   writeFileSync(path.join(agent, "mcp.json"), "{ not json");
-  assert.deepEqual(withdrawnMcpTools(["jira_search"]), ["jira_create_issue", "jira_search"], "a typo hands nothing back");
+  assert.deepEqual(withdrawnMcpTools(named("jira_search")), ["jira_create_issue", "jira_search"], "a typo hands nothing back");
   // Fixed by a write that leaves a server out: the servers it had are the ones it last could be read with.
   mcpFile({ mcpServers: { jira: { command: "j" }, notes: { command: "n" } } });
   withdrawnMcpTools();
   writeFileSync(path.join(agent, "mcp.json"), "{ not json either");
   writeMcpFile({ mcpServers: { jira: { command: "j" } } });
-  assert.deepEqual(withdrawnMcpTools(["notes_read"]), ["notes_read"], "the server left out is one that was removed");
+  assert.deepEqual(withdrawnMcpTools(named("notes_read")), ["notes_read"], "the server left out is one that was removed");
 });
 
 test("a server's tools from the cache go with the adapter's package, whatever it was installed from", () => {
@@ -215,4 +239,37 @@ test("a server's tool is registered one by one only where its directTools or the
   assert.equal(mcpDirect({ mcpServers: { jira: { command: "j", toolPrefix: "short", directTools: true } } }, { servers: cache })("jira_search"), undefined);
   // Without a cache entry there is the registered name to go by.
   assert.equal(mcpDirect(jira({ directTools: ["search"] }), null)("jira_search"), true);
+});
+
+test("a dotted server's tools are grouped under it, listed, off in pi while it is switched off, and forgotten when it is removed; the server its name starts like keeps its own", async () => {
+  cacheFile(dotted);
+  mcpFile({ mcpServers: { docs: { command: "d" }, "docs.v2": { command: "d2" } } });
+  const adapter = (name) => ({ name, source: "pi-mcp-adapter", package: "npm:pi-mcp-adapter@2.18.0" });
+  rememberTools([adapter("docs.v2_search"), adapter("docs_v2_search")]);
+  const docs = (list) => list.filter((name) => name.startsWith("docs")).sort();
+  createSession({ id: "dotted", title: "dotted", workspace: home, executor: "host" });
+  const grouped = async () => (await sessions.getTools("dotted")).tools.filter((t) => t.name.startsWith("docs")).map((t) => `${t.name} ${t.source}`).sort();
+  assert.deepEqual(await grouped(), ["docs.v2_search docs.v2", "docs_open docs", "docs_v2_search docs"]);
+  assert.deepEqual(docs(names(shownTools())), ["docs.v2_search", "docs_open", "docs_v2_search"]);
+
+  // A tool of it switched off is out of reach through the mcp tool too.
+  await sessions.setTools("dotted", ["docs.v2_search"]);
+  assert.equal(switchedOffVia("mcp", { tool: "docs.v2_search" }, new Set(sessions.piOff("dotted"))), "docs.v2_search");
+  assert.equal(switchedOffVia("mcp", { tool: "search", server: "docs.v2" }, new Set(sessions.piOff("dotted"))), "docs.v2_search");
+  assert.equal(switchedOffVia("mcp", { tool: "docs_open" }, new Set(sessions.piOff("dotted"))), undefined);
+  await sessions.setTools("dotted", []);
+
+  // The server switched off: withdrawn, in pi and in the lists, and docs' own are not.
+  mcpFile({ mcpServers: { docs: { command: "d" }, "docs.v2": { command: "d2", disabled: true } } });
+  assert.deepEqual(docs(withdrawnMcpTools()), ["docs.v2_search"]);
+  assert.deepEqual(docs(sessions.piOff("dotted")), ["docs.v2_search"]);
+  assert.deepEqual(docs(names(shownTools())), ["docs_open", "docs_v2_search"]);
+
+  // Removed: forgotten, off in a chat still running with it, and not remembered again from one.
+  writeMcpFile({ mcpServers: { docs: { command: "d" } } });
+  assert.deepEqual(docs(knownTools().map((t) => t.name)), ["docs_v2_search"]);
+  assert.deepEqual(docs(withdrawnMcpTools(named("docs.v2_search", "docs_v2_search", "docs_open"))), ["docs.v2_search"]);
+  rememberTools([adapter("docs.v2_search")]);
+  assert.ok(!knownTools().some((t) => t.name === "docs.v2_search"));
+  assert.deepEqual(docs(names(shownTools())), ["docs_open", "docs_v2_search"]);
 });
