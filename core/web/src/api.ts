@@ -41,6 +41,8 @@ export interface ChatMode {
   confirm?: string;
   /** The package that offers it, whose translations its texts are shown through. */
   extension?: string;
+  /** The model parameters it sets, where it sets any (a mode of the person's). */
+  params?: { temperature?: number };
 }
 
 /** A set of instructions the agent pulls in when the description matches. */
@@ -369,6 +371,8 @@ export interface CustomMode {
   provider: string | null;
   model: string | null;
   thinkingLevel: string | null;
+  /** The temperature its chats' requests to the model carry; none leaves it to the server's own default. */
+  temperature: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1126,6 +1130,8 @@ export const api = {
     json<{ extensions: ExtensionInfo[]; settingsPath: string }>("/api/extensions"),
   /** What comes with the portal and can be installed with a click. */
   shippedExtensions: () => json<{ extensions: ShippedExtension[] }>("/api/extensions/shipped"),
+  /** The sets the setup assistant offers, by the packages each holds. */
+  extensionPresets: () => json<{ presets: ExtensionPreset[] }>("/api/extensions/presets"),
   /** What installing `spec` brings with it: the extensions it requires that are not there as it needs them. */
   installPlan: (spec: string) => json<InstallPlan>(`/api/extensions/plan?${new URLSearchParams({ spec })}`),
   setExtensionSetting: (key: string, value: unknown) =>
@@ -1328,6 +1334,12 @@ export interface ShippedExtension {
  * nowhere in a version taken (`missing`, with `error` where npm could not be asked) or is there in a `version` not
  * taken (installed, or, with `from`, the one in the portal's own folder or the one installed from npm for another).
  */
+/** A set of the portal's own extensions (Minimal, Developer…), by package name. */
+export interface ExtensionPreset {
+  id: string;
+  extensions: string[];
+}
+
 export interface InstallNeed {
   name: string;
   range: string;
