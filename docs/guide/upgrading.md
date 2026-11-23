@@ -187,6 +187,25 @@ default of Settings → Tools as off, beside what you had switched off there, so
 no chat has it until it is switched on for a chat, a project, an agent or every
 chat. A later start does not undo what you choose.
 
+## Lazy tools have three values and a threshold
+
+A tool or a group of tools is **auto**, **lazy** or **direct** now, and a limit decides what is **auto**
+([Lazy tools](/guide/extensions#lazy-tools)). The tool that reaches the lazy tools is called `tool_search`
+and no longer `tools`. On the first start with it, what you had marked lazy stays **lazy**, and everything else is
+**auto**: the model's list is measured, and when it holds more than 3,000 tokens or 20 tools, the largest groups
+that nobody marked are taken out of it, as a lazy group would be. A portal with the browser and the subagent tool
+is over the limit. Settings → Tools says which groups that is, once, and a **direct** mark keeps a group in the
+list; **Lazy above** there changes the limits, and `0` turns them off. A chat that has started keeps the tools it
+started with, and a chat that was running before the upgrade takes its list from what is marked and measured
+when it first starts again. Old chats keep their calls of `tools` in their history, and they are still drawn as
+the tools they called.
+
+A tool is no longer counted as an MCP server's by a name that starts with `mcp_`: the guard asks pi which server a
+tool came from, and a name proves nothing, as any extension can register one. What the pi-mcp-adapter's tools hand
+back is still wrapped, by their package. A pi package of yours that hands back another server's or somebody else's
+words under such a name (another MCP bridge, say) is now trusted as the extension it is, so its tools have to say so:
+`guard: { outside: true }` on their definition ([What the guard holds a tool to](/guide/extension-ui#what-the-guard-holds-a-tool-to)).
+
 ## The password moves into the database
 
 A portal used to take its password from `PORTAL_PASSWORD`. It now keeps it, hashed, in its database, chosen in the browser and changed under Settings → Authentication (see [The password](/guide/deploying#the-password)). What the first start after the upgrade does:
@@ -1312,6 +1331,19 @@ mode where you switch it off. Gone:
 `PI_SUBAGENT_BIN` and `PI_SUBAGENT_GRACE_MS`, which nothing reads any more. The
 database is not changed, so going back needs nothing but the older version; the
 subagents' chats it made stay, as chats of their own.
+
+## A routine's own run time limit
+
+A routine's page sets how many minutes its runs may take
+([Routines](/guide/routines#scheduling)), where every run had the portal's hour.
+The upgrade to schema 16 adds the column that holds it; a portal already at 16
+gets it when it starts. It is empty for every routine there is, so each keeps
+the portal's default. It changes no data; nothing is left for an extension, and
+nothing needs doing.
+
+**Going back.** As for
+[Chats an extension makes for nobody to attend](#chats-an-extension-makes-for-nobody-to-attend);
+a portal at 16 that goes back to a build without the column keeps it, unused.
 
 ## The guard
 

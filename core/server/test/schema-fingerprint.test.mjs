@@ -18,7 +18,11 @@ import { freePort, inProcessHome } from "./server-harness.mjs";
 // src/schema-version.ts (once for the release, not once for each change),
 // pin the new version and fingerprint here, and have an upgrade test for what
 // changed (below) that starts from a database made before it.
-const PINNED = { version: 16, fingerprint: "4881a2f81ac22f97f43990ab83a069821ebf03e86ec21bb7c9603d5a7bc4a0db" };
+const PINNED = { version: 16, fingerprint: "883e02458ea38ea3ed30a993b1c3c14e1cc53d88406409b15cdcc7f2a465ed3c" };
+/** The schema 16 had before a routine could set a limit of its own on a run: a portal built from it is at version 16, and gets the column when it starts. */
+const V16_WITHOUT_ROUTINE_TIMEOUT = "a62e9d26db4cbd874add924a1ccb9f5a32d4a5cd20aa0ebb002d66ff4a3d2785";
+/** The schema 16 had before a chat froze what is lazy in it, and a mode or an agent could keep tools in the model's list: a portal built from it is at version 16, and gets the columns when it starts. */
+const V16_WITHOUT_LAZY_HEAD = "4881a2f81ac22f97f43990ab83a069821ebf03e86ec21bb7c9603d5a7bc4a0db";
 /** The schema 16 had before a mode could set a temperature: a portal built from it is at version 16, and gets the column when it starts. */
 const V16_WITHOUT_TEMPERATURE = "ba52cad83d268b2700843d8970a6f880eaa924ae3076b3ab66414b2af22eeb1a";
 /** The schema of version 15, the one pinned before: no chat is one nobody attends, and every child takes its parent's tools. */
@@ -41,10 +45,24 @@ const home = inProcessHome("pithagoras-schema-");
 const { SCHEMA_VERSION } = await import("../dist/schema-version.js");
 const { getDb } = await import("../dist/db.js");
 
-/** A database of the schema 16 had before a mode could set a temperature, at `file`, open: a fresh one without that column. */
-function freshWithoutTemperature(file) {
+/** A database of the schema 16 had before a routine could set a limit of its own on a run, at `file`, open: a fresh one without that column. */
+function freshWithoutRoutineTimeout(file) {
   getDb().exec(`VACUUM INTO '${file}'`);
   const d = new Database(file);
+  d.exec("ALTER TABLE routines DROP COLUMN timeout_min");
+  return d;
+}
+
+/** A database of the schema 16 had before a chat froze its lazy tools, at `file`, open: one without a routine's limit, and without those columns. */
+function freshWithoutLazyHead(file) {
+  const d = freshWithoutRoutineTimeout(file);
+  d.exec("ALTER TABLE sessions DROP COLUMN lazy_head; ALTER TABLE chat_modes DROP COLUMN keep_direct; ALTER TABLE agent_tools DROP COLUMN keep_direct");
+  return d;
+}
+
+/** A database of the schema 16 had before a mode could set a temperature, at `file`, open: a fresh one without that column. */
+function freshWithoutTemperature(file) {
+  const d = freshWithoutLazyHead(file);
   d.exec("ALTER TABLE chat_modes DROP COLUMN temperature");
   return d;
 }
@@ -334,7 +352,7 @@ test("the canvases a portal stored are written out as Markdown in their chat's f
   assert.ok(!d.prepare("SELECT 1 FROM sqlite_master WHERE name = 'canvases'").get(), run.output());
   assert.equal(schemaFingerprint(d), PINNED.fingerprint);
   const value = (key) => d.prepare("SELECT value FROM settings WHERE key = ?").get(key).value;
-  assert.equal(value("tools_lazy"), "<tool>web_fetch\npithagoras-canvas");
+  assert.deepEqual(JSON.parse(value("tool_marks")), { "<tool>web_fetch": "lazy", "pithagoras-canvas": "lazy" });
   assert.deepEqual(JSON.parse(value("tool_group_names")), { "pi-web": "Web", "pithagoras-canvas": "Documents" });
   d.close();
   // In the chat's folder, a taken name numbered as an upload's is; nothing over anything.
@@ -482,7 +500,7 @@ test("what the Media page kept is left for its extension, its files moved and th
   assert.equal(value("image_generation"), undefined);
   assert.equal(value("video_generation"), undefined);
   // The set the tools were filed in is the extension's package now, its name and lazy mark with it; and so is each as the lists remember it.
-  assert.equal(value("tools_lazy"), "<tool>web_fetch\npithagoras-media");
+  assert.deepEqual(JSON.parse(value("tool_marks")), { "<tool>web_fetch": "lazy", "pithagoras-media": "lazy" });
   assert.deepEqual(JSON.parse(value("tool_group_names")), { "pi-web-access": "Web", "pithagoras-media": "Pictures" });
   assert.deepEqual(JSON.parse(value("tools_seen")), SEEN.map((tool) => (tool.name === "web_fetch" ? tool : { ...tool, source: "pithagoras-media" })));
   // Whenever the extension first starts, it is told of every folder deleted from the upgrade on, for what it takes up of one to go too.
@@ -568,7 +586,7 @@ test("an upgrade whose database rolled back after it left what the Media page ke
   const d = new Database(path.join(dir, "portal.db"), { readonly: true });
   assert.equal(schemaFingerprint(d), PINNED.fingerprint);
   assert.equal(d.prepare("SELECT value FROM settings WHERE key = 'image_generation'").get(), undefined);
-  assert.equal(d.prepare("SELECT value FROM settings WHERE key = 'tools_lazy'").get().value, "<tool>web_fetch\npithagoras-media");
+  assert.deepEqual(JSON.parse(d.prepare("SELECT value FROM settings WHERE key = 'tool_marks'").get().value), { "<tool>web_fetch": "lazy", "pithagoras-media": "lazy" });
   const seen = JSON.parse(d.prepare("SELECT value FROM settings WHERE key = 'tools_seen'").get().value);
   assert.deepEqual(seen.find((tool) => tool.name === "generate_image"), theirs);
   assert.deepEqual(seen.find((tool) => tool.name === "show_image"), { name: "show_image", source: "pithagoras-media", package: null, inline: true });
@@ -699,7 +717,7 @@ test("what the portal kept of its browser is left for its extension, the local p
   assert.equal(now.value("browser_tools_adopted"), "carry");
   // The set the tools were filed in is the extension's package now, its name and lazy mark with it; and so is each as
   // the lists remember it. An MCP server's tool, and another package's, stay as they were.
-  assert.equal(now.value("tools_lazy"), "<tool>web_fetch\npithagoras-browser");
+  assert.deepEqual(JSON.parse(now.value("tool_marks")), { "<tool>web_fetch": "lazy", "pithagoras-browser": "lazy" });
   assert.deepEqual(JSON.parse(now.value("tool_group_names")), { "pi-web-access": "Web", "pithagoras-browser": "Agent's browser" });
   assert.deepEqual(JSON.parse(now.value("tools_seen")), BROWSER_SEEN.map((tool) => (tool.source === "browser" ? { ...tool, source: "pithagoras-browser" } : tool)));
 
@@ -807,14 +825,14 @@ test("what the browser kept that cannot be left is kept for the next start, whic
   let now = browserIn(dir);
   assert.equal(now.version, SCHEMA_VERSION, "upgraded all the same");
   assert.equal(now.value("browser_password"), BROWSER_PASSWORD, "with all of it kept");
-  assert.equal(now.value("tools_lazy"), "<tool>web_fetch\nbrowser");
+  assert.deepEqual(JSON.parse(now.value("tool_marks")), { "<tool>web_fetch": "lazy", "browser": "lazy" });
   assert.equal(readFileSync(path.join(dir, "browser-profile", "Default", "Cookies"), "utf8"), "the agent's logins");
   // Out of the way: the next start, which is no upgrade, leaves it.
   rmSync(path.join(dir, "handoff"));
   await upgraded(dir);
   now = browserIn(dir);
   assert.equal(now.value("browser_password"), undefined);
-  assert.equal(now.value("tools_lazy"), "<tool>web_fetch\npithagoras-browser");
+  assert.deepEqual(JSON.parse(now.value("tool_marks")), { "<tool>web_fetch": "lazy", "pithagoras-browser": "lazy" });
   assert.equal(JSON.parse(readFileSync(path.join(dir, "handoff", "browser", "settings.json"), "utf8")).browser_password, BROWSER_PASSWORD);
 
   // A try that left it whole, and whose database rolled back: not filled again, and the settings go.
@@ -1671,6 +1689,37 @@ test("a portal built before a mode could set a temperature, already at version 1
   }
 });
 
+test("a portal built before a chat froze its lazy tools, already at version 16, gets the columns when it starts, and what was marked lazy is a mark", async () => {
+  const dir = path.join(home, "lazy-head-at-16");
+  mkdirSync(dir, { recursive: true });
+  const d = freshWithoutLazyHead(path.join(dir, "portal.db"));
+  d.pragma("user_version = 16");
+  assert.equal(schemaFingerprint(d), V16_WITHOUT_LAZY_HEAD, "the schema 16 had before");
+  d.prepare("INSERT INTO sessions (id, title, workspace, kind) VALUES ('c1', 'Kites', '/w/site', 'task')").run();
+  d.prepare("INSERT INTO chat_modes (id, label, instructions) VALUES ('coder', 'Coder', 'Be exact.')").run();
+  d.prepare("INSERT INTO agent_tools (agent, tools_off, tools_on) VALUES ('home', 'bash', '')").run();
+  // The marks the portal had: a set and a single tool, which had one value.
+  const setting = d.prepare("INSERT INTO settings (key, value) VALUES (?, ?)");
+  setting.run("tools_lazy", "pi-web\n<tool>web_fetch");
+  d.close();
+  // Not an upgrade: the version is the one pinned, so nothing is backed up, and migrate() adds the columns and the marks at the start.
+  assert.deepEqual(upgradeCheck(path.join(dir, "portal.db")), { needed: false, from: 16 });
+  await upgraded(dir);
+  assert.equal(existsSync(path.join(dir, "backups")), false);
+  const now = new Database(path.join(dir, "portal.db"), { readonly: true });
+  try {
+    assert.equal(schemaFingerprint(now), PINNED.fingerprint);
+    assert.deepEqual(now.prepare("SELECT id, lazy_head FROM sessions").all(), [{ id: "c1", lazy_head: null }], "a chat that had no head makes one the first time it starts");
+    assert.deepEqual(now.prepare("SELECT id, instructions, keep_direct FROM chat_modes").all(), [{ id: "coder", instructions: "Be exact.", keep_direct: "" }]);
+    assert.deepEqual(now.prepare("SELECT agent, tools_off, keep_direct FROM agent_tools").all(), [{ agent: "home", tools_off: "bash", keep_direct: "" }]);
+    // Lazy was one of two states: it is `lazy` of three now, and the old setting is gone.
+    assert.deepEqual(JSON.parse(now.prepare("SELECT value FROM settings WHERE key = 'tool_marks'").get().value), { "<tool>web_fetch": "lazy", "pi-web": "lazy" });
+    assert.equal(now.prepare("SELECT value FROM settings WHERE key = 'tools_lazy'").get(), undefined);
+  } finally {
+    now.close();
+  }
+});
+
 // A data folder of v0.1.0 that used every part an extension holds now, each kept as v0.1.0 kept it, on fixtures/portal-v3.db:
 // a chat with a canvas, a picture of the Media page with its file, the image endpoint, voice mode on at the voice service's
 // addresses with the person's own remembered as connecting it kept them, a designed voice and a clone, the GPU chosen,
@@ -1779,4 +1828,25 @@ test("a data folder of v0.1.0 that used every part is brought to this version in
     whisperUrl: OWN.whisper, sttModel: "", breezeUrl: OWN.speech, runtime: "kokoro", dictationUrl: null, dictationModel: null, language: "en", kokoroVoice: "af_heart",
   });
   assert.deepEqual(understoryLeft(dir, "settings.json"), UNDERSTORY_KEPT);
+});
+
+test("a portal built before a routine could set a limit of its own on a run, already at version 16, gets the column when it starts, each routine on the default", async () => {
+  const dir = path.join(home, "routine-timeout-at-16");
+  mkdirSync(dir, { recursive: true });
+  const d = freshWithoutRoutineTimeout(path.join(dir, "portal.db"));
+  d.pragma("user_version = 16");
+  assert.equal(schemaFingerprint(d), V16_WITHOUT_ROUTINE_TIMEOUT, "the schema 16 had before");
+  d.prepare("INSERT INTO routines (id, slug, name, schedule, instructions) VALUES ('r1', 'nightly', 'Nightly build', '@daily', 'build it')").run();
+  d.close();
+  // Not an upgrade: the version is the one pinned, so nothing is backed up, and migrate() adds the column at the start.
+  assert.deepEqual(upgradeCheck(path.join(dir, "portal.db")), { needed: false, from: 16 });
+  await upgraded(dir);
+  assert.equal(existsSync(path.join(dir, "backups")), false);
+  const now = new Database(path.join(dir, "portal.db"), { readonly: true });
+  try {
+    assert.equal(schemaFingerprint(now), PINNED.fingerprint);
+    assert.deepEqual(now.prepare("SELECT slug, timeout_min FROM routines").all(), [{ slug: "nightly", timeout_min: null }]);
+  } finally {
+    now.close();
+  }
 });
